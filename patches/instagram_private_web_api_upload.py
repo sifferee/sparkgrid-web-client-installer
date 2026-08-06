@@ -1193,7 +1193,10 @@ def main() -> int:
     if not accounts:
         log("No accounts selected", "WARNING")
         return 2
-    run_id = datetime.now().strftime("api_run_%Y%m%d_%H%M%S")
+    run_id = str(
+        os.environ.get("SPARKGRID_RUN_ID")
+        or datetime.now().strftime("api_run_%Y%m%d_%H%M%S")
+    )
     workers = min(args.parallel, len(accounts))
     log(
         f"Private Web API engine: accounts={len(accounts)}, parallel={workers}, "

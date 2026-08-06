@@ -35,34 +35,52 @@ from browser_workflow_goal import (
     STABLE_BLOCKER as SESSION_STABLE_BLOCKER,
 )
 from instagram_session_goal import run_check_session_goal
+from initial_browser_load import recover_initial_browser_load
+from blocking_popup_transaction import (
+    AUTOMATED_POPUP_CATEGORIES,
+    inspect_topmost_blocker,
+)
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import contextlib
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 import random
 import re
 import shutil
 import sqlite3
+import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+import uuid
 
 try:
     from browser_preferences import preferred_search_engine, save_browser_preferences
 except Exception:
     preferred_search_engine = None
     save_browser_preferences = None
-from typing import Dict, List
+from typing import Any, Dict, List
 from urllib.parse import urlparse
 from urllib.error import HTTPError
 from urllib.request import build_opener, ProxyHandler, Request
 from disk_safety import DiagnosticWriter
-from lifecycle_recovery import heartbeat_payload, write_heartbeat
+from lifecycle_recovery import IndependentHeartbeat
 from password_ip_recovery import (
     finish_submission as finish_password_submission,
     reserve_submission as reserve_password_submission,
+)
+from task_receipts import opaque_account_ref, record_outcome as record_task_outcome
+from run_diagnostics import (
+    append_event as append_run_event,
+    append_event_once as append_run_event_once,
+    capture_visual as capture_run_visual,
+    ensure_run as ensure_run_diagnostics,
+    update_latest_state as update_run_latest_state,
 )
 
 try:
@@ -200,6 +218,18 @@ def ensure_schema():
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        job_cols = cols(c, "ig_web_upload_jobs")
+        for column in (
+            "domain_outcome",
+            "infrastructure_outcome",
+            "closure_owner",
+            "closure_reason",
+        ):
+            if column not in job_cols:
+                c.execute(
+                    "ALTER TABLE ig_web_upload_jobs "
+                    f"ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                )
         c.commit()
     finally:
         c.close()
@@ -241,6 +271,8 @@ def create_job(run_id: str, account: str, task: str, debug_dir: str, provider: s
 def update_job(job_id: int, **kw):
     c = db_conn()
     try:
+        if "status" in kw and "domain_outcome" not in kw:
+            kw["domain_outcome"] = str(kw["status"] or "")
         not_null = set()
         try:
             for row in c.execute("PRAGMA table_info(ig_web_upload_jobs)").fetchall():
@@ -381,12 +413,114 @@ def ensure_profile(account: dict) -> dict:
     return metadata
 
 
+AUTO_LOGIN_DIAGNOSTIC_SCHEMA_VERSION = 1
+AUTO_LOGIN_DIAGNOSTIC_FILE = "auto_login_transaction.jsonl"
+_AUTO_LOGIN_DIAGNOSTIC_STATES = {
+    "authenticated",
+    "blocker_detected",
+    "challenge",
+    "consent_blocker",
+    "login_combined",
+    "login_password_only",
+    "login_username_first",
+    "transitioning",
+    "two_factor",
+    "unsupported_stable",
+    "unknown",
+}
+_AUTO_LOGIN_DIAGNOSTIC_URL_CATEGORIES = {
+    "challenge",
+    "consent",
+    "instagram",
+    "login_family",
+    "two_factor",
+    "unknown",
+}
+_AUTO_LOGIN_DIAGNOSTIC_EVENTS = {
+    "interaction",
+    "observation",
+    "terminal",
+}
+_AUTO_LOGIN_DIAGNOSTIC_INTERACTIONS = {
+    "click_fill",
+    "native_setter",
+    "none",
+    "reacquire",
+}
+_AUTO_LOGIN_DIAGNOSTIC_TERMINALS = {
+    "blocker_detected",
+    "challenge_detected",
+    "login_form_transition_timeout",
+    "login_submit_control_not_found",
+    "login_submit_no_transition",
+    "password_field_not_found",
+    "password_input_not_retained",
+    "unrecognized_surface",
+    "unsupported_login_state",
+    "username_field_not_found",
+    "username_field_not_ready",
+}
+_ACTIVE_AUTO_LOGIN_DIAGNOSTIC_DUMP: ContextVar[Any | None] = ContextVar(
+    "active_auto_login_diagnostic_dump",
+    default=None,
+)
+_ACTIVE_BROWSER_PRE_CLEANUP_FINALIZER: ContextVar[Any | None] = ContextVar(
+    "active_browser_pre_cleanup_finalizer",
+    default=None,
+)
+
+
+def _auto_login_diagnostic_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _auto_login_diagnostic_token(
+    value: Any, allowed: set[str], fallback: str
+) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else fallback
+
+
+def _auto_login_exception_class(value: Any) -> str:
+    name = (
+        type(value).__name__
+        if isinstance(value, BaseException)
+        else str(value or "")
+    )
+    if not name:
+        return ""
+    return (
+        name
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,79}", name)
+        else "UnknownError"
+    )
+
+
+def _write_auto_login_diagnostic(payload: dict[str, Any]) -> None:
+    dump = _ACTIVE_AUTO_LOGIN_DIAGNOSTIC_DUMP.get()
+    recorder = getattr(dump, "record_auto_login_diagnostic", None)
+    if recorder is None:
+        return
+    try:
+        recorder(payload)
+    except Exception:
+        pass
+
+
 class LiveDump:
     def __init__(self, run_id: str, account: str, max_snapshots: int = 30):
         self.run_id = run_id
         self.account = safe_name(account)
         self.root = DEBUG_ROOT / run_id / self.account
         self.root.mkdir(parents=True, exist_ok=True)
+        try:
+            ensure_run_diagnostics(
+                run_id,
+                task_category="workflow",
+                account_refs=[opaque_account_ref(run_id, account)],
+            )
+        except Exception:
+            pass
         DEBUG_ROOT.mkdir(parents=True, exist_ok=True)
         (DEBUG_ROOT / "latest_run.txt").write_text(run_id, encoding="utf-8")
         (DEBUG_ROOT / "latest_account.txt").write_text(self.account, encoding="utf-8")
@@ -394,22 +528,297 @@ class LiveDump:
         self.max_snapshots = int(max_snapshots or 30)
         self.actions = self.root / "actions.jsonl"
         self.writer = DiagnosticWriter(self.root)
-        self.heartbeat_sequence = 0
-        self.heartbeat_started = time.monotonic()
-        self._heartbeat("worker_ready")
+        self._auto_login_diagnostic_nonce = uuid.uuid4().hex[:12]
+        self._auto_login_diagnostic_sequence = 0
+        self._auto_login_diagnostic_refs: dict[str, dict[str, str]] = {
+            "frame": {},
+            "container": {},
+        }
+        self._auto_login_document_epochs: dict[str, int] = {}
+        heartbeat_target = str(
+            os.environ.get("SPARKGRID_HEARTBEAT_PATH") or ""
+        ).strip()
+        scheduler_error = str(
+            os.environ.get("SPARKGRID_HEARTBEAT_ERROR_PATH") or ""
+        ).strip()
+        self.liveness = IndependentHeartbeat(
+            heartbeat_target,
+            run_ref=self.run_id,
+            account_ref=self.account,
+            task_ref=str(os.environ.get("SPARKGRID_TASK_ID") or ""),
+            workflow="profile",
+            role="profile_worker",
+            recovery_attempt=int(
+                os.environ.get("SPARKGRID_RECOVERY_ATTEMPT", "0") or 0
+            ),
+            error_paths=tuple(
+                item
+                for item in (
+                    scheduler_error,
+                    str(self.root / "heartbeat_transport_error.json"),
+                )
+                if item
+            ),
+        ).start()
 
     def _heartbeat(self, state: str) -> None:
-        target = str(os.environ.get("SPARKGRID_HEARTBEAT_PATH") or "").strip()
-        if not target:
+        self.liveness.update_phase(state)
+
+    def _auto_login_opaque_ref(self, kind: str, raw: Any) -> str:
+        if kind not in {"frame", "container"} or raw in {None, ""}:
+            return ""
+        if not hasattr(self, "_auto_login_diagnostic_nonce"):
+            self._auto_login_diagnostic_nonce = uuid.uuid4().hex[:12]
+            self._auto_login_diagnostic_refs = {
+                "frame": {},
+                "container": {},
+            }
+        values = self._auto_login_diagnostic_refs.setdefault(kind, {})
+        key = str(raw)
+        if key not in values:
+            values[key] = (
+                f"{kind[:1]}_{self._auto_login_diagnostic_nonce}_"
+                f"{len(values) + 1:03d}"
+            )
+        return values[key]
+
+    def _auto_login_document_epoch(self, raw: Any) -> int:
+        if raw in {None, ""}:
+            return 0
+        if not hasattr(self, "_auto_login_document_epochs"):
+            self._auto_login_document_epochs = {}
+        key = str(raw)
+        if key not in self._auto_login_document_epochs:
+            self._auto_login_document_epochs[key] = (
+                len(self._auto_login_document_epochs) + 1
+            )
+        return self._auto_login_document_epochs[key]
+
+    def record_auto_login_diagnostic(
+        self, payload: dict[str, Any]
+    ) -> None:
+        """Persist only the versioned Auto Login diagnostic allowlist."""
+        if self.writer.disabled:
             return
+        if not hasattr(self, "_auto_login_diagnostic_sequence"):
+            self._auto_login_diagnostic_sequence = 0
+        self._auto_login_diagnostic_sequence += 1
+        selected_raw = (
+            payload.get("selected_candidate")
+            if isinstance(payload.get("selected_candidate"), dict)
+            else None
+        )
+        selected = None
+        if selected_raw is not None:
+            selected = {
+                "intent": _auto_login_diagnostic_token(
+                    selected_raw.get("intent"),
+                    {"otp", "password", "username", "unknown"},
+                    "unknown",
+                ),
+                "type_category": _auto_login_diagnostic_token(
+                    selected_raw.get("type_category"),
+                    {
+                        "email",
+                        "number",
+                        "other",
+                        "password",
+                        "search",
+                        "tel",
+                        "text",
+                        "textarea",
+                    },
+                    "other",
+                ),
+                "autocomplete_category": (
+                    _auto_login_diagnostic_token(
+                        selected_raw.get("autocomplete_category"),
+                        {
+                            "current-password",
+                            "email",
+                            "new-password",
+                            "none",
+                            "off",
+                            "one-time-code",
+                            "other",
+                            "tel",
+                            "username",
+                        },
+                        "other",
+                    )
+                ),
+                "form_owned": bool(selected_raw.get("form_owned")),
+                "attached": bool(selected_raw.get("attached")),
+                "visible_probe": _auto_login_diagnostic_bool(
+                    selected_raw.get("visible_probe")
+                ),
+                "enabled_probe": _auto_login_diagnostic_bool(
+                    selected_raw.get("enabled_probe")
+                ),
+                "editable_probe": _auto_login_diagnostic_bool(
+                    selected_raw.get("editable_probe")
+                ),
+                "readonly": bool(selected_raw.get("readonly")),
+                "bounding_box_present": bool(
+                    selected_raw.get("bounding_box_present")
+                ),
+                "viewport_intersection": bool(
+                    selected_raw.get("viewport_intersection")
+                ),
+                "node_replacement": bool(
+                    selected_raw.get("node_replacement")
+                ),
+            }
+        counts_raw = (
+            payload.get("candidate_counts")
+            if isinstance(payload.get("candidate_counts"), dict)
+            else {}
+        )
+        interaction_raw = (
+            payload.get("interaction")
+            if isinstance(payload.get("interaction"), dict)
+            else {}
+        )
+        postcondition_raw = (
+            payload.get("postcondition")
+            if isinstance(payload.get("postcondition"), dict)
+            else {}
+        )
+        terminal_raw = (
+            payload.get("terminal")
+            if isinstance(payload.get("terminal"), dict)
+            else {}
+        )
+        terminal_code = str(terminal_raw.get("code") or "")
+        if terminal_code not in _AUTO_LOGIN_DIAGNOSTIC_TERMINALS:
+            terminal_code = ""
+        record = {
+            "schema_version": AUTO_LOGIN_DIAGNOSTIC_SCHEMA_VERSION,
+            "timestamp_utc": datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "sequence": self._auto_login_diagnostic_sequence,
+            "event": _auto_login_diagnostic_token(
+                payload.get("event"),
+                _AUTO_LOGIN_DIAGNOSTIC_EVENTS,
+                "observation",
+            ),
+            "attempt_number": max(
+                0, min(999, int(payload.get("attempt_number") or 0))
+            ),
+            "document_epoch": self._auto_login_document_epoch(
+                payload.get("document_key")
+            ),
+            "mutation_epoch": max(
+                0, int(payload.get("mutation_epoch") or 0)
+            ),
+            "state": _auto_login_diagnostic_token(
+                payload.get("state"),
+                _AUTO_LOGIN_DIAGNOSTIC_STATES,
+                "unknown",
+            ),
+            "url_category": _auto_login_diagnostic_token(
+                payload.get("url_category"),
+                _AUTO_LOGIN_DIAGNOSTIC_URL_CATEGORIES,
+                "unknown",
+            ),
+            "frame_ref": self._auto_login_opaque_ref(
+                "frame", payload.get("frame_key")
+            ),
+            "container_ref": self._auto_login_opaque_ref(
+                "container", payload.get("container_key")
+            ),
+            "candidate_counts": {
+                intent: max(
+                    0, min(999, int(counts_raw.get(intent) or 0))
+                )
+                for intent in ("username", "password", "otp", "other")
+            },
+            "selected_candidate": selected,
+            "interaction": {
+                "attempted": bool(interaction_raw.get("attempted")),
+                "kind": _auto_login_diagnostic_token(
+                    interaction_raw.get("kind"),
+                    _AUTO_LOGIN_DIAGNOSTIC_INTERACTIONS,
+                    "none",
+                ),
+                "exception_class": _auto_login_exception_class(
+                    interaction_raw.get("exception_class")
+                ),
+            },
+            "postcondition": {
+                "value_match": _auto_login_diagnostic_bool(
+                    postcondition_raw.get("value_match")
+                )
+            },
+            "terminal": {
+                "owner": (
+                    "auto_login_transaction_coordinator"
+                    if terminal_code
+                    and terminal_raw.get("owner")
+                    == "auto_login_transaction_coordinator"
+                    else ""
+                ),
+                "code": terminal_code,
+                "reason_category": _auto_login_diagnostic_token(
+                    terminal_raw.get("reason_category"),
+                    {
+                        "blocker",
+                        "candidate_absent",
+                        "challenge",
+                        "interaction_not_verified",
+                        "none",
+                        "postcondition_negative",
+                        "submit_no_transition",
+                        "submit_not_dispatched",
+                        "transition_timeout",
+                        "unsupported_state",
+                    },
+                    "none",
+                ),
+            },
+        }
+        self.writer.append_text(
+            self.root / AUTO_LOGIN_DIAGNOSTIC_FILE,
+            json.dumps(
+                record,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+        )
         try:
-            self.heartbeat_sequence += 1
-            write_heartbeat(target, heartbeat_payload(
-                job_ref=self.run_id, account_ref=self.account, workflow="profile", operation=state,
-                sequence=self.heartbeat_sequence, started=self.heartbeat_started,
-                recovery_attempt=int(os.environ.get("SPARKGRID_RECOVERY_ATTEMPT", "0") or 0),
-            ))
-        except OSError:
+            state = str(record.get("state") or "unknown")
+            event_type = (
+                "username_interaction"
+                if (selected or {}).get("intent") == "username"
+                else "password_interaction"
+                if (selected or {}).get("intent") == "password"
+                else "submission_readiness"
+                if record.get("event") in {
+                    "submission_readiness", "submission_blocked",
+                    "submission_attempt",
+                }
+                else "login_surface_classified"
+            )
+            append_run_event(
+                self.run_id,
+                event_type,
+                stream="actions",
+                login_surface_category=state,
+                interaction_category=str(
+                    (record.get("interaction") or {}).get("kind") or "none"
+                ),
+                interaction_attempted=bool(
+                    (record.get("interaction") or {}).get("attempted")
+                ),
+                value_verified=bool(
+                    (record.get("postcondition") or {}).get("value_match")
+                ),
+                document_epoch=int(record.get("document_epoch") or 0),
+                mutation_epoch=int(record.get("mutation_epoch") or 0),
+            )
+        except Exception:
             pass
 
     def visible_text(self, page) -> str:
@@ -436,7 +845,27 @@ class LiveDump:
             payload["url"] = str(page.url or "").split("?", 1)[0].split("#", 1)[0]
         except Exception:
             pass
-        if take_screenshot:
+        meaningful_visual = bool(
+            take_screenshot
+            and (
+                force_snapshot
+                or error
+                or state != self.last_state
+            )
+        )
+        sensitive_input = False
+        if meaningful_visual:
+            try:
+                sensitive_input = bool(page.evaluate(
+                    """() => Array.from(document.querySelectorAll('input')).some(el => {
+                      const t=(el.type||'').toLowerCase();
+                      const a=(el.autocomplete||'').toLowerCase();
+                      return !!el.value && (t==='password' || a==='one-time-code');
+                    })"""
+                ))
+            except Exception:
+                sensitive_input = True
+        if meaningful_visual and not sensitive_input:
             try:
                 page.screenshot(path=str(self.root / "latest.png"), full_page=False)
             except Exception as exc:
@@ -453,7 +882,7 @@ class LiveDump:
             snap = self.root / "snapshots"
             snap.mkdir(exist_ok=True)
             base = datetime.now().strftime("%H%M%S") + "_" + re.sub(r"[^A-Za-z0-9_.-]+", "_", state)[:40]
-            if take_screenshot:
+            if meaningful_visual and not sensitive_input:
                 try:
                     shutil.copy2(self.root / "latest.png", snap / f"{base}.png")
                 except Exception:
@@ -466,6 +895,58 @@ class LiveDump:
                     x.unlink()
                 except Exception:
                     pass
+        try:
+            normalized_state = (
+                "authenticated"
+                if "logged_in" in state or "authenticated" in state
+                else "challenge"
+                if "challenge" in state
+                else "two_factor"
+                if "two_factor" in state or "2fa" in state.lower()
+                else "login_username_first"
+                if "username" in state
+                else "login_password_only"
+                if "password" in state
+                else "unknown"
+            )
+            update_run_latest_state(
+                self.run_id, normalized_state,
+                browser_live=True, page_live=True,
+            )
+            reason = (
+                "password_submission_blocker"
+                if "second_submission" in (state + " " + error)
+                else "browser_load_failure"
+                if "browser_load" in (state + " " + error)
+                else "regional_ads_transition"
+                if "regional_ads" in state
+                else "recognized_blocker"
+                if "consent" in state or "dialog" in state
+                else "terminal_failure"
+                if error
+                else "final_success"
+                if normalized_state == "authenticated"
+                else "first_meaningful_surface"
+            )
+            if meaningful_visual:
+                capture_run_visual(page, self.run_id, reason)
+            if "regional_ads" in state:
+                append_run_event(
+                    self.run_id, "regional_ads_consent_step",
+                    popup_category="regional_ads_consent",
+                    category="transitioning",
+                )
+            elif "consent" in state or "dialog" in state:
+                append_run_event(
+                    self.run_id, "popup_classified",
+                    popup_category=(
+                        "cookie_consent"
+                        if "cookie" in state
+                        else "unknown_blocker"
+                    ),
+                )
+        except Exception:
+            pass
 
     def capture_safe_dom(self, page, label: str = "post_action_stable") -> str:
         """Persist a credential-free DOM copy for a terminal browser state."""
@@ -524,6 +1005,66 @@ class LiveDump:
             with (self.root / "consent_recovery.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(safe, ensure_ascii=False) + "\n")
         except OSError:
+            pass
+        try:
+            append_run_event(
+                self.run_id,
+                "popup_classified",
+                popup_category=(
+                    "cookie_consent"
+                    if payload.get("consent_detected")
+                    else "none"
+                ),
+                transition_count=int(payload.get("attempt_number") or 0),
+            )
+        except Exception:
+            pass
+
+    def record_initial_browser_load(self, payload: dict) -> None:
+        """Persist only the initial-load allowlist."""
+        fields = (
+            "target_category",
+            "navigation_timeout",
+            "main_frame_failure_category",
+            "browser_live",
+            "context_live",
+            "page_live",
+            "document_category",
+            "retry_count",
+            "outcome",
+            "ok",
+        )
+        safe = {field: payload.get(field) for field in fields}
+        try:
+            with (self.root / "initial_browser_load.jsonl").open(
+                "a", encoding="utf-8"
+            ) as handle:
+                handle.write(
+                    json.dumps(safe, ensure_ascii=False, separators=(",", ":"))
+                    + "\n"
+                )
+        except OSError:
+            pass
+        try:
+            append_run_event(
+                self.run_id,
+                "document_classified",
+                document_category=str(
+                    payload.get("document_category") or "unknown_document"
+                ),
+                failure_category=str(
+                    payload.get("main_frame_failure_category") or ""
+                ),
+                navigation_timeout=bool(payload.get("navigation_timeout")),
+                browser_live=bool(payload.get("browser_live")),
+                context_live=bool(payload.get("context_live")),
+                page_live=bool(payload.get("page_live")),
+                retry_count=int(payload.get("retry_count") or 0),
+                target_category=str(
+                    payload.get("target_category") or "unknown"
+                ),
+            )
+        except Exception:
             pass
 
 
@@ -625,6 +1166,8 @@ def _proxy_url_for_urllib(proxy: str) -> str:
 
 
 def _check_proxy_reachable(proxy: str, timeout: float = 15.0) -> tuple[bool, str]:
+    if os.environ.get("SPARKGRID_PROXY_GATE_PASSED") == "1":
+        return True, "scheduler strict proxy gate already passed"
     proxy_url = _proxy_url_for_urllib(proxy)
     if not proxy_url:
         return True, "no proxy configured"
@@ -870,6 +1413,25 @@ def get_state(page) -> tuple[str, str]:
         }
         if gate_state in dialog_states:
             return dialog_states[gate_state]
+    auth_goal = continue_authentication_goal(
+        page, timeout_seconds=0.0, optional_cleanup=True
+    )
+    if auth_goal.get("ok"):
+        return "logged_in", str(
+            auth_goal.get("reason")
+            or "authenticated goal confirmed the session"
+        )
+    strong_auth_states = {
+        "login_required": ("login_required", "visible login form"),
+        "two_factor_required": ("two_factor_required", "2FA URL/form requires action"),
+        "checkpoint": ("checkpoint", "scoped challenge evidence requires review"),
+        "restricted": ("restricted", "restriction dialog requires review"),
+        "suspended": ("suspended", "suspension dialog requires review"),
+        "unknown_popup": ("unknown_popup", "stable unknown dialog requires review"),
+    }
+    auth_state = str(auth_goal.get("state") or "")
+    if auth_state in strong_auth_states:
+        return strong_auth_states[auth_state]
     # Instagram sometimes uses /accounts/suspended for a reversible human
     # confirmation flow. Do not misclassify that screen as a permanent ban.
     if (
@@ -922,10 +1484,6 @@ def get_state(page) -> tuple[str, str]:
     if any(s in txt for s in ["log in", "sign up", "enter your password", "войдите",
                               "anmelden", "passwort", "neues konto", "registrieren"]):
         return "login_required", "login text detected"
-    if any(s in txt for s in ["challenge", "checkpoint", "confirm it's you", "help us confirm",
-                              "verify", "verification", "подтверд", "провер",
-                              "bestätig", "verifizier", "wir haben"]):
-        return "checkpoint", "checkpoint/verification text detected"
     if any(s in txt for s in ["suspicious", "try again later", "we restrict", "огранич", "подозр",
                               "verdächtig", "später erneut", "eingeschränkt"]):
         return "restricted", "restriction text detected"
@@ -976,7 +1534,13 @@ def _force_english(page, dump=None) -> None:
         pass
 
 
-def _arrive_instagram(page, dump, via_search: bool, account: str = "", mode: str = "desktop") -> None:
+def _arrive_instagram(
+    page,
+    dump,
+    via_search: bool,
+    account: str = "",
+    mode: str = "desktop",
+) -> dict[str, Any]:
     """Land on instagram.com. With via_search=True arrive organically through a
     search result (looks like a real referral) and fall back to a direct visit."""
     if via_search:
@@ -1013,14 +1577,32 @@ def _arrive_instagram(page, dump, via_search: bool, account: str = "", mode: str
                             except Exception:
                                 pass
                         _force_english(page, dump)
-                        return
+                        result = recover_initial_browser_load(page)
+                        if hasattr(dump, "record_initial_browser_load"):
+                            dump.record_initial_browser_load(result)
+                        return result
             except Exception as exc:
                 log(f"{engine} search arrival failed ({exc}); trying next route", "WARNING")
+    initial_error = None
     try:
         url = "https://www.instagram.com/?hl=en" if FORCE_IG_ENGLISH else "https://www.instagram.com/"
         page.goto(url, wait_until="domcontentloaded", timeout=90000)
-    except Exception:
-        pass
+    except Exception as exc:
+        initial_error = exc
+    result = recover_initial_browser_load(
+        page,
+        initial_error=initial_error,
+    )
+    if hasattr(dump, "record_initial_browser_load"):
+        dump.record_initial_browser_load(result)
+    if not result.get("ok"):
+        dump.capture(
+            page,
+            "initial_browser_load_failed",
+            "browser_load_failed_after_retry",
+            force_snapshot=True,
+        )
+    return result
 
 
 def _click_login_if_present(page, dump, account: str = "") -> bool:
@@ -1146,6 +1728,11 @@ def _consent_recovery_result(
     uses the current context and is followed by fresh DOM/state detection.
     """
     capture = _consent_capture(dump)
+    human = _human_for(
+        page,
+        str(getattr(dump, "account", "") or ""),
+        dump,
+    )
     authenticated = bool(authenticated_confirmed or _authenticated_session_present(page))
     attempts = 0
     limit = max(0, int(max_navigation_attempts))
@@ -1219,7 +1806,9 @@ def _consent_recovery_result(
                 continue
 
             if consent_after:
-                result = resolve_instagram_consent(page, capture, max_seconds=70)
+                result = resolve_instagram_consent(
+                    page, capture, max_seconds=70, human=human
+                )
                 if not result.get("ok"):
                     request_processing_after = bool(
                         result.get("request_failed") or consent_request_failed(page)
@@ -1371,7 +1960,9 @@ def _consent_recovery_result(
             }
 
         if consent_present(page):
-            result = resolve_instagram_consent(page, capture, max_seconds=70)
+            result = resolve_instagram_consent(
+                page, capture, max_seconds=70, human=human
+            )
             if not result.get("ok"):
                 if result.get("request_failed"):
                     continue
@@ -1454,7 +2045,12 @@ def _recover_instagram_consent(page, dump: LiveDump | None = None, account: str 
 
 
 def _dismiss_instagram_consent(page, dump: LiveDump | None = None, account: str = "") -> bool:
-    result = resolve_instagram_consent(page, _consent_capture(dump), max_seconds=70)
+    result = resolve_instagram_consent(
+        page,
+        _consent_capture(dump),
+        max_seconds=70,
+        human=_human_for(page, account, dump),
+    )
     return bool(result.get("handled"))
 
 
@@ -1465,6 +2061,7 @@ def _login_blocker_first(
     action: str,
     *,
     wait_seconds: float = 1.0,
+    structural_login_surface: bool = False,
 ) -> tuple[bool, str, str]:
     """Resolve the topmost blocker, then classify a newly-read DOM.
 
@@ -1473,6 +2070,59 @@ def _login_blocker_first(
     """
     handled = False
     for _attempt in range(5):
+        observed = inspect_topmost_blocker(page)
+        if observed.get("authenticated_surface"):
+            return True, "logged_in", "authenticated state confirmed"
+        if observed.get("two_factor_surface"):
+            return True, "two_factor_required", "2FA surface confirmed"
+        observation = (
+            _observe_login_surface(page)
+            if structural_login_surface
+            else None
+        )
+        if observation is not None and observation.state in {
+            "authenticated",
+            "challenge",
+            "two_factor",
+        }:
+            state = {
+                "authenticated": "logged_in",
+                "challenge": "checkpoint",
+                "two_factor": "two_factor_required",
+            }[observation.state]
+            return True, state, observation.reason
+        category = str(observed.get("category") or "")
+        if category in {"checkpoint", "restriction", "suspended"}:
+            return (
+                False,
+                category,
+                "existing challenge or account-state handling is required",
+            )
+        if (
+            not observed.get("present")
+            or category not in AUTOMATED_POPUP_CATEGORIES
+        ):
+            if structural_login_surface:
+                observation = observation or _observe_login_surface(page)
+                state = {
+                    "authenticated": "logged_in",
+                    "two_factor": "two_factor_required",
+                    "challenge": "checkpoint",
+                    "consent_blocker": "consent_required",
+                    "transitioning": "unknown",
+                    "unsupported_stable": "unknown",
+                    "login_combined": "login_required",
+                    "login_username_first": "login_required",
+                    "login_password_only": "login_required",
+                }.get(observation.state, "unknown")
+                reason = observation.reason
+            else:
+                state, reason = get_state(page)
+            if handled and state == "unknown" and _attempt < 4:
+                _wait_for_current_dom(page)
+                continue
+            return True, state, reason
+
         gate = continue_after_dialog(
             page,
             allow_safe_close=True,
@@ -1480,12 +2130,9 @@ def _login_blocker_first(
         )
         outcome = str(gate.get("outcome") or "")
         if outcome == NO_BLOCKER or (not outcome and not gate.get("present")):
-            state, reason = get_state(page)
-            if handled and state == "unknown" and _attempt < 4:
-                _wait_for_current_dom(page)
-                time.sleep(0.2)
-                continue
-            return True, state, reason
+            _wait_for_current_dom(page)
+            handled = True
+            continue
         if outcome in {HANDLED_REEVALUATE, TRANSITIONING_RETRY} or gate.get("dismissed"):
             handled = True
             if dump is not None:
@@ -1496,7 +2143,6 @@ def _login_blocker_first(
                     take_visible_text=False,
                 )
             _wait_for_current_dom(page)
-            time.sleep(0.2)
             continue
 
         state = str(gate.get("state") or "unknown_popup")
@@ -1528,19 +2174,14 @@ def _login_credentials_action_ready(
     account: str,
     action: str,
 ) -> bool:
-    ok, state, _reason = _login_blocker_first(page, dump, account, action)
-    if ok and state == "login_required":
-        return True
-    code = state if not ok else "login_form_not_ready"
-    _set_login_form_failure(dump, code)
-    if ok:
-        dump.capture(
-            page,
-            "auto_login_state_changed",
-            f"state={state}; blocked before {action}",
-            force_snapshot=True,
-        )
-    return False
+    ok, state, _reason = _login_blocker_first(
+        page,
+        dump,
+        account,
+        action,
+        structural_login_surface=True,
+    )
+    return bool(ok and state == "login_required")
 
 
 
@@ -1685,50 +2326,1029 @@ def _two_factor_liveness(page) -> tuple[str, str]:
     return "", ""
 
 
-def _login_input_count(page) -> int:
-    # Count distinct semantic selector matches only as a render hint. The real
-    # decision below still requires both concrete visible locators.
-    total = 0
-    for selector in (
-        "input[name='username']", "input[autocomplete='username']",
-        "input[name='password']", "input[autocomplete='current-password']",
-        "input[type='password']",
+LOGIN_INPUT_LIKE_SELECTOR = (
+    "input,textarea,[contenteditable='true'],"
+    "[contenteditable='plaintext-only']"
+)
+LOGIN_CONTROL_SELECTOR = (
+    "button,input[type='submit'],input[type='button'],[role='button']"
+)
+LOGIN_USERNAME_STATES = {"login_combined", "login_username_first"}
+LOGIN_CREDENTIAL_STATES = {
+    "login_combined", "login_username_first", "login_password_only"
+}
+
+
+@dataclass(frozen=True)
+class LoginCandidateRecipe:
+    frame_index: int
+    node_index: int
+    node_ref: str
+    group_ref: str
+
+
+@dataclass(frozen=True)
+class LoginCandidateDescriptor:
+    recipe: LoginCandidateRecipe
+    intent: str
+    semantic: str
+    type_category: str
+    autocomplete_category: str
+    form_owned: bool
+    attached: bool
+    visible: bool
+    viewport_intersecting: bool
+    bounding_box_present: bool
+    disabled: bool
+    readonly: bool
+    covered: bool
+    group_has_submit: bool
+    group_challenge: bool
+    score: int
+
+    @property
+    def structurally_viable(self) -> bool:
+        return bool(
+            self.attached
+            and self.bounding_box_present
+            and self.viewport_intersecting
+        )
+
+
+@dataclass
+class LoginSurfaceObservation:
+    state: str
+    reason: str
+    url_category: str
+    loading: bool
+    semantic_fingerprint: str
+    frame_epochs: tuple[tuple[int, str, int], ...]
+    candidates: list[LoginCandidateDescriptor] = field(default_factory=list)
+    selected_group_ref: str = ""
+
+    def candidates_for(
+        self, intent: str, preferred_group_ref: str = ""
+    ) -> list[LoginCandidateDescriptor]:
+        values = [
+            candidate
+            for candidate in self.candidates
+            if candidate.intent == intent
+        ]
+        preferred = [
+            candidate
+            for candidate in values
+            if preferred_group_ref
+            and candidate.recipe.group_ref == preferred_group_ref
+        ]
+        return sorted(preferred or values, key=lambda item: item.score, reverse=True)
+
+
+def _strong_combined_login_surface(
+    observation: LoginSurfaceObservation,
+) -> bool:
+    def ready(candidate: LoginCandidateDescriptor) -> bool:
+        return bool(
+            candidate.attached
+            and candidate.visible
+            and candidate.viewport_intersecting
+            and candidate.bounding_box_present
+            and not candidate.disabled
+            and not candidate.readonly
+        )
+
+    groups: dict[str, set[str]] = {}
+    for candidate in observation.candidates:
+        if ready(candidate) and candidate.intent in {"username", "password"}:
+            groups.setdefault(candidate.recipe.group_ref, set()).add(
+                candidate.intent
+            )
+    return any(
+        {"username", "password"}.issubset(intents)
+        for intents in groups.values()
+    )
+
+
+def _credential_surface_readiness(
+    observation: LoginSurfaceObservation,
+) -> tuple[bool, bool]:
+    ready_by_group: dict[str, set[str]] = {}
+    for candidate in observation.candidates:
+        ready = bool(
+            candidate.attached
+            and candidate.visible
+            and candidate.viewport_intersecting
+            and candidate.bounding_box_present
+            and not candidate.disabled
+            and not candidate.readonly
+        )
+        if ready and candidate.intent in {"username", "password"}:
+            ready_by_group.setdefault(
+                candidate.recipe.group_ref, set()
+            ).add(candidate.intent)
+    combined = next(
+        (
+            intents
+            for intents in ready_by_group.values()
+            if {"username", "password"}.issubset(intents)
+        ),
+        set(),
+    )
+    return "username" in combined, "password" in combined
+
+
+def _diagnostic_document_epoch(dump: Any, raw: Any) -> int:
+    try:
+        return int(dump._auto_login_document_epoch(raw))
+    except Exception:
+        return 0
+
+
+def _surface_diagnostic_evidence(
+    dump: Any,
+    observation: LoginSurfaceObservation | None,
+) -> dict[str, Any]:
+    username_ready = False
+    password_ready = False
+    document_epoch = 0
+    mutation_epoch = 0
+    if observation is not None:
+        username_ready, password_ready = (
+            _credential_surface_readiness(observation)
+        )
+        if observation.frame_epochs:
+            _frame, document_ref, mutation_epoch = (
+                observation.frame_epochs[0]
+            )
+            document_epoch = _diagnostic_document_epoch(
+                dump, document_ref
+            )
+    return {
+        "document_epoch": document_epoch,
+        "mutation_epoch": int(mutation_epoch or 0),
+        "username_ready": username_ready,
+        "password_ready": password_ready,
+    }
+
+
+def _blocker_diagnostic_evidence(
+    dump: Any,
+    observed: dict[str, Any] | None,
+) -> dict[str, Any]:
+    value = dict(observed or {})
+    return {
+        "document_epoch": _diagnostic_document_epoch(
+            dump, value.get("document_epoch")
+        ),
+        "mutation_epoch": int(value.get("mutation_epoch") or 0),
+        "username_ready": False,
+        "password_ready": False,
+    }
+
+
+def _record_arrival_route(
+    dump: Any,
+    route: str,
+    *,
+    popup_category: str = "",
+    surface: LoginSurfaceObservation | None = None,
+    observed: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    evidence = (
+        _surface_diagnostic_evidence(dump, surface)
+        if surface is not None
+        else _blocker_diagnostic_evidence(dump, observed)
+    )
+    if route == "credential_surface" and not (
+        evidence["username_ready"] and evidence["password_ready"]
     ):
+        return evidence
+    try:
+        append_run_event(
+            str(dump.run_id),
+            "arrival_route_selected",
+            route=route,
+            popup_category=(
+                popup_category if route == "known_popup" else ""
+            ),
+            source_live_debug=(
+                os.environ.get("SPARKGRID_SOURCE_LIVE_DEBUG") == "1"
+            ),
+            **evidence,
+        )
+        dump._stage1_arrival_route = route
+        dump._stage1_route_evidence = dict(evidence)
+    except Exception:
+        pass
+    return evidence
+
+
+def _record_credential_workflow_started(
+    page: Any,
+    dump: Any,
+) -> None:
+    try:
+        evidence = dict(
+            getattr(dump, "_stage1_route_evidence", {}) or {}
+        )
+        if (
+            getattr(dump, "_stage1_arrival_route", "")
+            != "credential_surface"
+            or not evidence.get("username_ready")
+            or not evidence.get("password_ready")
+        ):
+            surface = _observe_login_surface(page)
+            if not _strong_combined_login_surface(surface):
+                return
+            evidence = _record_arrival_route(
+                dump, "credential_surface", surface=surface
+            )
+        append_run_event(
+            str(dump.run_id),
+            "credential_workflow_started",
+            reason="credential_surface",
+            username_ready=True,
+            password_ready=True,
+            document_epoch=int(evidence.get("document_epoch") or 0),
+            mutation_epoch=int(evidence.get("mutation_epoch") or 0),
+        )
+    except Exception:
+        pass
+
+
+@dataclass
+class LoginInteractionResult:
+    verified: bool
+    intent: str
+    state: str
+    group_ref: str = ""
+    candidate_seen: bool = False
+    structurally_viable_seen: bool = False
+    normal_attempts: int = 0
+    fresh_observations: int = 0
+    missing_observations: int = 0
+    fallback_available: bool = False
+    fallback_attempted: bool = False
+    postcondition_checks: int = 0
+    exception_classes: tuple[str, ...] = ()
+    reason: str = ""
+
+
+@dataclass
+class LoginSurfaceWaitResult:
+    observation: LoginSurfaceObservation | None
+    code: str = ""
+    reason: str = ""
+
+
+def _auto_login_selected_candidate(
+    observation: LoginSurfaceObservation,
+) -> LoginCandidateDescriptor | None:
+    selected = [
+        candidate
+        for candidate in observation.candidates
+        if observation.selected_group_ref
+        and candidate.recipe.group_ref == observation.selected_group_ref
+    ]
+    values = selected or observation.candidates
+    return max(values, key=lambda item: item.score, default=None)
+
+
+def _auto_login_candidate_diagnostic(
+    candidate: LoginCandidateDescriptor | None,
+    *,
+    probes: dict[str, bool | None] | None = None,
+    node_replacement: bool = False,
+) -> dict[str, Any] | None:
+    if candidate is None:
+        return None
+    values = probes or {}
+    return {
+        "intent": candidate.intent or "unknown",
+        "type_category": candidate.type_category,
+        "autocomplete_category": candidate.autocomplete_category,
+        "form_owned": candidate.form_owned,
+        "attached": candidate.attached,
+        "visible_probe": (
+            values.get("visible")
+            if "visible" in values
+            else candidate.visible
+        ),
+        "enabled_probe": values.get("enabled"),
+        "editable_probe": values.get("editable"),
+        "readonly": candidate.readonly,
+        "bounding_box_present": candidate.bounding_box_present,
+        "viewport_intersection": candidate.viewport_intersecting,
+        "node_replacement": bool(node_replacement),
+    }
+
+
+def _auto_login_diagnostic_base(
+    observation: LoginSurfaceObservation,
+    candidate: LoginCandidateDescriptor | None = None,
+) -> dict[str, Any]:
+    selected = candidate or _auto_login_selected_candidate(observation)
+    frame_key: Any = (
+        selected.recipe.frame_index if selected is not None else None
+    )
+    container_key: Any = (
+        selected.recipe.group_ref if selected is not None else ""
+    )
+    document_key = ""
+    mutation_epoch = 0
+    for frame_index, raw_document, raw_mutation in observation.frame_epochs:
+        if frame_key is None or frame_index == frame_key:
+            frame_key = frame_index
+            document_key = raw_document
+            mutation_epoch = raw_mutation
+            break
+    counts = {"username": 0, "password": 0, "otp": 0, "other": 0}
+    for value in observation.candidates:
+        intent = (
+            value.intent
+            if value.intent in {"username", "password", "otp"}
+            else "other"
+        )
+        counts[intent] += 1
+    return {
+        "state": observation.state,
+        "url_category": observation.url_category,
+        "frame_key": frame_key,
+        "container_key": container_key,
+        "document_key": document_key,
+        "mutation_epoch": mutation_epoch,
+        "candidate_counts": counts,
+    }
+
+
+def _record_auto_login_observation(
+    observation: LoginSurfaceObservation,
+) -> None:
+    dump = _ACTIVE_AUTO_LOGIN_DIAGNOSTIC_DUMP.get()
+    if dump is not None:
         try:
-            total += int(page.locator(selector).count() or 0)
+            dump._auto_login_last_observation = observation
         except Exception:
             pass
-    return total
+    selected = _auto_login_selected_candidate(observation)
+    payload = _auto_login_diagnostic_base(observation, selected)
+    payload.update(
+        {
+            "event": "observation",
+            "attempt_number": 0,
+            "selected_candidate": _auto_login_candidate_diagnostic(
+                selected
+            ),
+            "interaction": {
+                "attempted": False,
+                "kind": "none",
+                "exception_class": "",
+            },
+            "postcondition": {"value_match": None},
+            "terminal": {},
+        }
+    )
+    _write_auto_login_diagnostic(payload)
 
 
-LOGIN_USER_SELECTORS = [
-    "input[name='username']", "input[autocomplete='username']",
-    "input[placeholder*='Mobile' i]", "input[placeholder*='username' i]",
-    "input[placeholder*='email' i]", "input[aria-label*='Phone' i]",
-    "input[aria-label*='username' i]", "input[aria-label*='email' i]",
-    "input[type='text']",
-]
+def _record_auto_login_interaction(
+    observation: LoginSurfaceObservation,
+    candidate: LoginCandidateDescriptor | None,
+    *,
+    attempt_number: int,
+    attempted: bool,
+    kind: str,
+    probes: dict[str, bool | None] | None = None,
+    exception_class: str = "",
+    value_match: bool | None = None,
+    node_replacement: bool = False,
+) -> None:
+    payload = _auto_login_diagnostic_base(observation, candidate)
+    payload.update(
+        {
+            "event": "interaction",
+            "attempt_number": attempt_number,
+            "selected_candidate": _auto_login_candidate_diagnostic(
+                candidate,
+                probes=probes,
+                node_replacement=node_replacement,
+            ),
+            "interaction": {
+                "attempted": attempted,
+                "kind": kind,
+                "exception_class": exception_class,
+            },
+            "postcondition": {"value_match": value_match},
+            "terminal": {},
+        }
+    )
+    _write_auto_login_diagnostic(payload)
 
-LOGIN_PASS_SELECTORS = [
-    "input[name='password']", "input[autocomplete='current-password']",
-    "input[placeholder*='Password' i]", "input[type='password']",
-]
+
+def _auto_login_terminal_reason_category(code: str) -> str:
+    return {
+        "blocker_detected": "blocker",
+        "challenge_detected": "challenge",
+        "login_form_transition_timeout": "transition_timeout",
+        "login_submit_control_not_found": "submit_not_dispatched",
+        "login_submit_no_transition": "submit_no_transition",
+        "password_field_not_found": "candidate_absent",
+        "password_input_not_retained": "postcondition_negative",
+        "unrecognized_surface": "unsupported_state",
+        "unsupported_login_state": "unsupported_state",
+        "username_field_not_found": "candidate_absent",
+        "username_field_not_ready": "interaction_not_verified",
+    }.get(str(code or ""), "none")
+
+
+def _record_auto_login_terminal(
+    observation: LoginSurfaceObservation,
+    code: str,
+) -> None:
+    selected = _auto_login_selected_candidate(observation)
+    payload = _auto_login_diagnostic_base(observation, selected)
+    payload.update(
+        {
+            "event": "terminal",
+            "attempt_number": 0,
+            "selected_candidate": _auto_login_candidate_diagnostic(
+                selected
+            ),
+            "interaction": {
+                "attempted": False,
+                "kind": "none",
+                "exception_class": "",
+            },
+            "postcondition": {"value_match": None},
+            "terminal": {
+                "owner": "auto_login_transaction_coordinator",
+                "code": code,
+                "reason_category": (
+                    _auto_login_terminal_reason_category(code)
+                ),
+            },
+        }
+    )
+    _write_auto_login_diagnostic(payload)
+
+
+_LOGIN_SURFACE_SCRIPT = r"""() => {
+  const INPUTS = "input,textarea,[contenteditable='true'],[contenteditable='plaintext-only']";
+  const CONTROLS = "button,input[type='submit'],input[type='button'],[role='button']";
+  const key = Symbol.for('sparkgrid.login.surface.v1');
+  let state = globalThis[key];
+  if (!state) {
+    state = {
+      documentRef: (
+        (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function')
+          ? globalThis.crypto.randomUUID()
+          : `${Date.now()}-${Math.random()}`
+      ),
+      mutation: 0,
+      sequence: 0,
+      nodeRefs: new WeakMap(),
+      groupRefs: new WeakMap(),
+    };
+    const root = document.documentElement;
+    if (root && typeof MutationObserver === 'function') {
+      state.observer = new MutationObserver(() => { state.mutation += 1; });
+      state.observer.observe(root, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+      });
+    }
+    globalThis[key] = state;
+  }
+  const token = (map, node, prefix) => {
+    if (!node) return '';
+    let value = map.get(node);
+    if (!value) {
+      state.sequence += 1;
+      value = `${prefix}${state.sequence}`;
+      map.set(node, value);
+    }
+    return value;
+  };
+  const visible = (el) => {
+    if (!el || !el.isConnected) return false;
+    const rect = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return (
+      rect.width > 1 && rect.height > 1 &&
+      style.display !== 'none' &&
+      style.visibility !== 'hidden' &&
+      Number.parseFloat(style.opacity || '1') > 0.01
+    );
+  };
+  const viewport = (rect) => (
+    rect.width > 1 && rect.height > 1 &&
+    rect.bottom > 0 && rect.right > 0 &&
+    rect.top < innerHeight && rect.left < innerWidth
+  );
+  const groupFor = (el) => {
+    if (el.form) return el.form;
+    let current = el.parentElement;
+    while (current && current !== document.body) {
+      const inputCount = current.querySelectorAll(INPUTS).length;
+      if (
+        inputCount > 0 &&
+        (inputCount > 1 || current.querySelector(CONTROLS))
+      ) return current;
+      current = current.parentElement;
+    }
+    return el.parentElement || document.body || document.documentElement;
+  };
+  const category = (value, allowed, fallback = 'other') => {
+    const normalized = String(value || '').trim().toLowerCase();
+    return allowed.includes(normalized) ? normalized : fallback;
+  };
+  const nodes = [...new Set(document.querySelectorAll(INPUTS))];
+  const candidates = nodes.map((el, index) => {
+    const rect = el.getBoundingClientRect();
+    const group = groupFor(el);
+    const groupVisibleControls = [...group.querySelectorAll(CONTROLS)]
+      .some(control => visible(control) && viewport(control.getBoundingClientRect()));
+    const action = String(
+      (el.form && el.form.getAttribute('action')) ||
+      (group && group.getAttribute && group.getAttribute('action')) ||
+      ''
+    ).toLowerCase();
+    const groupChallenge = (
+      action.includes('/challenge') ||
+      action.includes('/checkpoint') ||
+      !!group.querySelector(
+        "form[action*='/challenge' i],form[action*='/checkpoint' i]," +
+        "[data-testid*='challenge' i],[data-testid*='checkpoint' i]"
+      )
+    );
+    const rawType = String(
+      el.getAttribute('type') ||
+      (el.tagName.toLowerCase() === 'textarea' ? 'textarea' : 'text')
+    ).toLowerCase();
+    const rawAutocomplete = String(el.getAttribute('autocomplete') || '')
+      .trim().toLowerCase();
+    const rawName = String(el.getAttribute('name') || '').trim().toLowerCase();
+    const inputMode = String(el.getAttribute('inputmode') || '').trim().toLowerCase();
+    const maxLength = Number(el.getAttribute('maxlength') || 0);
+    let semantic = 'generic';
+    if (rawType === 'password' || rawAutocomplete === 'current-password') {
+      semantic = 'password';
+    } else if (
+      rawAutocomplete === 'one-time-code' ||
+      (
+        ['numeric', 'decimal'].includes(inputMode) &&
+        maxLength >= 4 && maxLength <= 8
+      )
+    ) {
+      semantic = 'otp';
+    } else if (
+      ['username', 'email', 'tel'].includes(rawAutocomplete) ||
+      ['email', 'tel'].includes(rawType) ||
+      /(^|[_-])(user(name)?|login|identifier|email|phone|mobile)([_-]|$)/.test(rawName)
+    ) {
+      semantic = 'username';
+    }
+    return {
+      index,
+      node_ref: token(state.nodeRefs, el, 'n'),
+      group_ref: token(state.groupRefs, group, 'g'),
+      semantic,
+      type_category: category(
+        rawType,
+        ['text', 'email', 'tel', 'password', 'number', 'search', 'textarea'],
+      ),
+      autocomplete_category: category(
+        rawAutocomplete,
+        ['username', 'email', 'tel', 'current-password', 'one-time-code', 'off', 'new-password'],
+        rawAutocomplete ? 'other' : 'none',
+      ),
+      numeric_mode: ['numeric', 'decimal'].includes(inputMode),
+      max_length: maxLength,
+      form_owned: !!el.form,
+      attached: !!el.isConnected,
+      visible: visible(el),
+      viewport_intersecting: viewport(rect),
+      bounding_box_present: rect.width > 1 && rect.height > 1,
+      disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+      readonly: !!el.readOnly || el.getAttribute('contenteditable') === 'false',
+      covered: false,
+      group_has_submit: groupVisibleControls,
+      group_challenge: groupChallenge,
+    };
+  });
+  const busy = [...document.querySelectorAll(
+    "[aria-busy='true'],[role='progressbar']"
+  )].some(visible);
+  return {
+    document_ref: state.documentRef,
+    mutation_epoch: state.mutation,
+    ready_state: String(document.readyState || ''),
+    loading: document.readyState !== 'complete' || busy || !document.body,
+    candidates,
+  };
+}"""
+
+
+def _trusted_login_frames(page) -> list[tuple[int, Any]]:
+    try:
+        frames = list(getattr(page, "frames", []) or [])
+    except Exception:
+        frames = []
+    try:
+        main_frame = getattr(page, "main_frame", None)
+    except Exception:
+        main_frame = None
+    if not frames and main_frame is not None:
+        frames = [main_frame]
+    trusted: list[tuple[int, Any]] = []
+    for index, frame in enumerate(frames):
+        if frame is main_frame:
+            trusted.append((index, frame))
+            continue
+        try:
+            parsed = urlparse(str(getattr(frame, "url", "") or ""))
+            host = str(parsed.hostname or "").lower()
+            scheme = str(parsed.scheme or "").lower()
+        except Exception:
+            continue
+        if scheme in {"about", "data"} or host == "instagram.com" or host.endswith(
+            ".instagram.com"
+        ):
+            trusted.append((index, frame))
+    return trusted
+
+
+def _login_route_category(page) -> str:
+    try:
+        parsed = urlparse(str(getattr(page, "url", "") or ""))
+        path = str(parsed.path or "").lower()
+    except Exception:
+        return "unknown"
+    if "/challenge" in path or "/checkpoint" in path:
+        return "challenge"
+    if "two_factor" in path or "two_step_verification" in path:
+        return "two_factor"
+    if "/consent" in path:
+        return "consent"
+    if "/accounts" in path or "/login" in path:
+        return "login_family"
+    return "instagram" if str(parsed.hostname or "").lower().endswith(
+        "instagram.com"
+    ) else "unknown"
+
+
+def _scoped_consent_surface(page) -> bool:
+    if _login_route_category(page) == "consent":
+        return True
+    try:
+        dialog = inspect_dialog(page)
+    except Exception:
+        return False
+    return bool(
+        dialog.get("present")
+        and str(dialog.get("category") or "") == "cookie_consent"
+    )
+
+
+def _candidate_score(raw: dict[str, Any], intent: str) -> int:
+    score = 0
+    if raw.get("visible"):
+        score += 60
+    else:
+        score -= 120
+    if raw.get("viewport_intersecting"):
+        score += 35
+    else:
+        score -= 60
+    if raw.get("bounding_box_present"):
+        score += 20
+    else:
+        score -= 50
+    if raw.get("attached"):
+        score += 15
+    else:
+        score -= 100
+    if raw.get("form_owned"):
+        score += 25
+    if raw.get("group_has_submit"):
+        score += 20
+    if raw.get("covered"):
+        score -= 15
+    if raw.get("disabled"):
+        score -= 30
+    if raw.get("readonly"):
+        score -= 30
+    semantic = str(raw.get("semantic") or "")
+    if semantic == intent:
+        score += 80
+    elif intent == "username" and semantic == "generic":
+        score += 10
+    return score
+
+
+def _classify_login_surface(
+    raw_candidates: list[dict[str, Any]],
+    *,
+    loading: bool,
+    url_category: str,
+    authenticated: bool = False,
+    consent: bool = False,
+    frame_epochs: tuple[tuple[int, str, int], ...] = (),
+) -> LoginSurfaceObservation:
+    candidates: list[LoginCandidateDescriptor] = []
+    groups: dict[str, list[LoginCandidateDescriptor]] = {}
+    group_has_submit: dict[str, bool] = {}
+    group_challenge: dict[str, bool] = {}
+    grouped_raw: dict[str, list[dict[str, Any]]] = {}
+    for raw in raw_candidates:
+        frame_index = int(raw.get("frame_index") or 0)
+        group_key = f"{frame_index}:{str(raw.get('group_ref') or '')}"
+        grouped_raw.setdefault(group_key, []).append(raw)
+    segmented_otp_groups = {
+        group_key
+        for group_key, values in grouped_raw.items()
+        if 4 <= len(values) <= 8
+        and all(
+            bool(item.get("numeric_mode"))
+            and int(item.get("max_length") or 0) == 1
+            for item in values
+        )
+    }
+
+    for raw in raw_candidates:
+        frame_index = int(raw.get("frame_index") or 0)
+        raw_group_ref = str(raw.get("group_ref") or "")
+        group_ref = f"{frame_index}:{raw_group_ref}"
+        semantic = str(raw.get("semantic") or "generic")
+        if group_ref in segmented_otp_groups:
+            semantic = "otp"
+        type_category = str(raw.get("type_category") or "other")
+        intent = semantic if semantic in {"password", "otp", "username"} else ""
+        if not intent and type_category not in {"password", "number", "search"}:
+            intent = "username"
+        recipe = LoginCandidateRecipe(
+            frame_index=frame_index,
+            node_index=int(raw.get("index") or 0),
+            node_ref=str(raw.get("node_ref") or ""),
+            group_ref=group_ref,
+        )
+        candidate = LoginCandidateDescriptor(
+            recipe=recipe,
+            intent=intent,
+            semantic=semantic,
+            type_category=type_category,
+            autocomplete_category=str(
+                raw.get("autocomplete_category") or "none"
+            ),
+            form_owned=bool(raw.get("form_owned")),
+            attached=bool(raw.get("attached")),
+            visible=bool(raw.get("visible")),
+            viewport_intersecting=bool(raw.get("viewport_intersecting")),
+            bounding_box_present=bool(raw.get("bounding_box_present")),
+            disabled=bool(raw.get("disabled")),
+            readonly=bool(raw.get("readonly")),
+            covered=bool(raw.get("covered")),
+            group_has_submit=bool(raw.get("group_has_submit")),
+            group_challenge=bool(raw.get("group_challenge")),
+            score=_candidate_score(raw, intent),
+        )
+        candidates.append(candidate)
+        groups.setdefault(recipe.group_ref, []).append(candidate)
+        group_has_submit[recipe.group_ref] = bool(raw.get("group_has_submit"))
+        group_challenge[recipe.group_ref] = bool(raw.get("group_challenge"))
+
+    fingerprint_parts: list[str] = [url_category, "loading" if loading else "stable"]
+    classified_groups: list[tuple[int, str, str]] = []
+    for group_ref, values in groups.items():
+        passwords = [item for item in values if item.intent == "password"]
+        otps = [item for item in values if item.intent == "otp"]
+        explicit_usernames = [
+            item
+            for item in values
+            if item.intent == "username" and item.semantic == "username"
+        ]
+        usernames = [
+            item
+            for item in values
+            if item.intent == "username"
+            and (
+                item.semantic == "username"
+                or bool(passwords)
+            )
+        ]
+        visible_score = max((item.score for item in values), default=-500)
+        if group_challenge.get(group_ref):
+            group_state, priority = "challenge", 1000
+        elif otps and not passwords:
+            group_state, priority = "two_factor", 900
+        elif usernames and passwords:
+            group_state, priority = "login_combined", 700
+        elif passwords:
+            group_state, priority = "login_password_only", 600
+        elif explicit_usernames and group_has_submit.get(group_ref):
+            group_state, priority = "login_username_first", 500
+        else:
+            group_state, priority = "unrelated", 0
+        classified_groups.append(
+            (priority + visible_score, group_state, group_ref)
+        )
+        fingerprint_parts.append(
+            f"{group_state}:{len(usernames)}:{len(passwords)}:{len(otps)}:"
+            f"{int(group_has_submit.get(group_ref, False))}"
+        )
+
+    classified_groups.sort(reverse=True)
+    selected_state = classified_groups[0][1] if classified_groups else ""
+    selected_group = classified_groups[0][2] if classified_groups else ""
+    if consent:
+        state, reason, selected_group = (
+            "consent_blocker",
+            "scoped consent surface is active",
+            "",
+        )
+    elif selected_state == "challenge" or url_category == "challenge":
+        state, reason = "challenge", "scoped challenge structure is active"
+    elif selected_state == "two_factor" or url_category == "two_factor":
+        state, reason = "two_factor", "OTP verification structure is active"
+    elif selected_state in LOGIN_CREDENTIAL_STATES:
+        state, reason = selected_state, "coherent credential group is active"
+    elif authenticated:
+        state, reason, selected_group = (
+            "authenticated",
+            "authenticated state confirmed without an active credential form",
+            "",
+        )
+    elif loading:
+        state, reason, selected_group = (
+            "transitioning",
+            "document or login surface is transitioning",
+            "",
+        )
+    else:
+        state, reason, selected_group = (
+            "unsupported_stable",
+            "stable document has no coherent login surface",
+            "",
+        )
+
+    return LoginSurfaceObservation(
+        state=state,
+        reason=reason,
+        url_category=url_category,
+        loading=bool(loading),
+        semantic_fingerprint="|".join(sorted(fingerprint_parts)),
+        frame_epochs=frame_epochs,
+        candidates=candidates,
+        selected_group_ref=selected_group,
+    )
+
+
+def _observe_login_surface(page) -> LoginSurfaceObservation:
+    raw_candidates: list[dict[str, Any]] = []
+    frame_epochs: list[tuple[int, str, int]] = []
+    loading = False
+    for frame_index, frame in _trusted_login_frames(page):
+        try:
+            payload = frame.evaluate(_LOGIN_SURFACE_SCRIPT)
+        except Exception:
+            continue
+        if (
+            not isinstance(payload, dict)
+            or "document_ref" not in payload
+            or not isinstance(payload.get("candidates"), list)
+        ):
+            continue
+        document_ref = str(payload.get("document_ref") or "")
+        mutation_epoch = int(payload.get("mutation_epoch") or 0)
+        frame_epochs.append((frame_index, document_ref, mutation_epoch))
+        loading = loading or bool(payload.get("loading"))
+        for raw in list(payload.get("candidates") or []):
+            if isinstance(raw, dict):
+                raw_candidates.append({**raw, "frame_index": frame_index})
+    url_category = _login_route_category(page)
+    has_credential_structure = any(
+        str(item.get("semantic") or "") in {"password", "otp"}
+        for item in raw_candidates
+    )
+    authenticated = False
+    if not has_credential_structure and url_category not in {
+        "challenge", "two_factor", "consent"
+    }:
+        try:
+            authenticated = bool(_authenticated_session_present(page))
+        except Exception:
+            authenticated = False
+    observation = _classify_login_surface(
+        raw_candidates,
+        loading=loading or not frame_epochs,
+        url_category=url_category,
+        authenticated=authenticated,
+        consent=_scoped_consent_surface(page),
+        frame_epochs=tuple(frame_epochs),
+    )
+    try:
+        _record_auto_login_observation(observation)
+    except Exception:
+        pass
+    return observation
+
+
+def _resolve_login_candidate(page, candidate: LoginCandidateDescriptor):
+    frames = dict(_trusted_login_frames(page))
+    frame = frames.get(candidate.recipe.frame_index)
+    if frame is None:
+        return None
+    try:
+        locator = frame.locator(LOGIN_INPUT_LIKE_SELECTOR).nth(
+            candidate.recipe.node_index
+        )
+        if int(locator.count() or 0) != 1:
+            return None
+        node_ref = str(
+            locator.evaluate(
+                """el => {
+                  const state=globalThis[Symbol.for('sparkgrid.login.surface.v1')];
+                  return state && state.nodeRefs.get(el) || '';
+                }"""
+            )
+            or ""
+        )
+    except Exception:
+        return None
+    return locator if node_ref == candidate.recipe.node_ref else None
+
+
+def _fresh_login_candidate(
+    page, intent: str, preferred_group_ref: str = ""
+) -> tuple[
+    LoginSurfaceObservation,
+    LoginCandidateDescriptor | None,
+    Any | None,
+]:
+    observation = _observe_login_surface(page)
+    for candidate in observation.candidates_for(intent, preferred_group_ref):
+        locator = _resolve_login_candidate(page, candidate)
+        if locator is not None:
+            return observation, candidate, locator
+    return observation, None, None
+
+
+def _wait_for_login_surface_change(
+    page,
+    observation: LoginSurfaceObservation,
+    *,
+    timeout_ms: int = 900,
+) -> None:
+    if not observation.frame_epochs:
+        return
+    frame_index, document_ref, mutation_epoch = observation.frame_epochs[0]
+    frame = dict(_trusted_login_frames(page)).get(frame_index)
+    if frame is None:
+        return
+    try:
+        frame.wait_for_function(
+            """previous => {
+              const state=globalThis[Symbol.for('sparkgrid.login.surface.v1')];
+              return !state ||
+                state.documentRef !== previous.documentRef ||
+                state.mutation !== previous.mutation ||
+                document.readyState !== 'complete';
+            }""",
+            arg={
+                "documentRef": document_ref,
+                "mutation": mutation_epoch,
+            },
+            timeout=max(50, int(timeout_ms)),
+        )
+    except Exception:
+        pass
+
+
+def _login_input_count(page) -> int:
+    """Compatibility metric: count unique input-like nodes, never form authority."""
+    return len(_observe_login_surface(page).candidates)
 
 
 def _login_fields(page, visible_timeout_ms: int = 600):
-    user_field = _first_visible(page, LOGIN_USER_SELECTORS, timeout_ms=visible_timeout_ms)
-    pass_field = _first_visible(page, LOGIN_PASS_SELECTORS, timeout_ms=visible_timeout_ms)
-    # Existing-but-not-visible elements are accepted only as a last render
-    # fallback; the fill path below must still prove their live values.
+    """Compatibility wrapper returning freshly resolved structural candidates."""
+    del visible_timeout_ms
+    observation = _observe_login_surface(page)
+    user = next(
+        iter(observation.candidates_for("username", observation.selected_group_ref)),
+        None,
+    )
+    password = next(
+        iter(observation.candidates_for("password", observation.selected_group_ref)),
+        None,
+    )
     return (
-        user_field or _first_existing(page, LOGIN_USER_SELECTORS),
-        pass_field or _first_existing(page, LOGIN_PASS_SELECTORS),
+        _resolve_login_candidate(page, user) if user else None,
+        _resolve_login_candidate(page, password) if password else None,
     )
 
 
 def _login_fields_available(page) -> bool:
-    user_field, pass_field = _login_fields(page, visible_timeout_ms=500)
-    return bool(user_field and pass_field)
+    return _observe_login_surface(page).state == "login_combined"
 
 
 def _body_text_len(page) -> int:
@@ -1750,7 +3370,7 @@ def _login_values_confirmed(user_field, pass_field, username: str, password: str
 
 
 def _login_field_ready(field) -> bool:
-    """Require a current visible, enabled, editable locator without logging it."""
+    """Sample weak actionability probes for diagnostics only."""
     if not field:
         return False
     for method in ("is_visible", "is_enabled", "is_editable"):
@@ -1778,55 +3398,415 @@ def _login_form_failure_code(dump) -> str:
     return str(getattr(dump, "login_form_failure_code", "") or "login_form_not_ready")
 
 
+def _login_page_frame_identity(page) -> tuple[int, int, str]:
+    """Compatibility identity enriched with the structural document epoch."""
+    observation = _observe_login_surface(page)
+    epoch = observation.frame_epochs[0] if observation.frame_epochs else (-1, "", -1)
+    return id(page), hash(epoch), observation.url_category
+
+
+def _wait_for_username_field_ready(
+    page,
+    dump: LiveDump,
+    account: str,
+    *,
+    total_seconds: float = 12.0,
+    required_missing_reads: int = 3,
+    clock=None,
+    wait=None,
+):
+    """Compatibility wait returning a fresh structural locator.
+
+    This helper has no terminal authority. Auto Login uses the interaction
+    transaction below, which attempts real input before any not-ready outcome.
+    """
+    now = clock or time.monotonic
+    deadline = now() + max(0.0, float(total_seconds))
+    del dump, account, required_missing_reads, wait
+    last_observation = _observe_login_surface(page)
+    while now() <= deadline:
+        observation, candidate, locator = _fresh_login_candidate(
+            page, "username"
+        )
+        if candidate is not None and locator is not None:
+            return locator
+        remaining = deadline - now()
+        if remaining <= 0:
+            break
+        _wait_for_login_surface_change(
+            page,
+            last_observation,
+            timeout_ms=int(min(remaining, 0.9) * 1000),
+        )
+        last_observation = observation
+    return None
+
+
 def _safe_clear_and_type(field, value: str, hum=None) -> bool:
-    """Clear then type a sensitive value; retention is verified by the caller."""
+    """Attempt normal Playwright input; the caller owns fresh verification."""
     try:
         if hum is not None:
-            hum.type_text(value, locator=field, clear=True, sensitive=True)
-        else:
-            field.click(timeout=4000, force=True)
-            field.fill("", timeout=5000, force=True)
-            field.fill(value, timeout=8000, force=True)
+            try:
+                hum.move_to_locator(field, timeout=2500, allow_overshoot=False)
+            except Exception:
+                pass
+        field.click(timeout=4000)
+        field.fill("", timeout=5000)
+        field.fill(value, timeout=8000)
         return True
     except Exception:
         return False
 
 
 def _verified_field_input(field, expected: str, hum=None, *, username: bool) -> tuple[bool, bool]:
-    """Input one field and prove its live DOM property, with one React fallback.
-
-    The return tuple is (verified, fallback_used).  Password values are never
-    emitted; callers only use an equality/non-empty predicate.
-    """
-    fallback_used = False
+    """Legacy single-locator helper retained for non-transaction test callers."""
     _safe_clear_and_type(field, expected, hum)
-    if ( _input_value(field).strip() == expected.strip() if username else _input_value(field) == expected ):
-        time.sleep(0.25)
-        if ( _input_value(field).strip() == expected.strip() if username else _input_value(field) == expected ):
-            return True, fallback_used
-    fallback_used = True
-    try:
-        _react_fill(field, expected)
-        time.sleep(0.25)
-    except Exception:
-        pass
-    return (( _input_value(field).strip() == expected.strip() if username else _input_value(field) == expected ), fallback_used)
+    value = _input_value(field)
+    return (
+        value.strip() == expected.strip() if username else value == expected,
+        False,
+    )
 
 
 def _react_fill(locator, value: str) -> None:
     """Set an input through its native setter and notify React without logging it."""
     locator.evaluate("""(el, value) => {
-        const proto = Object.getPrototypeOf(el);
-        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value') ||
-            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-        const tracker = el._valueTracker;
-        if (tracker && typeof tracker.setValue === 'function') tracker.setValue('');
-        if (descriptor && descriptor.set) descriptor.set.call(el, value);
-        else el.value = value;
+        if (el.isContentEditable) {
+            el.textContent = value;
+        } else {
+            const proto = Object.getPrototypeOf(el);
+            const descriptor = Object.getOwnPropertyDescriptor(proto, 'value') ||
+                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            const tracker = el._valueTracker;
+            if (tracker && typeof tracker.setValue === 'function') tracker.setValue('');
+            if (descriptor && descriptor.set) descriptor.set.call(el, value);
+            else el.value = value;
+        }
         try { el.dispatchEvent(new InputEvent('input', {bubbles:true, data:value, inputType:'insertText'})); }
         catch (_) { el.dispatchEvent(new Event('input', {bubbles:true})); }
         el.dispatchEvent(new Event('change', {bubbles:true}));
     }""", value)
+
+
+def _value_postcondition(intent: str, actual: str, expected: str) -> bool:
+    return (
+        str(actual or "").strip() == str(expected or "").strip()
+        if intent == "username"
+        else str(actual or "") == str(expected or "")
+    )
+
+
+def _fresh_login_value_postcondition(
+    page,
+    intent: str,
+    expected: str,
+    preferred_group_ref: str,
+) -> tuple[
+    bool,
+    LoginSurfaceObservation,
+    LoginCandidateDescriptor | None,
+]:
+    observation, candidate, locator = _fresh_login_candidate(
+        page, intent, preferred_group_ref
+    )
+    if candidate is None or locator is None:
+        return False, observation, candidate
+    try:
+        value = str(
+            locator.evaluate(
+                """el => el.isContentEditable
+                  ? String(el.textContent || '')
+                  : String(el.value || '')"""
+            )
+            or ""
+        )
+    except Exception:
+        value = ""
+    return (
+        _value_postcondition(intent, value, expected),
+        observation,
+        candidate,
+    )
+
+
+def _interaction_state_still_requires(
+    observation: LoginSurfaceObservation, intent: str
+) -> bool:
+    if intent == "username":
+        return observation.state in LOGIN_USERNAME_STATES
+    return observation.state in {"login_combined", "login_password_only"}
+
+
+def _interact_and_verify_login_candidate(
+    page,
+    *,
+    intent: str,
+    expected: str,
+    preferred_group_ref: str,
+    hum=None,
+    max_normal_attempts: int = 2,
+    total_seconds: float = 10.0,
+    clock=None,
+) -> LoginInteractionResult:
+    """Use real input plus a fresh value read as the credential authority."""
+    now = clock or time.monotonic
+    deadline = now() + max(0.2, float(total_seconds))
+    normal_attempts = 0
+    fresh_observations = 0
+    missing_observations = 0
+    candidate_seen = False
+    viable_seen = False
+    postcondition_checks = 0
+    fallback_attempted = False
+    fallback_available = False
+    human_action_failures = 0
+    exceptions: list[str] = []
+    last_state = "transitioning"
+    last_group = preferred_group_ref
+    last_observation = _observe_login_surface(page)
+
+    while normal_attempts < max(2, int(max_normal_attempts)) and now() < deadline:
+        observation, candidate, locator = _fresh_login_candidate(
+            page, intent, last_group
+        )
+        fresh_observations += 1
+        last_observation = observation
+        last_state = observation.state
+        if not _interaction_state_still_requires(observation, intent):
+            break
+        if candidate is None or locator is None:
+            missing_observations += 1
+            _wait_for_login_surface_change(
+                page,
+                observation,
+                timeout_ms=int(min(0.9, max(0.05, deadline - now())) * 1000),
+            )
+            continue
+
+        candidate_seen = True
+        viable_seen = viable_seen or candidate.structurally_viable
+        last_group = candidate.recipe.group_ref
+        # Weak probes are deliberately sampled but never gate the real action.
+        probes: dict[str, bool | None] = {
+            "visible": None,
+            "enabled": None,
+            "editable": None,
+        }
+        for method in ("is_visible", "is_enabled", "is_editable"):
+            try:
+                probe = getattr(locator, method, None)
+                if probe is not None:
+                    probes[method.removeprefix("is_")] = bool(
+                        probe(timeout=500)
+                    )
+            except Exception:
+                pass
+
+        # Probes are observations, so resolve the recipe again before acting.
+        # A React replacement during a probe invalidates the prior locator.
+        locator = _resolve_login_candidate(page, candidate)
+        if locator is None:
+            try:
+                _record_auto_login_interaction(
+                    observation,
+                    candidate,
+                    attempt_number=normal_attempts + 1,
+                    attempted=False,
+                    kind="reacquire",
+                    probes=probes,
+                    exception_class="NodeReplaced",
+                    value_match=None,
+                    node_replacement=True,
+                )
+            except Exception:
+                pass
+            _wait_for_login_surface_change(
+                page,
+                observation,
+                timeout_ms=int(
+                    min(0.9, max(0.05, deadline - now())) * 1000
+                ),
+            )
+            continue
+
+        normal_attempts += 1
+        attempt_exception = ""
+        action_accepted = True
+        try:
+            if hum is not None:
+                action_accepted = bool(hum.type_text(
+                    expected,
+                    locator=locator,
+                    clear=True,
+                    sensitive=True,
+                    allow_typos=False,
+                ))
+                if not action_accepted:
+                    human_action_failures += 1
+                    attempt_exception = "HumanActionNotExecuted"
+                    exceptions.append(attempt_exception)
+            else:
+                locator.click(timeout=1800)
+                locator.fill("", timeout=2200)
+                locator.fill(expected, timeout=3500)
+        except Exception as exc:
+            action_accepted = False
+            if hum is not None:
+                human_action_failures += 1
+            attempt_exception = type(exc).__name__
+            exceptions.append(attempt_exception)
+
+        matched, post_observation, post_candidate = (
+            _fresh_login_value_postcondition(
+                page, intent, expected, last_group
+            )
+        )
+        matched = bool(matched and action_accepted)
+        fresh_observations += 1
+        postcondition_checks += 1
+        last_observation = post_observation
+        last_state = post_observation.state
+        if post_candidate is not None:
+            candidate_seen = True
+            viable_seen = viable_seen or post_candidate.structurally_viable
+            last_group = post_candidate.recipe.group_ref
+        node_replacement = bool(
+            post_candidate is None
+            or post_candidate.recipe.node_ref
+            != candidate.recipe.node_ref
+        )
+        try:
+            _record_auto_login_interaction(
+                post_observation,
+                post_candidate or candidate,
+                attempt_number=normal_attempts,
+                attempted=True,
+                kind="click_fill",
+                probes=probes,
+                exception_class=attempt_exception,
+                value_match=matched,
+                node_replacement=node_replacement,
+            )
+        except Exception:
+            pass
+        if matched:
+            return LoginInteractionResult(
+                verified=True,
+                intent=intent,
+                state=last_state,
+                group_ref=last_group,
+                candidate_seen=candidate_seen,
+                structurally_viable_seen=viable_seen,
+                normal_attempts=normal_attempts,
+                fresh_observations=fresh_observations,
+                missing_observations=missing_observations,
+                postcondition_checks=postcondition_checks,
+                exception_classes=tuple(exceptions),
+                reason="fresh value postcondition matched",
+            )
+        _wait_for_login_surface_change(
+            page,
+            post_observation,
+            timeout_ms=int(min(0.9, max(0.05, deadline - now())) * 1000),
+        )
+
+    if (
+        normal_attempts >= 2
+        and now() < deadline
+        and not (
+            hum is not None
+            and human_action_failures >= normal_attempts
+        )
+    ):
+        observation, candidate, locator = _fresh_login_candidate(
+            page, intent, last_group
+        )
+        fresh_observations += 1
+        last_observation = observation
+        last_state = observation.state
+        if candidate is not None and locator is not None:
+            candidate_seen = True
+            viable_seen = viable_seen or candidate.structurally_viable
+            last_group = candidate.recipe.group_ref
+            if not candidate.readonly and not candidate.disabled:
+                fallback_available = True
+                fallback_attempted = True
+                fallback_exception = ""
+                try:
+                    _react_fill(locator, expected)
+                except Exception as exc:
+                    fallback_exception = type(exc).__name__
+                    exceptions.append(fallback_exception)
+                matched, post_observation, post_candidate = (
+                    _fresh_login_value_postcondition(
+                        page, intent, expected, last_group
+                    )
+                )
+                fresh_observations += 1
+                postcondition_checks += 1
+                last_observation = post_observation
+                last_state = post_observation.state
+                if post_candidate is not None:
+                    last_group = post_candidate.recipe.group_ref
+                try:
+                    _record_auto_login_interaction(
+                        post_observation,
+                        post_candidate or candidate,
+                        attempt_number=normal_attempts + 1,
+                        attempted=True,
+                        kind="native_setter",
+                        exception_class=fallback_exception,
+                        value_match=matched,
+                        node_replacement=bool(
+                            post_candidate is None
+                            or post_candidate.recipe.node_ref
+                            != candidate.recipe.node_ref
+                        ),
+                    )
+                except Exception:
+                    pass
+                if matched:
+                    return LoginInteractionResult(
+                        verified=True,
+                        intent=intent,
+                        state=last_state,
+                        group_ref=last_group,
+                        candidate_seen=True,
+                        structurally_viable_seen=viable_seen,
+                        normal_attempts=normal_attempts,
+                        fresh_observations=fresh_observations,
+                        missing_observations=missing_observations,
+                        fallback_available=True,
+                        fallback_attempted=True,
+                        postcondition_checks=postcondition_checks,
+                        exception_classes=tuple(exceptions),
+                        reason="fresh value postcondition matched after native setter",
+                    )
+
+    reason = (
+        "candidate absent after fresh structural observations"
+        if not candidate_seen
+        else "fresh value postconditions remained negative"
+    )
+    if not _interaction_state_still_requires(last_observation, intent):
+        reason = "login surface changed before value verification"
+    return LoginInteractionResult(
+        verified=False,
+        intent=intent,
+        state=last_state,
+        group_ref=last_group,
+        candidate_seen=candidate_seen,
+        structurally_viable_seen=viable_seen,
+        normal_attempts=normal_attempts,
+        fresh_observations=fresh_observations,
+        missing_observations=missing_observations,
+        fallback_available=fallback_available,
+        fallback_attempted=fallback_attempted,
+        postcondition_checks=postcondition_checks,
+        exception_classes=tuple(exceptions),
+        reason=reason,
+    )
+
 
 def _looks_like_cookie_or_session(value: str) -> bool:
     v = str(value or "").strip().lower()
@@ -1900,66 +3880,46 @@ def _detect_login_rejection(page) -> str:
 
 
 def _wait_for_instagram_login_form(page, dump: LiveDump, total_seconds: int = 24, account: str = "") -> bool:
-    """Instagram Web sometimes lands on a blank app shell before React renders.
-    Wait, reload once, then fall back to the direct login URL before giving up.
-    """
-    deadline = time.time() + total_seconds
-    reloaded = False
-    direct_loaded = False
-    while time.time() < deadline:
+    """Wait for a coherent login group; observations are never locators."""
+    deadline = time.monotonic() + max(0.2, float(total_seconds))
+    observation = _observe_login_surface(page)
+    while time.monotonic() < deadline:
         _dismiss_instagram_consent(page, dump, account)
-        if _login_fields_available(page) or _login_input_count(page) >= 2:
+        ready, blocker_state, _reason = _login_blocker_first(
+            page,
+            dump,
+            account,
+            "login surface",
+            wait_seconds=0.2,
+            structural_login_surface=True,
+        )
+        if not ready or blocker_state in {
+            "checkpoint", "restricted", "suspended", "unknown_popup"
+        }:
+            return False
+        observation = _observe_login_surface(page)
+        if observation.state in LOGIN_CREDENTIAL_STATES:
             return True
-        text_len = _body_text_len(page)
-        if text_len > 0:
-            _click_login_if_present(page, dump, account)
-            _dismiss_instagram_consent(page, dump, account)
-            if _login_fields_available(page) or _login_input_count(page) >= 2:
-                return True
-        remaining = deadline - time.time()
-        if text_len <= 0 and not reloaded and remaining < total_seconds - 8:
-            reloaded = True
-            dump.capture(page, "auto_login_blank_reload", "login page not rendered yet; reloading")
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=45000)
-            except Exception:
-                pass
-        elif not direct_loaded and remaining < total_seconds - 14:
-            direct_loaded = True
-            dump.capture(page, "auto_login_direct_login_fallback", "opening direct instagram login URL")
-            try:
-                page.goto("https://www.instagram.com/accounts/login/?hl=en",
-                          wait_until="domcontentloaded", timeout=60000)
-            except Exception:
-                pass
-        time.sleep(0.7)
-    return _login_fields_available(page) or _login_input_count(page) >= 2
+        if observation.state in {
+            "authenticated", "two_factor", "challenge", "unsupported_stable"
+        }:
+            return False
+        _wait_for_login_surface_change(
+            page,
+            observation,
+            timeout_ms=int(
+                min(0.9, max(0.05, deadline - time.monotonic())) * 1000
+            ),
+        )
+    return _observe_login_surface(page).state in LOGIN_CREDENTIAL_STATES
 
 
 def _classify_login_form_failure(page) -> str:
-    text_len = _body_text_len(page)
-    url = ""
-    try:
-        url = page.url or ""
-    except Exception:
-        pass
-    if text_len <= 0:
-        return "instagram page never rendered (blank body after retries; proxy/network dead or JS blocked)"
-    try:
-        txt = (page.locator("body").inner_text(timeout=1200) or "").strip().lower()
-    except Exception:
-        txt = ""
-    if any(s in txt for s in ["cookie", "cookies", "allow all", "essential and optional"]):
-        return "instagram cookie consent still blocks the login form"
-    if any(s in txt for s in ["captcha", "unusual traffic", "automated", "try again later"]):
-        return "instagram/browser route hit captcha or traffic restriction"
-    if any(s in txt for s in ["502 bad gateway", "503 service unavailable", "504 gateway timeout", "proxy error", "connection timed out"]):
-        return "proxy/network gateway failed before the Instagram login form rendered"
-    if any(s in txt for s in ["this site can't be reached", "connection was reset", "server ip address could not be found"]):
-        return "proxy/network connection failed before the Instagram login form rendered"
-    if "accounts/login" not in url and "instagram.com" in url:
-        return f"instagram login form not visible on current page ({url})"
-    return "instagram login form inputs not found after retries"
+    observation = _observe_login_surface(page)
+    return (
+        f"state={observation.state}; url_category={observation.url_category}; "
+        f"reason={observation.reason}"
+    )
 
 
 ACTION_NOT_EXECUTED = "ACTION_NOT_EXECUTED"
@@ -2314,23 +4274,59 @@ def _login_post_action_ui(page) -> dict:
     return defaults
 
 
-def _login_submit_control(page, timeout_ms: int = 700):
+def _login_submit_control(
+    page, timeout_ms: int = 700, *, group_ref: str = ""
+):
     """Return a fresh, form-scoped semantic submit control when one exists."""
-    for selector in (
-        "form button[type='submit']",
-        "form [role='button'][type='submit']",
-        "form button",
-    ):
+    # Enumerate every generic control in trusted frames. A hidden first match
+    # cannot suppress a later visible control in the selected credential group.
+    for frame_index, frame in _trusted_login_frames(page):
+        expected_group_ref = str(group_ref or "")
+        if ":" in expected_group_ref:
+            expected_frame, expected_group_ref = expected_group_ref.split(
+                ":", 1
+            )
+            if expected_frame.isdigit() and int(expected_frame) != frame_index:
+                continue
         try:
-            controls = page.locator(selector)
-            count = min(int(controls.count() or 0), 8)
+            controls = frame.locator(LOGIN_CONTROL_SELECTOR)
+            count = min(int(controls.count() or 0), 30)
         except Exception:
             continue
         for index in range(count):
             try:
                 control = controls.nth(index)
-                if control.is_visible(timeout=timeout_ms):
-                    return control
+                candidate_group = str(
+                    control.evaluate(
+                        """el => {
+                          const INPUTS = "input,textarea,[contenteditable='true'],[contenteditable='plaintext-only']";
+                          const CONTROLS = "button,input[type='submit'],input[type='button'],[role='button']";
+                          const state=globalThis[Symbol.for('sparkgrid.login.surface.v1')];
+                          if (!state) return '';
+                          const groupFor = node => {
+                            if (node.form) return node.form;
+                            let current=node.parentElement;
+                            while (current && current !== document.body) {
+                              const count=current.querySelectorAll(INPUTS).length;
+                              if (count > 0 && (count > 1 || current.querySelector(CONTROLS))) {
+                                return current;
+                              }
+                              current=current.parentElement;
+                            }
+                            return node.parentElement || document.body || document.documentElement;
+                          };
+                          return state.groupRefs.get(groupFor(el)) || '';
+                        }"""
+                    )
+                    or ""
+                )
+                if group_ref and candidate_group != expected_group_ref:
+                    continue
+                # Playwright 1.60 removed the Locator.is_visible timeout
+                # argument; visibility remains an immediate fresh-state probe.
+                if not control.is_visible():
+                    continue
+                return control
             except Exception:
                 continue
     return None
@@ -2364,9 +4360,19 @@ def _control_state(control) -> dict:
     return state
 
 
-def _execute_login_submit(page, pass_field, account: str, dump: LiveDump, hum=None) -> tuple[str, str, object, dict]:
+def _execute_login_submit(
+    page,
+    pass_field,
+    account: str,
+    dump: LiveDump,
+    hum=None,
+    *,
+    group_ref: str = "",
+) -> tuple[str, str, object, dict]:
     """Dispatch exactly one submit, retrying only a human action proven false."""
-    control = _login_submit_control(page, timeout_ms=1200)
+    control = _login_submit_control(
+        page, timeout_ms=1200, group_ref=group_ref
+    )
     before = _control_state(control)
     if control is not None and before.get("visible") and before.get("enabled"):
         if hum is not None:
@@ -2383,8 +4389,30 @@ def _execute_login_submit(page, pass_field, account: str, dump: LiveDump, hum=No
             return ACTION_NOT_EXECUTED, "button_click_failed", control, before
     try:
         if hum is not None:
+            if group_ref:
+                _surface, _candidate, pass_field = _fresh_login_candidate(
+                    page, "password", group_ref
+                )
+                if pass_field is None:
+                    return (
+                        ACTION_NOT_EXECUTED,
+                        "password_reacquire_failed",
+                        control,
+                        before,
+                    )
             hum.press(pass_field, "Enter")
         else:
+            if group_ref:
+                _surface, _candidate, pass_field = _fresh_login_candidate(
+                    page, "password", group_ref
+                )
+                if pass_field is None:
+                    return (
+                        ACTION_NOT_EXECUTED,
+                        "password_reacquire_failed",
+                        control,
+                        before,
+                    )
             pass_field.press("Enter", timeout=3000)
         _record_direct_fallback(dump, "submit_login_form_enter")
         return ACTION_ACCEPTED_TRANSITIONING, "password_enter", control, before
@@ -2392,197 +4420,615 @@ def _execute_login_submit(page, pass_field, account: str, dump: LiveDump, hum=No
         return ACTION_NOT_EXECUTED, "enter_failed", control, before
 
 
-def _fill_instagram_login_form(page, account: dict, dump: LiveDump) -> bool:
-    name = account["name"]
-    password = str(account.get("api_password") or "").strip()
-    if not password:
-        raise RuntimeError("missing saved api_password for web auto-login")
-    if _looks_like_cookie_or_session(password):
-        raise RuntimeError("saved api_password looks like a cookie/session dump, not a real password")
-    _dismiss_instagram_consent(page, dump, name)
-    if not _wait_for_instagram_login_form(page, dump, account=name):
-        _set_login_form_failure(dump, "login_form_not_ready")
-        dump.capture(page, "auto_login_no_form", "login form not ready", force_snapshot=True)
+class _AutoLoginTransactionCoordinator:
+    """Own structural credential actions and the single terminal boundary."""
+
+    def __init__(self, page, account: dict, dump: LiveDump):
+        self.page = page
+        self.account = account
+        self.dump = dump
+        self.name = str(account.get("name") or "")
+        self.password = str(account.get("api_password") or "").strip()
+        self.hum = _human_for(page, self.name, dump)
+
+    def _terminal(self, code: str, reason: str) -> bool:
+        observation = getattr(
+            self.dump, "_auto_login_last_observation", None
+        )
+        if not isinstance(observation, LoginSurfaceObservation):
+            observation = LoginSurfaceObservation(
+                state={
+                    "blocker_detected": "blocker_detected",
+                    "challenge_detected": "challenge",
+                    "unrecognized_surface": "unsupported_stable",
+                    "unsupported_login_state": "unsupported_stable",
+                }.get(code, "unknown"),
+                reason="",
+                url_category="unknown",
+                loading=False,
+                semantic_fingerprint="",
+                frame_epochs=(),
+                candidates=[],
+                selected_group_ref="",
+            )
+        try:
+            _record_auto_login_terminal(observation, code)
+        except Exception:
+            pass
+        _set_login_form_failure(self.dump, code)
+        self.dump.capture(
+            self.page,
+            "auto_login_" + code,
+            reason,
+            force_snapshot=True,
+            take_screenshot=False,
+            take_visible_text=False,
+        )
         return False
 
-    if not _login_credentials_action_ready(page, dump, name, "username input"):
-        return False
-
-    # Stage 1: username is an explicit gate.  Do not retain the password
-    # locator across a React render and do not even discover it until this
-    # live-value verification has succeeded.
-    user_field, _ = _login_fields(page, visible_timeout_ms=1800)
-    if not _login_field_ready(user_field):
-        _set_login_form_failure(dump, "username_field_not_found")
-        dump.capture(page, "auto_login_username_field_not_found", "username field unavailable", force_snapshot=True)
-        return False
-    hum = _human_for(page, name, dump)
-    username_ok, username_fallback = _verified_field_input(user_field, name, hum, username=True)
-    if not username_ok:
-        _set_login_form_failure(dump, "username_input_not_retained")
-        dump.capture(page, "auto_login_username_not_retained", "username live value was not retained; password and submit blocked", force_snapshot=True)
-        # Preserve the established aggregate diagnostic marker for callers
-        # while exposing the precise username-first typed result.
-        dump.capture(page, "auto_login_values_not_retained", "login fields were not verified; submit blocked", force_snapshot=True)
-        return False
-    dump.capture(page, "auto_login_username_verified", f"username_verified=true fallback_used={str(username_fallback).lower()}")
-
-    if not _login_credentials_action_ready(page, dump, name, "password input"):
-        return False
-
-    # Stage 2: rediscover after the username stabilization period.  This makes
-    # detached handles a bounded local failure instead of password-only input.
-    _, pass_field = _login_fields(page, visible_timeout_ms=1800)
-    if not _login_field_ready(pass_field):
-        _set_login_form_failure(dump, "password_field_not_found")
-        dump.capture(page, "auto_login_password_field_not_found", "password field unavailable", force_snapshot=True)
-        return False
-    password_ok, password_fallback = _verified_field_input(pass_field, password, hum, username=False)
-    if not password_ok:
-        _set_login_form_failure(dump, "password_input_not_retained")
-        dump.capture(page, "auto_login_password_not_retained", "password live value was not retained; submit blocked")
-        return False
-
-    # Password focus/input can make React re-render the username field.  One
-    # bounded rediscovery and restoration is allowed; never alternate forever.
-    user_field, pass_field = _login_fields(page, visible_timeout_ms=1800)
-    if not _login_field_ready(user_field) or not _login_field_ready(pass_field):
-        _set_login_form_failure(dump, "login_fields_not_verified")
-        return False
-    if _input_value(user_field).strip() != name.strip():
-        restored, restore_fallback = _verified_field_input(user_field, name, hum, username=True)
-        username_fallback = username_fallback or restore_fallback
-        user_field, pass_field = _login_fields(page, visible_timeout_ms=1800)
-        if not restored or not _login_field_ready(user_field) or not _login_field_ready(pass_field):
-            _set_login_form_failure(dump, "username_input_not_retained")
-            dump.capture(page, "auto_login_username_not_retained", "username disappeared after password input; submit blocked", force_snapshot=True)
-            return False
-    if _input_value(user_field).strip() != name.strip() or not _input_value(pass_field):
-        _set_login_form_failure(dump, "login_fields_not_verified")
-        dump.capture(page, "auto_login_values_not_retained", "login fields were not verified; submit blocked")
-        return False
-    dump.capture(page, "auto_login_values_confirmed", f"username_verified=true password_verified=true fallback_used={str(username_fallback or password_fallback).lower()}")
-    if not _login_credentials_action_ready(page, dump, name, "login submit"):
-        return False
-    before_url = str(getattr(page, "url", "") or "")
-    # Final pre-submit gate uses fresh locators.  It deliberately does not
-    # treat placeholder/autofill attributes as values and does not submit from
-    # a landing page CTA.
-    user_field, pass_field = _login_fields(page, visible_timeout_ms=1200)
-    if (not _login_field_ready(user_field) or not _login_field_ready(pass_field)
-            or _input_value(user_field).strip() != name.strip() or not _input_value(pass_field)):
-        _set_login_form_failure(dump, "login_fields_not_verified")
-        return False
-    telemetry = LoginPostActionTelemetry(page, dump)
-    telemetry.start()
-    dump._login_post_action_telemetry = telemetry
-    recovery_workflow_id = str(
-        os.environ.get("SPARKGRID_PASSWORD_RECOVERY_WORKFLOW_ID") or ""
-    )
-    submission_reserved = False
-    if recovery_workflow_id:
-        reservation = reserve_password_submission(name, recovery_workflow_id)
-        if not reservation.get("ok"):
-            raise RuntimeError(
-                "password_submission_blocked: "
-                + str(
-                    reservation.get("reason")
-                    or "durable recovery gate rejected submit"
+    def _wait_for_surface(
+        self, *, total_seconds: float = 20.0
+    ) -> LoginSurfaceWaitResult:
+        deadline = time.monotonic() + max(0.5, float(total_seconds))
+        stable_fingerprint = ""
+        stable_reads = 0
+        last_observation: LoginSurfaceObservation | None = None
+        while time.monotonic() < deadline:
+            _dismiss_instagram_consent(
+                self.page, self.dump, self.name
+            )
+            ready, blocker_state, blocker_reason = _login_blocker_first(
+                self.page,
+                self.dump,
+                self.name,
+                "credential transaction",
+                wait_seconds=0.2,
+                structural_login_surface=True,
+            )
+            if not ready:
+                code = (
+                    "challenge_detected"
+                    if blocker_state in {
+                        "checkpoint", "restricted", "suspended"
+                    }
+                    else "blocker_detected"
                 )
+                return LoginSurfaceWaitResult(
+                    None, code, blocker_reason or blocker_state
+                )
+
+            observation = _observe_login_surface(self.page)
+            last_observation = observation
+            if observation.state in LOGIN_CREDENTIAL_STATES:
+                return LoginSurfaceWaitResult(observation)
+            if observation.state == "authenticated":
+                self.dump._login_transaction_authenticated = True
+                return LoginSurfaceWaitResult(observation)
+            if observation.state == "two_factor":
+                self.dump._login_transaction_two_factor = True
+                return LoginSurfaceWaitResult(observation)
+            if observation.state == "challenge":
+                return LoginSurfaceWaitResult(
+                    None,
+                    "challenge_detected",
+                    observation.reason,
+                )
+
+            if observation.semantic_fingerprint == stable_fingerprint:
+                stable_reads += 1
+            else:
+                stable_fingerprint = observation.semantic_fingerprint
+                stable_reads = 1
+            if observation.state == "consent_blocker" and stable_reads >= 3:
+                return LoginSurfaceWaitResult(
+                    None,
+                    "blocker_detected",
+                    "scoped consent blocker remained after bounded resolution",
+                )
+            if observation.state == "unsupported_stable" and stable_reads >= 3:
+                return LoginSurfaceWaitResult(
+                    None,
+                    "unrecognized_surface",
+                    "stable observations contained no coherent login surface",
+                )
+            _wait_for_login_surface_change(
+                self.page,
+                observation,
+                timeout_ms=int(
+                    min(
+                        0.9,
+                        max(0.05, deadline - time.monotonic()),
+                    )
+                    * 1000
+                ),
             )
-        submission_reserved = True
-    action_state, method, submit_control, control_before = _execute_login_submit(
-        page, pass_field, name, dump, hum
-    )
-    if action_state == ACTION_NOT_EXECUTED:
-        if submission_reserved:
-            finish_password_submission(
-                name, recovery_workflow_id, physically_dispatched=False
+        return LoginSurfaceWaitResult(
+            None,
+            "login_form_transition_timeout",
+            (
+                "login surface did not settle before the bounded deadline"
+                if last_observation is None
+                else f"last_state={last_observation.state}"
+            ),
+        )
+
+    def _interaction_terminal(
+        self,
+        result: LoginInteractionResult,
+        *,
+        initial_state: str,
+    ) -> bool:
+        if result.intent == "username":
+            if (
+                result.candidate_seen
+                and result.structurally_viable_seen
+                and result.normal_attempts >= 2
+                and result.postcondition_checks >= 2
+                and (
+                    not result.fallback_available
+                    or result.fallback_attempted
+                )
+                and result.state in LOGIN_USERNAME_STATES
+            ):
+                return self._terminal(
+                    "username_field_not_ready",
+                    (
+                        "two normal attempts against freshly reacquired "
+                        "username candidates had negative fresh postconditions"
+                    ),
+                )
+            if (
+                not result.candidate_seen
+                and result.missing_observations >= 3
+                and initial_state in LOGIN_USERNAME_STATES
+            ):
+                return self._terminal(
+                    "username_field_not_found",
+                    "fresh observations could not reacquire a username candidate",
+                )
+            return self._terminal(
+                "login_form_transition_timeout",
+                result.reason or "username transaction changed state",
             )
-        telemetry.stop(ACTION_NOT_EXECUTED)
-        dump._login_post_action_telemetry = None
-        _set_login_form_failure(dump, "login_submit_control_not_found")
-        return False
-    dump.capture(
-        page,
-        "auto_login_submit_dispatched",
-        f"method={method}; url_unchanged={str(str(getattr(page, 'url', '') or '') == before_url).lower()}; "
-        f"control_present={str(bool(control_before.get('present'))).lower()}; "
-        f"control_enabled={str(bool(control_before.get('enabled'))).lower()}",
-        take_screenshot=False,
-        take_visible_text=False,
-    )
-    transition, evidence = _wait_for_password_submit_activation(
-        page, pass_field, before_url, submit_control=submit_control,
-        timeout_seconds=8.0, telemetry=telemetry,
-    )
-    if (
-        transition == UNKNOWN_STABLE_STATE
-        and method == "password_enter"
-        and not telemetry.login_request_started
-    ):
-        # Enter produced no request, navigation, loading, disabled form, or
-        # known state. Only in that proven no-action case is one fresh
-        # locator fallback allowed.
-        fresh_ui = _login_post_action_ui(page)
-        fallback_control = _login_submit_control(page, timeout_ms=1200)
-        fallback_state = _control_state(fallback_control)
-        if (
-            not fresh_ui.get("submit_loading")
-            and not fresh_ui.get("login_form_disabled")
-            and not fresh_ui.get("password_disabled")
-            and fallback_control is not None
-            and fallback_state.get("visible")
-            and fallback_state.get("enabled")
-        ):
+        if not result.candidate_seen:
+            return self._terminal(
+                "password_field_not_found",
+                "fresh observations could not reacquire a password candidate",
+            )
+        return self._terminal(
+            "password_input_not_retained",
+            result.reason or "fresh password postconditions remained negative",
+        )
+
+    def _continue_username_first(
+        self, observation: LoginSurfaceObservation
+    ) -> LoginSurfaceWaitResult:
+        group_ref = observation.selected_group_ref
+        deadline = time.monotonic() + 8.0
+        attempts = 0
+        current = observation
+        while time.monotonic() < deadline and attempts < 2:
+            current = _observe_login_surface(self.page)
+            if current.state != "login_username_first":
+                return LoginSurfaceWaitResult(current)
+            control = _login_submit_control(
+                self.page,
+                timeout_ms=900,
+                group_ref=group_ref or current.selected_group_ref,
+            )
+            if control is None:
+                _wait_for_login_surface_change(
+                    self.page, current, timeout_ms=700
+                )
+                continue
+            attempts += 1
             try:
-                fallback_control.click(timeout=5000)
-                _record_direct_fallback(dump, "submit_login_form_locator_after_enter_no_request")
-                dump.capture(
-                    page,
-                    "auto_login_submit_fallback_dispatched",
-                    "method=button_locator_click; reason=enter_produced_no_request_or_transition",
-                    take_screenshot=False,
-                    take_visible_text=False,
-                )
-                transition, evidence = _wait_for_password_submit_activation(
-                    page, pass_field, before_url, submit_control=fallback_control,
-                    timeout_seconds=8.0, telemetry=telemetry,
-                )
+                control.click(timeout=5000)
             except Exception:
                 pass
-    if transition in {UNKNOWN_STABLE_STATE, ACTION_NOT_EXECUTED, TERMINAL_FAILURE}:
+            # The clicked control and all pre-click observations are invalid.
+            post = _observe_login_surface(self.page)
+            if post.state != "login_username_first":
+                return LoginSurfaceWaitResult(post)
+            _wait_for_login_surface_change(
+                self.page, post, timeout_ms=900
+            )
+        return LoginSurfaceWaitResult(
+            None,
+            "login_form_transition_timeout",
+            "verified username continuation did not reach a new structural state",
+        )
+
+    def run(self) -> bool:
+        token = _ACTIVE_AUTO_LOGIN_DIAGNOSTIC_DUMP.set(
+            getattr(self, "dump", None)
+        )
+        try:
+            return self._run_transaction()
+        finally:
+            _ACTIVE_AUTO_LOGIN_DIAGNOSTIC_DUMP.reset(token)
+
+    def _run_transaction(self) -> bool:
+        surface = self._wait_for_surface()
+        if surface.code:
+            return self._terminal(surface.code, surface.reason)
+        observation = surface.observation
+        if observation is None:
+            return self._terminal(
+                "login_form_transition_timeout",
+                "credential transaction produced no observation",
+            )
+        if observation.state in {"authenticated", "two_factor"}:
+            return True
+        if not self.password:
+            raise RuntimeError("missing saved api_password for web auto-login")
+        if _looks_like_cookie_or_session(self.password):
+            raise RuntimeError(
+                "saved api_password looks like a cookie/session dump, not a real password"
+            )
+
+        username_result: LoginInteractionResult | None = None
+        if observation.state in LOGIN_USERNAME_STATES:
+            username_result = _interact_and_verify_login_candidate(
+                self.page,
+                intent="username",
+                expected=self.name,
+                preferred_group_ref=observation.selected_group_ref,
+                hum=self.hum,
+            )
+            if not username_result.verified:
+                return self._interaction_terminal(
+                    username_result, initial_state=observation.state
+                )
+            self.dump.capture(
+                self.page,
+                "auto_login_username_verified",
+                (
+                    "username_verified=true; "
+                    f"normal_attempts={username_result.normal_attempts}; "
+                    f"fallback_used={str(username_result.fallback_attempted).lower()}"
+                ),
+                take_screenshot=False,
+                take_visible_text=False,
+            )
+            observation = _observe_login_surface(self.page)
+
+        if observation.state == "login_username_first":
+            continuation = self._continue_username_first(observation)
+            if continuation.code:
+                return self._terminal(
+                    continuation.code, continuation.reason
+                )
+            observation = continuation.observation
+            if observation is None:
+                return self._terminal(
+                    "login_form_transition_timeout",
+                    "username continuation produced no fresh observation",
+                )
+            if observation.state == "two_factor":
+                self.dump._login_transaction_two_factor = True
+                return True
+            if observation.state == "authenticated":
+                self.dump._login_transaction_authenticated = True
+                return True
+            if observation.state == "challenge":
+                return self._terminal(
+                    "challenge_detected", observation.reason
+                )
+
+        if observation.state not in {
+            "login_combined", "login_password_only"
+        }:
+            refreshed = self._wait_for_surface(total_seconds=8.0)
+            if refreshed.code:
+                return self._terminal(
+                    refreshed.code, refreshed.reason
+                )
+            observation = refreshed.observation
+            if observation is None or observation.state not in {
+                "login_combined", "login_password_only"
+            }:
+                return self._terminal(
+                    "unrecognized_surface",
+                    "verified username did not lead to a password surface",
+                )
+
+        password_result = _interact_and_verify_login_candidate(
+            self.page,
+            intent="password",
+            expected=self.password,
+            preferred_group_ref=observation.selected_group_ref,
+            hum=self.hum,
+        )
+        if not password_result.verified:
+            return self._interaction_terminal(
+                password_result, initial_state=observation.state
+            )
+
+        # Authorize submit only after a bounded, mutation-stable round in which
+        # all credentials required by the current state have fresh values.
+        fresh = _observe_login_surface(self.page)
+        password_candidate: LoginCandidateDescriptor | None = None
+        credentials_verified = False
+        for _verification_round in range(3):
+            fresh = _observe_login_surface(self.page)
+            if fresh.state == "authenticated":
+                self.dump._login_transaction_authenticated = True
+                return True
+            if fresh.state == "two_factor":
+                self.dump._login_transaction_two_factor = True
+                return True
+            if fresh.state == "challenge":
+                return self._terminal(
+                    "challenge_detected", fresh.reason
+                )
+            if fresh.state not in {
+                "login_combined", "login_password_only"
+            }:
+                return self._terminal(
+                    "login_form_transition_timeout",
+                    "credential surface changed during fresh verification",
+                )
+
+            group_ref = fresh.selected_group_ref
+            username_epoch = fresh.frame_epochs
+            if fresh.state == "login_combined":
+                username_matches, username_observation, username_candidate = (
+                    _fresh_login_value_postcondition(
+                        self.page,
+                        "username",
+                        self.name,
+                        group_ref,
+                    )
+                )
+                fresh = username_observation
+                if not username_matches or username_candidate is None:
+                    restored_username = _interact_and_verify_login_candidate(
+                        self.page,
+                        intent="username",
+                        expected=self.name,
+                        preferred_group_ref=group_ref,
+                        hum=self.hum,
+                    )
+                    if not restored_username.verified:
+                        return self._interaction_terminal(
+                            restored_username,
+                            initial_state="login_combined",
+                        )
+                    continue
+                group_ref = username_candidate.recipe.group_ref
+                username_epoch = username_observation.frame_epochs
+
+            password_matches, password_observation, password_candidate = (
+                _fresh_login_value_postcondition(
+                    self.page,
+                    "password",
+                    self.password,
+                    group_ref,
+                )
+            )
+            fresh = password_observation
+            if not password_matches or password_candidate is None:
+                restored_password = _interact_and_verify_login_candidate(
+                    self.page,
+                    intent="password",
+                    expected=self.password,
+                    preferred_group_ref=group_ref,
+                    hum=self.hum,
+                )
+                if not restored_password.verified:
+                    return self._interaction_terminal(
+                        restored_password, initial_state=fresh.state
+                    )
+                continue
+
+            if fresh.state == "login_combined":
+                final_username, final_observation, _ = (
+                    _fresh_login_value_postcondition(
+                        self.page,
+                        "username",
+                        self.name,
+                        group_ref,
+                    )
+                )
+                fresh = final_observation
+                if (
+                    not final_username
+                    or final_observation.frame_epochs
+                    != password_observation.frame_epochs
+                    or username_epoch
+                    != password_observation.frame_epochs
+                ):
+                    continue
+            credentials_verified = True
+            break
+
+        if not credentials_verified or password_candidate is None:
+            return self._terminal(
+                "login_form_transition_timeout",
+                "credential postconditions did not stabilize before submit",
+            )
+
+        self.dump.capture(
+            self.page,
+            "auto_login_values_confirmed",
+            "username_requirement_verified=true; password_verified=true",
+            take_screenshot=False,
+            take_visible_text=False,
+        )
+        before_url = str(getattr(self.page, "url", "") or "")
+        telemetry = LoginPostActionTelemetry(self.page, self.dump)
+        telemetry.start()
+        self.dump._login_post_action_telemetry = telemetry
+        recovery_workflow_id = str(
+            os.environ.get("SPARKGRID_PASSWORD_RECOVERY_WORKFLOW_ID") or ""
+        )
+        submission_reserved = False
+        if recovery_workflow_id:
+            reservation = reserve_password_submission(
+                self.name, recovery_workflow_id
+            )
+            if not reservation.get("ok"):
+                raise RuntimeError(
+                    "password_submission_blocked: "
+                    + str(
+                        reservation.get("reason")
+                        or "durable recovery gate rejected submit"
+                    )
+                )
+            submission_reserved = True
+
+        action_state, method, _submit_control, control_before = (
+            _execute_login_submit(
+                self.page,
+                None,
+                self.name,
+                self.dump,
+                self.hum,
+                group_ref=fresh.selected_group_ref,
+            )
+        )
+        if action_state == ACTION_NOT_EXECUTED:
+            if submission_reserved:
+                finish_password_submission(
+                    self.name,
+                    recovery_workflow_id,
+                    physically_dispatched=False,
+                )
+            telemetry.stop(ACTION_NOT_EXECUTED)
+            self.dump._login_post_action_telemetry = None
+            return self._terminal(
+                "login_submit_control_not_found",
+                "fresh group-scoped submit action was not dispatched",
+            )
+        self.dump.capture(
+            self.page,
+            "auto_login_submit_dispatched",
+            (
+                f"method={method}; "
+                f"url_unchanged={str(str(getattr(self.page, 'url', '') or '') == before_url).lower()}; "
+                f"control_present={str(bool(control_before.get('present'))).lower()}; "
+                f"control_enabled={str(bool(control_before.get('enabled'))).lower()}"
+            ),
+            take_screenshot=False,
+            take_visible_text=False,
+        )
+        transition, evidence = _wait_for_password_submit_activation(
+            self.page,
+            None,
+            before_url,
+            initial_control_state=control_before,
+            group_ref=fresh.selected_group_ref,
+            timeout_seconds=8.0,
+            telemetry=telemetry,
+        )
+        if (
+            transition == UNKNOWN_STABLE_STATE
+            and method == "password_enter"
+            and not telemetry.login_request_started
+        ):
+            fresh_ui = _login_post_action_ui(self.page)
+            fallback_control = _login_submit_control(
+                self.page,
+                timeout_ms=1200,
+                group_ref=fresh.selected_group_ref,
+            )
+            fallback_state = _control_state(fallback_control)
+            if (
+                not fresh_ui.get("submit_loading")
+                and not fresh_ui.get("login_form_disabled")
+                and not fresh_ui.get("password_disabled")
+                and fallback_control is not None
+                and fallback_state.get("visible")
+                and fallback_state.get("enabled")
+            ):
+                try:
+                    fallback_control.click(timeout=5000)
+                    _record_direct_fallback(
+                        self.dump,
+                        "submit_login_form_locator_after_enter_no_request",
+                    )
+                    transition, evidence = (
+                        _wait_for_password_submit_activation(
+                            self.page,
+                            None,
+                            before_url,
+                            initial_control_state=fallback_state,
+                            group_ref=fresh.selected_group_ref,
+                            timeout_seconds=8.0,
+                            telemetry=telemetry,
+                        )
+                    )
+                except Exception:
+                    pass
+        if transition in {
+            UNKNOWN_STABLE_STATE, ACTION_NOT_EXECUTED, TERMINAL_FAILURE
+        }:
+            if submission_reserved:
+                finish_password_submission(
+                    self.name,
+                    recovery_workflow_id,
+                    physically_dispatched=False,
+                )
+            telemetry.stop(transition)
+            self.dump._login_post_action_telemetry = None
+            self.dump.capture_safe_dom(
+                self.page, "login_submit_no_transition"
+            )
+            return self._terminal(
+                "login_submit_no_transition",
+                "login submit reached a stable unchanged form",
+            )
         if submission_reserved:
             finish_password_submission(
-                name, recovery_workflow_id, physically_dispatched=False
+                self.name,
+                recovery_workflow_id,
+                physically_dispatched=True,
             )
-        reason = "Instagram login submit reached a stable unchanged form with no error or transition"
-        dump.capture(page, "auto_login_submit_not_activated", reason, force_snapshot=True)
-        dump.capture_safe_dom(page, "login_submit_no_transition")
-        telemetry.stop(transition)
-        dump._login_post_action_telemetry = None
-        _set_login_form_failure(dump, "login_submit_no_transition")
-        return False
-    if submission_reserved:
-        finish_password_submission(
-            name, recovery_workflow_id, physically_dispatched=True
+        self.dump.capture(
+            self.page,
+            "auto_login_submitted_password",
+            f"method={method}; contract={transition}; {evidence}",
+            take_screenshot=False,
+            take_visible_text=False,
         )
-    dump.capture(
-        page,
-        "auto_login_submitted_password",
-        f"submitted credentials; method={method}; contract={transition}; {evidence}",
-    )
-    return True
+        return True
+
+
+def _fill_instagram_login_form(page, account: dict, dump: LiveDump) -> bool:
+    return _AutoLoginTransactionCoordinator(page, account, dump).run()
 
 
 def _wait_for_password_submit_activation(
     page, pass_field, before_url: str, *, submit_control=None,
-    timeout_seconds: float = 8.0, telemetry: LoginPostActionTelemetry | None = None,
+    initial_control_state: dict | None = None,
+    group_ref: str = "",
+    timeout_seconds: float = 8.0,
+    telemetry: LoginPostActionTelemetry | None = None,
 ) -> tuple[str, str]:
     """Classify fresh post-submit observations without mistaking SPA loading for failure."""
+    legacy_pass_field = pass_field
     deadline = time.time() + max(0.5, float(timeout_seconds))
     stable_reads = 0
-    initial_control = _control_state(submit_control)
+    initial_control = dict(
+        initial_control_state
+        if initial_control_state is not None
+        else _control_state(submit_control)
+    )
+    if (
+        initial_control.get("busy")
+        or initial_control.get("aria_disabled")
+        or initial_control.get("disabled")
+        or (
+            initial_control.get("present")
+            and initial_control.get("visible")
+            and not initial_control.get("enabled")
+        )
+    ):
+        return (
+            ACTION_ACCEPTED_TRANSITIONING,
+            "login submit control was already loading/disabled",
+        )
     while True:
         try:
             current_url = str(page.url or "")
@@ -2613,7 +5059,9 @@ def _wait_for_password_submit_activation(
             )
         ):
             return ACTION_ACCEPTED_TRANSITIONING, "login form entered confirmed loading/disabled state"
-        fresh_control = _login_submit_control(page, timeout_ms=250)
+        fresh_control = _login_submit_control(
+            page, timeout_ms=250, group_ref=group_ref
+        )
         control_state = _control_state(fresh_control)
         if (
             control_state.get("busy")
@@ -2631,8 +5079,17 @@ def _wait_for_password_submit_activation(
             )
         ):
             return ACTION_ACCEPTED_TRANSITIONING, "login submit control entered loading/disabled state"
+        surface, _password_candidate, fresh_password = _fresh_login_candidate(
+            page, "password", group_ref
+        )
+        if fresh_password is None and legacy_pass_field is not None:
+            # Script-level post-action characterization fakes do not implement
+            # structural frames. Production passes no pre-submit locator here.
+            fresh_password = legacy_pass_field
+        if fresh_password is None:
+            return ACTION_ACCEPTED_TRANSITIONING, "login form detached during navigation"
         try:
-            if not pass_field.is_visible(timeout=350):
+            if not fresh_password.is_visible(timeout=350):
                 return ACTION_ACCEPTED_TRANSITIONING, "visible login form disappeared"
         except Exception:
             return ACTION_ACCEPTED_TRANSITIONING, "login form detached during navigation"
@@ -2642,7 +5099,13 @@ def _wait_for_password_submit_activation(
             stable_reads = 0
         if time.time() >= deadline:
             break
-        time.sleep(0.4)
+        _wait_for_login_surface_change(
+            page,
+            surface,
+            timeout_ms=int(
+                min(0.4, max(0.05, deadline - time.time())) * 1000
+            ),
+        )
     return UNKNOWN_STABLE_STATE, (
         f"login form remained visible across {stable_reads} fresh reads "
         "with no navigation, loading state, known next state, or inline error"
@@ -3740,9 +6203,363 @@ def _hold_manual_post_login(
         time.sleep(1.0)
 
 
+def _password_submission_blocker_reason(error: Any) -> str:
+    value = str(error or "").strip().lower()
+    if not value.startswith("password_submission_blocked:"):
+        return ""
+    reason = value.split(":", 1)[1].strip()
+    return (
+        reason
+        if reason in {
+            "password_submission_already_reserved",
+            "password_submission_limit_reached",
+            "recovery_workflow_not_active",
+            "second_submission_not_ready",
+        }
+        else "durable_recovery_gate_rejected_submit"
+    )
+
+
+_TYPED_POPUP_FAILURES = {
+    "browser_internal_error",
+    "cookie_consent_action_unavailable",
+    "cookie_consent_transition_timeout",
+    "ads_consent_action_unavailable",
+    "ads_consent_loop_detected",
+    "ads_consent_transition_timeout",
+    "save_login_info_action_unavailable",
+    "notifications_prompt_action_unavailable",
+    "promo_or_ad_action_unavailable",
+    "open_in_app_action_unavailable",
+    "popup_action_unavailable",
+    "popup_transition_timeout",
+    "unrecognized_surface",
+    "unknown_blocker",
+}
+
+
+def _typed_popup_failure(result: Any) -> str:
+    value = dict(result or {}) if isinstance(result, dict) else {}
+    step = str(value.get("step") or "").strip().lower()
+    return step if not value.get("ok") and step in _TYPED_POPUP_FAILURES else ""
+
+
+def _persist_browser_domain_failure(
+    *,
+    run_id: str,
+    name: str,
+    job: int,
+    code: str,
+    detail: str,
+    dump: LiveDump | None = None,
+    page: Any = None,
+) -> None:
+    """Flush diagnostics and both durable outcomes before browser cleanup."""
+    safe_code = str(code or "browser_domain_failure")[:80]
+    safe_detail = str(detail or safe_code)[:240]
+    if dump is not None and page is not None:
+        try:
+            dump.capture(
+                page,
+                safe_code,
+                safe_detail,
+                force_snapshot=True,
+            )
+        except Exception:
+            pass
+    update_account(
+        name,
+        web_upload_login_status=safe_code,
+        web_upload_last_error=safe_detail,
+    )
+    update_job(
+        job,
+        status="failed",
+        current_step=safe_code,
+        last_error=safe_detail,
+        domain_outcome=safe_code,
+        infrastructure_outcome="",
+        closure_owner="browser_workflow",
+        closure_reason=safe_code,
+        finished_at=now_iso(),
+    )
+    record_task_outcome(
+        run_id,
+        domain_outcome=safe_code,
+        closure_owner="browser_workflow",
+        closure_reason=safe_code,
+    )
+
+
+def _source_live_debug_enabled(args: Any) -> bool:
+    return bool(
+        os.environ.get("SPARKGRID_SOURCE_LIVE_DEBUG") == "1"
+        and not bool(getattr(args, "headless", False))
+    )
+
+
+def _record_source_routing_fingerprint(run_id: str) -> None:
+    try:
+        files = {
+            "blocking_popup_transaction_sha256": (
+                ROOT / "blocking_popup_transaction.py"
+            ),
+            "instagram_web_profile_workflow_sha256": Path(__file__).resolve(),
+        }
+        hashes = {
+            key: hashlib.sha256(path.read_bytes()).hexdigest()
+            for key, path in files.items()
+        }
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        append_run_event_once(
+            run_id,
+            "source_routing_fingerprint",
+            routing_schema="stage1-minimal-v1",
+            git_head=str(head.stdout or "").strip().lower(),
+            dirty_worktree=bool(str(status.stdout or "").strip()),
+            **hashes,
+        )
+    except Exception:
+        pass
+
+
+def _popup_handler_result(value: Any) -> str:
+    result = dict(value or {}) if isinstance(value, dict) else {}
+    outcome = str(result.get("outcome") or "")
+    if outcome == HANDLED_REEVALUATE:
+        return "handled_reevaluate"
+    if outcome == NO_BLOCKER:
+        return "no_blocker"
+    if outcome == TRANSITIONING_RETRY:
+        return "transitioning_retry"
+    if result.get("ok"):
+        return "completed"
+    return "action_unavailable"
+
+
+def _record_known_popup_completion(
+    dump: Any,
+    popup_category: str,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    handler_result: Any,
+) -> None:
+    try:
+        append_run_event(
+            str(dump.run_id),
+            "known_popup_handler_completed",
+            popup_category=popup_category,
+            handler_result=_popup_handler_result(handler_result),
+            fresh_reclassification_started=True,
+            document_epoch_before=_diagnostic_document_epoch(
+                dump, before.get("document_epoch")
+            ),
+            document_epoch_after=_diagnostic_document_epoch(
+                dump, after.get("document_epoch")
+            ),
+            mutation_epoch_before=int(
+                before.get("mutation_epoch") or 0
+            ),
+            mutation_epoch_after=int(after.get("mutation_epoch") or 0),
+        )
+    except Exception:
+        pass
+
+
+def _source_live_stop_requested(page: Any, context: Any) -> bool:
+    stop_path = str(
+        os.environ.get("SPARKGRID_SOURCE_LIVE_STOP_FILE") or ""
+    ).strip()
+    if stop_path and Path(stop_path).is_file():
+        return True
+    try:
+        if page.is_closed():
+            return True
+    except Exception:
+        return True
+    try:
+        pages = list(getattr(context, "pages", []) or [])
+        if not any(not item.is_closed() for item in pages):
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _hold_unrecognized_surface_for_source_live(
+    page: Any,
+    context: Any,
+    args: Any,
+    *,
+    stop_requested: Any = None,
+    sleep_fn: Any = time.sleep,
+) -> bool:
+    """Hold only a persisted source-live unknown surface until operator Stop."""
+    if not _source_live_debug_enabled(args):
+        return False
+    should_stop = stop_requested or _source_live_stop_requested
+    while not should_stop(page, context):
+        sleep_fn(0.5)
+    return True
+
+
+@contextlib.contextmanager
+def _browser_pre_cleanup_finalizer(callback):
+    token = _ACTIVE_BROWSER_PRE_CLEANUP_FINALIZER.set(callback)
+    try:
+        yield
+    finally:
+        _ACTIVE_BROWSER_PRE_CLEANUP_FINALIZER.reset(token)
+
+
+def _resolve_arrival_popup(page: Any, dump: LiveDump | None) -> dict[str, Any]:
+    """Route the current topmost blocker through one bounded transaction."""
+    observed = inspect_topmost_blocker(page)
+    category = str(observed.get("category") or "")
+    if observed.get("document_category") == "browser_internal_error":
+        return {"handled": False, "ok": False, "step": "browser_internal_error"}
+    if observed.get("authenticated_surface"):
+        _record_arrival_route(dump, "authenticated", observed=observed)
+        return {"handled": False, "ok": True, "step": "not_present"}
+    if observed.get("two_factor_surface"):
+        _record_arrival_route(dump, "two_factor", observed=observed)
+        return {"handled": False, "ok": True, "step": "not_present"}
+    surface = _observe_login_surface(page)
+    if surface.state in {"authenticated", "challenge", "two_factor"}:
+        _record_arrival_route(dump, surface.state, surface=surface)
+        return {"handled": False, "ok": True, "step": "not_present"}
+    if category in {"checkpoint", "restriction", "suspended"}:
+        _record_arrival_route(dump, "challenge", observed=observed)
+        return {"handled": False, "ok": True, "step": "not_present"}
+    if observed.get("present") and category in {
+        "cookie_consent",
+        "regional_ads_consent",
+        "request_processing",
+    }:
+        _record_arrival_route(
+            dump,
+            "known_popup",
+            popup_category=category,
+            observed=observed,
+        )
+        result = resolve_instagram_consent(
+            page,
+            _consent_capture(dump),
+            max_seconds=70,
+            human=_human_for(
+                page,
+                str(getattr(dump, "account", "") or ""),
+                dump,
+            ),
+        )
+        after = inspect_topmost_blocker(page)
+        _record_known_popup_completion(
+            dump, category, observed, after, result
+        )
+        return result
+    if not observed.get("present") or category not in AUTOMATED_POPUP_CATEGORIES:
+        if _strong_combined_login_surface(surface):
+            _record_arrival_route(
+                dump, "credential_surface", surface=surface
+            )
+            return {
+                "handled": False,
+                "ok": True,
+                "step": "credential_surface",
+            }
+        if surface.state in {
+            "authenticated",
+            "challenge",
+            "two_factor",
+            "transitioning",
+        }:
+            _record_arrival_route(
+                dump,
+                (
+                    "transitional"
+                    if surface.state == "transitioning"
+                    else surface.state
+                ),
+                surface=surface,
+            )
+            return {
+                "handled": False,
+                "ok": True,
+                "step": "not_present",
+            }
+        _record_arrival_route(
+            dump, "unrecognized_surface", surface=surface
+        )
+        return {
+            "handled": False,
+            "ok": False,
+            "step": "unrecognized_surface",
+        }
+
+    _record_arrival_route(
+        dump,
+        "known_popup",
+        popup_category=category,
+        observed=observed,
+    )
+    gate = continue_after_dialog(
+        page,
+        allow_safe_close=True,
+        wait_seconds=4.0,
+    )
+    after = inspect_topmost_blocker(page)
+    _record_known_popup_completion(
+        dump, category, observed, after, gate
+    )
+    outcome = str(gate.get("outcome") or "")
+    if outcome in {NO_BLOCKER, HANDLED_REEVALUATE}:
+        return {
+            "handled": bool(gate.get("dismissed")),
+            "ok": True,
+            "step": "completed",
+        }
+    if outcome == TRANSITIONING_RETRY:
+        return {
+            "handled": bool(gate.get("dismissed")),
+            "ok": False,
+            "step": "popup_transition_timeout",
+        }
+    if outcome == "UNKNOWN_BLOCKER":
+        return {
+            "handled": False,
+            "ok": False,
+            "step": "unrecognized_surface",
+        }
+    return {
+        "handled": bool(gate.get("dismissed")),
+        "ok": False,
+        "step": (
+            category + "_action_unavailable"
+            if category + "_action_unavailable" in _TYPED_POPUP_FAILURES
+            else "popup_action_unavailable"
+        ),
+    }
+
+
 def do_auto_login(account: dict, args, run_id: str):
     name = account["name"]
     dump = LiveDump(run_id, name)
+    _record_source_routing_fingerprint(run_id)
     job = create_job(run_id, name, "auto_login", str(dump.root), provider=getattr(args, "provider", "camoufox"))
     update_account(name, web_upload_last_error="")
     log(f"{name}: Auto login attempt started", "INFO")
@@ -3753,17 +6570,91 @@ def do_auto_login(account: dict, args, run_id: str):
             if not ok:
                 raise RuntimeError(reason)
             log(f"{name}: {reason}", "OK")
-        with _browser_session(account, args) as (ctx_obj, ctx, page):
+        def persist_before_cleanup(exc: BaseException, page: Any) -> None:
+            reason = _password_submission_blocker_reason(exc)
+            if reason:
+                _persist_browser_domain_failure(
+                    run_id=run_id,
+                    name=name,
+                    job=job,
+                    code="password_submission_blocked",
+                    detail="password_submission_blocked:" + reason,
+                    dump=dump,
+                    page=page,
+                )
+
+        with _browser_pre_cleanup_finalizer(
+            persist_before_cleanup
+        ), _browser_session(account, args) as (ctx_obj, ctx, page):
             session_ready_for_persistence = False
             post_login_transition = None
-            _arrive_instagram(page, dump, via_search=(getattr(args, "arrive", "direct") == "search"), account=name, mode=getattr(args, "mode", "desktop"))
+            arrival = _arrive_instagram(
+                page,
+                dump,
+                via_search=(getattr(args, "arrive", "direct") == "search"),
+                account=name,
+                mode=getattr(args, "mode", "desktop"),
+            )
+            # Historical offline callers replace the arrival helper with a
+            # side-effect-only stub. Production returns the structured result.
+            if arrival is None:
+                arrival = {"ok": True}
+            if not arrival.get("ok"):
+                code = "browser_load_failed_after_retry"
+                detail = (
+                    code
+                    + ":"
+                    + str(
+                        arrival.get("main_frame_failure_category")
+                        or "unknown_failure"
+                    )
+                )
+                update_account(
+                    name,
+                    web_upload_login_status=code,
+                    web_upload_last_error=detail,
+                )
+                update_job(
+                    job,
+                    status="failed",
+                    current_step=code,
+                    last_error=detail,
+                    domain_outcome="failed",
+                    infrastructure_outcome=code,
+                    finished_at=now_iso(),
+                )
+                return
             actor = _human_for(page, name, dump)
             if actor is not None:
                 actor.dwell(1.4, 2.8, micro_moves=True)
                 actor.wander(1)
             else:
                 time.sleep(random.uniform(2.0, 4.0))
-            _dismiss_instagram_consent(page, dump, name)
+            consent_result = _resolve_arrival_popup(page, dump)
+            popup_failure = _typed_popup_failure(consent_result)
+            if popup_failure:
+                _persist_browser_domain_failure(
+                    run_id=run_id,
+                    name=name,
+                    job=job,
+                    code=popup_failure,
+                    detail=popup_failure,
+                    dump=dump,
+                    page=page,
+                )
+                if popup_failure == "unrecognized_surface":
+                    update_job(
+                        job,
+                        status="manual_required",
+                        current_step="unrecognized_surface",
+                        last_error="unrecognized_surface",
+                        domain_outcome="unrecognized_surface",
+                        finished_at=now_iso(),
+                    )
+                    _hold_unrecognized_surface_for_source_live(
+                        page, ctx, args
+                    )
+                return
             if _is_consent_loop(page) and not _recover_instagram_consent(page, dump, name):
                 reason = "Instagram consent remained unresolved after bounded recovery"
                 dump.capture(page, "consent_failed", reason, force_snapshot=True)
@@ -3781,26 +6672,68 @@ def do_auto_login(account: dict, args, run_id: str):
                     _click_login_if_present(page, dump, name)
                     time.sleep(random.uniform(1.0, 2.0))
                     _dismiss_instagram_consent(page, dump, name)
-                ready, fresh_state, fresh_reason = _login_blocker_first(
-                    page, dump, name, "credentials flow"
-                )
-                if not ready or fresh_state not in {"login_required", "unknown"}:
-                    state = fresh_state if not ready or fresh_state != "unknown" else "unknown_popup"
-                    reason = fresh_reason
-                    dump.capture(page, "auto_login_" + state, reason, force_snapshot=True)
-                    update_account(name, web_upload_login_status=state, web_upload_last_error=reason)
-                    update_job(job, status="manual_required", current_step=state, last_error=reason, finished_at=now_iso())
-                    return
+                _record_credential_workflow_started(page, dump)
                 if not _fill_instagram_login_form(page, account, dump):
                     code = _login_form_failure_code(dump)
                     update_account(name, web_upload_login_status=code, web_upload_last_error=code)
+                    if code in {
+                        "unknown_popup",
+                        "blocking_dialog_not_dismissed",
+                        "blocker_detected",
+                        "unrecognized_surface",
+                    }:
+                        typed_code = (
+                            "unrecognized_surface"
+                            if code in {
+                                "unknown_popup",
+                                "blocker_detected",
+                                "unrecognized_surface",
+                            }
+                            else "popup_action_unavailable"
+                        )
+                        _persist_browser_domain_failure(
+                            run_id=run_id,
+                            name=name,
+                            job=job,
+                            code=typed_code,
+                            detail=typed_code,
+                            dump=dump,
+                            page=page,
+                        )
+                        if typed_code == "unrecognized_surface":
+                            update_job(
+                                job,
+                                status="manual_required",
+                                current_step="unrecognized_surface",
+                                last_error="unrecognized_surface",
+                                domain_outcome="unrecognized_surface",
+                                finished_at=now_iso(),
+                            )
+                            _hold_unrecognized_surface_for_source_live(
+                                page, ctx, args
+                            )
+                        return
                     manual = code in {
                         "unknown_popup", "checkpoint", "restricted", "suspended",
                         "blocking_dialog_not_dismissed",
+                        "challenge_detected", "blocker_detected",
                     }
                     update_job(job, status="manual_required" if manual else "failed", current_step=code, last_error=code, finished_at=now_iso())
                     return
-                post_password_state = _wait_after_password_submit(page, dump, max_seconds=60)
+                if bool(
+                    getattr(
+                        dump, "_login_transaction_authenticated", False
+                    )
+                ):
+                    post_password_state = "authenticated"
+                elif bool(
+                    getattr(dump, "_login_transaction_two_factor", False)
+                ):
+                    post_password_state = "2fa"
+                else:
+                    post_password_state = _wait_after_password_submit(
+                        page, dump, max_seconds=60
+                    )
                 telemetry = getattr(dump, "_login_post_action_telemetry", None)
                 if telemetry is not None:
                     telemetry.stop(post_password_state)
@@ -3857,6 +6790,9 @@ def do_auto_login(account: dict, args, run_id: str):
                 elif post_password_state == "login_loading_without_request":
                     state = post_password_state
                     reason = "Instagram kept the login form loading without starting a login request"
+                elif post_password_state == "authenticated":
+                    state = "logged_in"
+                    reason = "structural Auto Login observation confirmed authentication"
                 else:
                     time.sleep(random.uniform(5.0, 8.0))
                     state, reason = get_state(page)
@@ -3944,6 +6880,29 @@ def do_auto_login(account: dict, args, run_id: str):
     except Exception as exc:
         error = str(exc) or type(exc).__name__
         lowered = error.lower()
+        reason = _password_submission_blocker_reason(error)
+        if reason:
+            code = "password_submission_blocked"
+            detail = code + ":" + reason
+            update_account(
+                name,
+                web_upload_login_status=code,
+                web_upload_last_error=detail,
+            )
+            update_job(
+                job,
+                status="failed",
+                current_step=code,
+                last_error=detail,
+                domain_outcome=code,
+                infrastructure_outcome="",
+                finished_at=now_iso(),
+            )
+            log(
+                f"{name}: duplicate-safe password submission gate blocked the action",
+                "ERROR",
+            )
+            return
         incorrect_credentials = "explicit_password_rejection:" in lowered
         if incorrect_credentials:
             update_account(
@@ -3986,7 +6945,13 @@ def _browser_session(account: dict, args):
             manager, context, page = launch_context(
                 None, account, provider="camoufox", headless=headless, manual=manual
             )
-            yield manager, context, page
+            try:
+                yield manager, context, page
+            except BaseException as exc:
+                finalizer = _ACTIVE_BROWSER_PRE_CLEANUP_FINALIZER.get()
+                if finalizer is not None:
+                    finalizer(exc, page)
+                raise
         finally:
             # A rejected password, proxy failure, or page exception must never
             # leave SparkBrowser/profile locks alive after the workflow ends.
@@ -4011,7 +6976,13 @@ def _browser_session(account: dict, args):
                 p, account, provider="playwright", headless=headless
             )
             try:
-                yield None, context, page
+                try:
+                    yield None, context, page
+                except BaseException as exc:
+                    finalizer = _ACTIVE_BROWSER_PRE_CLEANUP_FINALIZER.get()
+                    if finalizer is not None:
+                        finalizer(exc, page)
+                    raise
             finally:
                 try:
                     context.close()
@@ -4198,7 +7169,38 @@ def do_check_login(account: dict, args, run_id: str):
                             "WARNING",
                         )
                 return "manual_open", "manual browser closed"
-            _arrive_instagram(page, dump, via_search=(getattr(args, "arrive", "direct") == "search"), account=name, mode=getattr(args, "mode", "desktop"))
+            arrival = _arrive_instagram(
+                page,
+                dump,
+                via_search=(getattr(args, "arrive", "direct") == "search"),
+                account=name,
+                mode=getattr(args, "mode", "desktop"),
+            )
+            if not arrival.get("ok"):
+                code = "browser_load_failed_after_retry"
+                detail = (
+                    code
+                    + ":"
+                    + str(
+                        arrival.get("main_frame_failure_category")
+                        or "unknown_failure"
+                    )
+                )
+                update_account(
+                    name,
+                    web_upload_login_status=code,
+                    web_upload_last_error=detail,
+                )
+                update_job(
+                    job,
+                    status="failed",
+                    current_step=code,
+                    last_error=detail,
+                    domain_outcome="failed",
+                    infrastructure_outcome=code,
+                    finished_at=now_iso(),
+                )
+                return code, detail
             result, _callbacks = run_check_session_goal(
                 page,
                 workflow_run_id=run_id,
@@ -5192,7 +8194,12 @@ def main() -> int:
     if not accounts:
         log("No accounts selected", "WARNING")
         return 2
-    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    # The API acceptance boundary owns the run identity. Direct/offline
+    # invocations retain a local fallback for backwards compatibility.
+    run_id = str(
+        os.environ.get("SPARKGRID_RUN_ID")
+        or datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    )
     if args.task == "create_profiles":
         do_create_profiles(accounts, run_id)
     elif args.task == "check_login":

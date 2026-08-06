@@ -25,6 +25,7 @@ import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from license_client import APP_VERSION
 from platform_runtime import process_group_kwargs, stop_process_tree, create_process_job, terminate_process_job, close_process_job
@@ -46,6 +47,26 @@ from password_ip_recovery import (
     ensure_schema as ensure_password_recovery_schema,
     get_active as get_active_password_recovery,
     mark_stopped as mark_password_recovery_stopped,
+)
+from task_receipts import (
+    create_receipt,
+    ensure_schema as ensure_task_receipt_schema,
+    finalize_process_exit,
+    mark_accepted as mark_task_accepted,
+    new_run_id as new_task_run_id,
+    recent_receipts,
+    record_outcome as record_task_outcome,
+    reject_receipt,
+    opaque_account_ref,
+)
+from run_diagnostics import (
+    account_worker_lifecycle,
+    append_event as append_run_event,
+    build_run_archive,
+    cleanup_diagnostics as cleanup_run_diagnostics,
+    ensure_run as ensure_run_diagnostics,
+    finalize_run as finalize_run_diagnostics,
+    normalize_task_category,
 )
 from connections import (
     ensure_connection_schema, list_connections, get_connection, upsert_connection,
@@ -232,6 +253,10 @@ def ensure_schema() -> None:
             "permalink": "TEXT NOT NULL DEFAULT ''",
             "attempts": "INTEGER NOT NULL DEFAULT 0",
             "campaign_run_identity": "TEXT NOT NULL DEFAULT ''",
+            "domain_outcome": "TEXT NOT NULL DEFAULT ''",
+            "infrastructure_outcome": "TEXT NOT NULL DEFAULT ''",
+            "closure_owner": "TEXT NOT NULL DEFAULT ''",
+            "closure_reason": "TEXT NOT NULL DEFAULT ''",
         }.items():
             if name not in job_cols:
                 conn.execute(f"ALTER TABLE ig_web_upload_jobs ADD COLUMN {name} {ddl}")
@@ -344,11 +369,176 @@ def ensure_schema() -> None:
         ensure_plan_schema(conn)
         ensure_connection_schema(conn)
         ensure_password_recovery_schema(conn)
+        ensure_task_receipt_schema(conn)
         ensure_automation_schema(conn)
         ensure_view_schema(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def ensure_task_detail_rows(
+    run_id: str,
+    account_names: list[str],
+    receipt: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Finalize selected accounts without copying one worker's outcome."""
+    names = list(
+        dict.fromkeys(
+            str(name).strip().lstrip("@")
+            for name in account_names
+            if str(name).strip()
+        )
+    )
+    if not names:
+        return []
+    run_ref = str(run_id or "")
+    closure_reason = str(receipt.get("closure_reason") or "")
+    cancelled = bool(
+        str(receipt.get("domain_outcome") or "") == "cancelled"
+        or str(receipt.get("infrastructure_outcome") or "") == "cancelled"
+        or closure_reason in {"stop_all", "targeted_stop", "user_stop"}
+    )
+    outcomes: list[dict[str, Any]] = []
+    scheduler_lifecycle = account_worker_lifecycle(run_ref)
+    conn = db_conn()
+    try:
+        for name in names:
+            try:
+                existing = conn.execute(
+                    """
+                    SELECT id,status,current_step,domain_outcome,
+                           infrastructure_outcome,closure_owner,closure_reason
+                    FROM ig_web_upload_jobs
+                    WHERE run_id=? AND account_name=? ORDER BY id DESC LIMIT 1
+                    """,
+                    (run_ref, name),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return outcomes
+            if existing:
+                infrastructure = str(existing[4] or "")
+                worker_started = "worker_not_started" not in infrastructure.split(";")
+                outcome = {
+                    "run_id": run_ref,
+                    "account_ref": opaque_account_ref(run_ref, name),
+                    "worker_started": worker_started,
+                    "real_job_id": int(existing[0]) if worker_started else None,
+                    "domain_outcome": str(existing[3] or existing[1] or ""),
+                    "infrastructure_outcome": infrastructure,
+                    "closure_reason": str(existing[6] or ""),
+                    "source": "worker" if worker_started else "scheduler",
+                }
+            elif scheduler_lifecycle.get(opaque_account_ref(run_ref, name), {}).get(
+                "worker_started"
+            ):
+                lifecycle = scheduler_lifecycle[opaque_account_ref(run_ref, name)]
+                worker_exited = bool(lifecycle.get("worker_exited"))
+                return_code = lifecycle.get("return_code")
+                if cancelled:
+                    status = "stopped"
+                    step = "stopped"
+                    domain = "cancelled"
+                    infrastructure = "cancelled"
+                    owner = str(receipt.get("closure_owner") or "user_stop")
+                    reason = closure_reason or "user_stop"
+                elif worker_exited and int(return_code or 0) == 0:
+                    status = "success"
+                    step = "completed"
+                    domain = "success"
+                    infrastructure = "worker_exit_0"
+                    owner = "connection_scheduler"
+                    reason = "normal_exit"
+                else:
+                    status = "failed"
+                    step = "failed"
+                    domain = "failed"
+                    infrastructure = "worker_exit_nonzero"
+                    owner = "connection_scheduler"
+                    reason = "process_exit_nonzero"
+                conn.execute(
+                    """
+                    INSERT INTO ig_web_upload_jobs(
+                        run_id,account_name,status,current_step,last_error,
+                        target_uploads,domain_outcome,infrastructure_outcome,
+                        closure_owner,closure_reason,started_at,finished_at,updated_at
+                    ) VALUES(?,?,?,?,?,0,?,?,?,?,?,?,datetime('now'))
+                    """,
+                    (
+                        run_ref, name, status, step,
+                        "" if status == "success" else step,
+                        domain, infrastructure, owner, reason,
+                        str(receipt.get("started_at") or ""),
+                        str(receipt.get("finished_at") or ""),
+                    ),
+                )
+                outcome = {
+                    "run_id": run_ref,
+                    "account_ref": opaque_account_ref(run_ref, name),
+                    "worker_started": True,
+                    "real_job_id": None,
+                    "domain_outcome": domain,
+                    "infrastructure_outcome": infrastructure,
+                    "closure_reason": reason,
+                    "source": "scheduler",
+                }
+            else:
+                step = "stopped_before_start" if cancelled else "not_started"
+                domain = "cancelled" if cancelled else "not_started"
+                infrastructure = "worker_not_started"
+                owner = (
+                    str(receipt.get("closure_owner") or "user_stop")
+                    if cancelled
+                    else "scheduler"
+                )
+                reason = (
+                    (closure_reason or "user_stop")
+                    if cancelled
+                    else "scheduler_completed_before_account_start"
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ig_web_upload_jobs(
+                        run_id,account_name,status,current_step,last_error,
+                        target_uploads,domain_outcome,infrastructure_outcome,
+                        closure_owner,closure_reason,started_at,finished_at,updated_at
+                    ) VALUES(?,?,?,?,?,0,?,?,?,?,?,?,datetime('now'))
+                    """,
+                    (
+                        run_ref, name, "stopped", step, step, domain,
+                        infrastructure, owner, reason, "",
+                        str(receipt.get("finished_at") or ""),
+                    ),
+                )
+                outcome = {
+                    "run_id": run_ref,
+                    "account_ref": opaque_account_ref(run_ref, name),
+                    "worker_started": False,
+                    "real_job_id": None,
+                    "domain_outcome": domain,
+                    "infrastructure_outcome": infrastructure,
+                    "closure_reason": reason,
+                    "source": "scheduler" if cancelled else "synthetic",
+                }
+            outcomes.append(outcome)
+            try:
+                append_run_event(
+                    run_ref,
+                    "account_detail_finalized",
+                    account_ref=outcome["account_ref"],
+                    real_job_id=outcome["real_job_id"],
+                    worker_started=outcome["worker_started"],
+                    source=outcome["source"],
+                    domain_outcome=outcome["domain_outcome"],
+                    infrastructure_outcome=outcome["infrastructure_outcome"],
+                    closure_reason=outcome["closure_reason"],
+                )
+            except Exception:
+                pass
+        conn.commit()
+    finally:
+        conn.close()
+    return outcomes
 
 
 class ProcessManager:
@@ -364,7 +554,14 @@ class ProcessManager:
     def _conflict(left: set[str], right: set[str]) -> bool:
         return "global:*" in left or "global:*" in right or bool(left.intersection(right))
 
-    def _finish_job(self, job_id: int, terminate: bool = False) -> None:
+    def _finish_job(
+        self,
+        job_id: int,
+        terminate: bool = False,
+        *,
+        closure_owner: str = "process_manager",
+        closure_reason: str = "",
+    ) -> None:
         job = self._jobs.get(job_id)
         if not job:
             return
@@ -378,6 +575,55 @@ class ProcessManager:
         elif handle is not None:
             close_process_job(handle)
             job["job_handle"] = None
+        returncode = proc.poll() if proc is not None else None
+        receipt = finalize_process_exit(
+            str(job.get("run_id") or ""),
+            returncode,
+            cancelled=bool(terminate),
+            closure_owner=(
+                str(closure_owner or "user_stop")
+                if terminate
+                else str(closure_owner or "process_manager")
+            ),
+            closure_reason=(
+                str(closure_reason or "user_stop")
+                if terminate
+                else str(closure_reason or "process_exit_observed")
+            ),
+        )
+        ensure_task_detail_rows(
+            str(job.get("run_id") or ""),
+            list(job.get("accounts") or []),
+            receipt,
+        )
+        try:
+            append_run_event(
+                str(job.get("run_id") or ""),
+                "child_exit",
+                stream="process_events",
+                child_process_state="exited",
+                return_code=int(returncode or 0),
+            )
+            append_run_event(
+                str(job.get("run_id") or ""),
+                "scheduler_exit",
+                stream="process_events",
+                scheduler_state="finished",
+                return_code=int(returncode or 0),
+            )
+            finalize_run_diagnostics(
+                str(job.get("run_id") or ""),
+                domain_outcome=str(receipt.get("domain_outcome") or ""),
+                infrastructure_outcome=str(
+                    receipt.get("infrastructure_outcome") or ""
+                ),
+                closure_owner=str(receipt.get("closure_owner") or "process_manager"),
+                closure_reason=str(
+                    receipt.get("closure_reason") or "process_exit_observed"
+                ),
+            )
+        except Exception:
+            pass
         log = job.get("log")
         if log is not None:
             try:
@@ -390,7 +636,12 @@ class ProcessManager:
         for job_id, job in list(self._jobs.items()):
             proc = job.get("proc")
             if proc is None or proc.poll() is not None:
-                self._finish_job(job_id, terminate=False)
+                self._finish_job(
+                    job_id,
+                    terminate=False,
+                    closure_owner="process_manager",
+                    closure_reason="process_exit_observed",
+                )
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -401,6 +652,7 @@ class ProcessManager:
                 {
                     "id": int(job["id"]),
                     "label": str(job.get("label") or "task"),
+                    "run_id": str(job.get("run_id") or ""),
                     "pid": job["proc"].pid,
                     "started_at": float(job.get("started_at") or 0),
                     "elapsed_seconds": max(0, int(now - float(job.get("started_at") or now))),
@@ -420,17 +672,51 @@ class ProcessManager:
                 "elapsed_seconds": first.get("elapsed_seconds", 0),
             }
 
-    def start(self, command: list[str], label: str, resources: set[str] | None = None,
-              accounts: list[str] | None = None) -> tuple[bool, str]:
+    def start(
+        self,
+        command: list[str],
+        label: str,
+        resources: set[str] | None = None,
+        accounts: list[str] | None = None,
+        *,
+        run_id: str = "",
+    ) -> tuple[bool, str]:
         owned = set(resources or {"global:*"})
         account_names = list(accounts or [])
+        run_id = str(run_id or new_task_run_id())
+        if not run_id.startswith("run-"):
+            # Caller-supplied identities remain valid; this branch only keeps
+            # the variable visibly normalized as text.
+            run_id = str(run_id)
+        try:
+            create_receipt(run_id, label, account_names)
+        except sqlite3.IntegrityError:
+            pass
         with self._lock:
             self._refresh()
             for running in self._jobs.values():
                 if self._conflict(owned, set(running.get("resources") or set())):
+                    reject_receipt(run_id, "active_resource_conflict")
+                    try:
+                        append_run_event(
+                            run_id, "task_rejected", stream="task_index",
+                            request_state="rejected",
+                            infrastructure_outcome="scheduler_rejected",
+                            rejection_owner="process_manager",
+                            closure_reason="active_resource_conflict",
+                        )
+                        finalize_run_diagnostics(
+                            run_id,
+                            infrastructure_outcome="scheduler_rejected",
+                            closure_owner="process_manager",
+                            closure_reason="active_resource_conflict",
+                        )
+                    except Exception:
+                        pass
                     return False, "Task conflicts with an active account or proxy lane: " + str(running.get("label") or "task")
             env = os.environ.copy()
             env["SPARKGRID_DATA_DIR"] = str(DATA_DIR)
+            env["SPARKGRID_RUN_ID"] = str(run_id)
             env["PYTHONPATH"] = str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
             env.setdefault("SPARKGRID_SHOW_CURSOR", "1")
             env.setdefault("SPARKGRID_HUMAN_PERSONA", "careful")
@@ -450,11 +736,43 @@ class ProcessManager:
                 job_handle = create_process_job(proc)
             except Exception:
                 log.close()
+                record_task_outcome(
+                    run_id,
+                    infrastructure_outcome="browser_start_failed",
+                    scheduler_state="start_failed",
+                    closure_owner="process_manager",
+                    closure_reason="browser_start_failed",
+                )
+                finalize_process_exit(
+                    run_id,
+                    1,
+                    closure_owner="process_manager",
+                    closure_reason="browser_start_failed",
+                )
                 raise
+            mark_task_accepted(run_id, int(proc.pid or 0))
+            try:
+                append_run_event(
+                    run_id, "task_accepted", stream="task_index",
+                    request_state="accepted",
+                    parent_process_state="running",
+                    pid=int(proc.pid or 0),
+                )
+                append_run_event(
+                    run_id, "scheduler_start", stream="process_events",
+                    scheduler_state="starting",
+                )
+                append_run_event(
+                    run_id, "child_spawn", stream="process_events",
+                    child_process_state="running",
+                    pid=int(proc.pid or 0),
+                )
+            except Exception:
+                pass
             self._jobs[job_id] = {
                 "id": job_id, "proc": proc, "job_handle": job_handle, "label": label,
                 "started_at": time.time(), "resources": owned, "accounts": account_names,
-                "log": log, "log_path": log_path,
+                "log": log, "log_path": log_path, "run_id": str(run_id),
             }
             self._log_path = log_path
             return True, "started"
@@ -464,7 +782,12 @@ class ProcessManager:
             self._refresh()
             job_ids = list(self._jobs)
             for job_id in job_ids:
-                self._finish_job(job_id, terminate=True)
+                self._finish_job(
+                    job_id,
+                    terminate=True,
+                    closure_owner="user_stop",
+                    closure_reason="stop_all",
+                )
             return bool(job_ids)
 
     def stop_job(self, job_id: int) -> dict[str, Any] | None:
@@ -477,11 +800,17 @@ class ProcessManager:
             stopped = {
                 "id": int(job["id"]),
                 "label": str(job.get("label") or "task"),
+                "run_id": str(job.get("run_id") or ""),
                 "pid": int(job["proc"].pid),
                 "accounts": list(job.get("accounts") or []),
                 "resources": set(job.get("resources") or set()),
             }
-            self._finish_job(int(job_id), terminate=True)
+            self._finish_job(
+                int(job_id),
+                terminate=True,
+                closure_owner="user_stop",
+                closure_reason="targeted_stop",
+            )
             return stopped
 
 
@@ -611,7 +940,17 @@ def _background_dispatcher_loop() -> None:
             finally:
                 conn.close()
             if command and not procman.status()["running"]:
-                procman.start(command, label)
+                background_run_id = new_task_run_id()
+                create_receipt(
+                    background_run_id,
+                    "background_dispatch",
+                    _command_accounts(command),
+                )
+                procman.start(
+                    command,
+                    label,
+                    run_id=background_run_id,
+                )
         except Exception as exc:
             try:
                 with (LOG_DIR / "background_dispatcher.log").open("a", encoding="utf-8") as handle:
@@ -670,6 +1009,7 @@ def _verifier_loop() -> None:
 def _start_publication_verifier() -> None:
     global _VERIFIER_THREAD, _BACKGROUND_THREAD
     ensure_schema()
+    cleanup_run_diagnostics(trigger="startup")
     _recover_background_state()
     if _VERIFIER_THREAD is None or not _VERIFIER_THREAD.is_alive():
         _VERIFIER_STOP.clear()
@@ -690,11 +1030,26 @@ app.mount("/web-warmup-debug", StaticFiles(directory=str(DEBUG_WARMUP)), name="w
 
 
 DIAGNOSTICS_DIR = DATA_DIR / "diagnostics"
+WORKER_DEBUG_UPLOAD = (
+    DATA_DIR / "ai_content_data" / "debug" / "ig_web_upload"
+)
+WORKER_DEBUG_WARMUP = (
+    DATA_DIR / "browser_warmup_data" / "debug" / "web_warmup"
+)
 DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _diagnostic_redactions(account_name: str) -> list[str]:
-    values: list[str] = []
+    account_values = {
+        str(account_name or ""),
+        re.sub(r"[^A-Za-z0-9_.-]+", "_", account_name)[:80],
+    }
+    values: list[str] = [
+        str(ROOT),
+        str(DATA_DIR),
+        str(Path.home()),
+        *account_values,
+    ]
     conn = db_conn()
     try:
         row = conn.execute(
@@ -707,26 +1062,608 @@ def _diagnostic_redactions(account_name: str) -> list[str]:
         ).fetchone()
         if row:
             values.extend(str(value or "") for value in row)
+        for table, fields in (
+            (
+                "api_content_assets",
+                ("caption", "file_path", "original_name"),
+            ),
+            (
+                "ig_publishing_history",
+                ("caption", "file_path", "video_name"),
+            ),
+        ):
+            columns = {
+                str(item[1])
+                for item in conn.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+            selected = [field for field in fields if field in columns]
+            if "account_name" not in columns or not selected:
+                continue
+            rows = conn.execute(
+                f"SELECT {','.join(selected)} FROM {table} "
+                "WHERE account_name=?",
+                (account_name,),
+            ).fetchall()
+            for item in rows:
+                values.extend(str(value or "") for value in item)
     except Exception:
         pass
     finally:
         conn.close()
-    return sorted({value for value in values if len(value) >= 4}, key=len, reverse=True)
+    expanded = {value for value in values if value}
+    for value in tuple(expanded):
+        if "://" not in value:
+            continue
+        try:
+            parsed = urlparse(value)
+        except Exception:
+            continue
+        expanded.update(
+            item
+            for item in (
+                parsed.hostname,
+                parsed.username,
+                parsed.password,
+                parsed.path if parsed.path not in {"", "/"} else "",
+                parsed.query,
+                parsed.fragment,
+            )
+            if item
+        )
+    return sorted(
+        {
+            value
+            for value in expanded
+            if len(value) >= 4 or value in account_values
+        },
+        key=len,
+        reverse=True,
+    )
 
 
 def _redact_diagnostic_text(text: str, secrets: list[str]) -> str:
     result = str(text or "")
     for secret in secrets:
         result = result.replace(secret, "[REDACTED]")
-    result = re.sub(r'(?i)(sessionid|csrftoken|password|api[_-]?key|totp|2fa)([^A-Za-z0-9]+)[^\s",;]+', r"\1\2[REDACTED]", result)
+    result = re.sub(
+        r'(?i)(sessionid|csrftoken|cookie|authorization|bearer|token|'
+        r'password|api[_-]?key|totp|2fa)([^A-Za-z0-9]+)'
+        r'[^\s",;]+',
+        r"\1\2[REDACTED]",
+        result,
+    )
     result = re.sub(r"(?i)https?://[^\s/@:]+:[^\s/@]+@", "http://[REDACTED]@", result)
+    return result
+
+
+AUTO_LOGIN_EXPORT_FILE = "auto_login_transaction.jsonl"
+AUTO_LOGIN_EXPORT_SCHEMA_VERSION = 1
+_AUTO_LOGIN_EXPORT_STATES = {
+    "authenticated",
+    "blocker_detected",
+    "challenge",
+    "consent_blocker",
+    "login_combined",
+    "login_password_only",
+    "login_username_first",
+    "transitioning",
+    "two_factor",
+    "unsupported_stable",
+    "unknown",
+}
+_AUTO_LOGIN_EXPORT_TERMINALS = {
+    "blocker_detected",
+    "challenge_detected",
+    "login_form_transition_timeout",
+    "login_submit_control_not_found",
+    "login_submit_no_transition",
+    "password_field_not_found",
+    "password_input_not_retained",
+    "unsupported_login_state",
+    "username_field_not_found",
+    "username_field_not_ready",
+}
+_DIAGNOSTIC_WORKER_FILE_ALLOWLIST = {
+    "actions.jsonl",
+    AUTO_LOGIN_EXPORT_FILE,
+    "consent_recovery.jsonl",
+    "heartbeat_transport_error.json",
+    "human_actions.jsonl",
+    "human_status.json",
+    "latest_state.json",
+    "login_post_action.jsonl",
+    "warmup_stats.json",
+}
+_DIAGNOSTIC_ARCHIVE_STATIC_ALLOWLIST = {
+    "diagnostic.json",
+    "runtime/evidence.json",
+    "runtime/task.log",
+}
+
+
+def _diagnostic_archive_path_allowed(name: str) -> bool:
+    value = str(name or "")
+    if value in _DIAGNOSTIC_ARCHIVE_STATIC_ALLOWLIST:
+        return True
+    if value.startswith("worker/"):
+        worker_name = value.removeprefix("worker/")
+        if worker_name in _DIAGNOSTIC_WORKER_FILE_ALLOWLIST:
+            return True
+    return bool(
+        re.fullmatch(r"worker/snapshots/\d{2}\.json", value)
+        or re.fullmatch(r"worker/sanitized_dom/\d{2}\.html", value)
+    )
+
+
+def _diagnostic_int(value: Any, *, maximum: int = 999_999_999) -> int:
+    try:
+        return max(0, min(maximum, int(value or 0)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _diagnostic_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _diagnostic_enum(value: Any, allowed: set[str], fallback: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else fallback
+
+
+def _diagnostic_identifier(value: Any, fallback: str = "") -> str:
+    normalized = str(value or "")
+    return (
+        normalized
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,79}", normalized)
+        else fallback
+    )
+
+
+def _sanitize_auto_login_diagnostic_jsonl(text: str) -> str:
+    records: list[str] = []
+    for line in str(text or "").splitlines():
+        try:
+            raw = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(raw, dict) or raw.get("schema_version") != 1:
+            continue
+        counts = (
+            raw.get("candidate_counts")
+            if isinstance(raw.get("candidate_counts"), dict)
+            else {}
+        )
+        candidate_raw = (
+            raw.get("selected_candidate")
+            if isinstance(raw.get("selected_candidate"), dict)
+            else None
+        )
+        candidate = None
+        if candidate_raw is not None:
+            candidate = {
+                "intent": _diagnostic_enum(
+                    candidate_raw.get("intent"),
+                    {"otp", "password", "username", "unknown"},
+                    "unknown",
+                ),
+                "type_category": _diagnostic_enum(
+                    candidate_raw.get("type_category"),
+                    {
+                        "email",
+                        "number",
+                        "other",
+                        "password",
+                        "search",
+                        "tel",
+                        "text",
+                        "textarea",
+                    },
+                    "other",
+                ),
+                "autocomplete_category": _diagnostic_enum(
+                    candidate_raw.get("autocomplete_category"),
+                    {
+                        "current-password",
+                        "email",
+                        "new-password",
+                        "none",
+                        "off",
+                        "one-time-code",
+                        "other",
+                        "tel",
+                        "username",
+                    },
+                    "other",
+                ),
+                "form_owned": bool(candidate_raw.get("form_owned")),
+                "attached": bool(candidate_raw.get("attached")),
+                "visible_probe": _diagnostic_bool(
+                    candidate_raw.get("visible_probe")
+                ),
+                "enabled_probe": _diagnostic_bool(
+                    candidate_raw.get("enabled_probe")
+                ),
+                "editable_probe": _diagnostic_bool(
+                    candidate_raw.get("editable_probe")
+                ),
+                "readonly": bool(candidate_raw.get("readonly")),
+                "bounding_box_present": bool(
+                    candidate_raw.get("bounding_box_present")
+                ),
+                "viewport_intersection": bool(
+                    candidate_raw.get("viewport_intersection")
+                ),
+                "node_replacement": bool(
+                    candidate_raw.get("node_replacement")
+                ),
+            }
+        interaction_raw = (
+            raw.get("interaction")
+            if isinstance(raw.get("interaction"), dict)
+            else {}
+        )
+        postcondition_raw = (
+            raw.get("postcondition")
+            if isinstance(raw.get("postcondition"), dict)
+            else {}
+        )
+        terminal_raw = (
+            raw.get("terminal")
+            if isinstance(raw.get("terminal"), dict)
+            else {}
+        )
+        terminal_code = str(terminal_raw.get("code") or "")
+        if terminal_code not in _AUTO_LOGIN_EXPORT_TERMINALS:
+            terminal_code = ""
+        timestamp = str(raw.get("timestamp_utc") or "")
+        if not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+            r"(?:\.\d{1,6})?Z",
+            timestamp,
+        ):
+            timestamp = ""
+        frame_ref = str(raw.get("frame_ref") or "")
+        if not re.fullmatch(r"f_[a-f0-9]{12}_\d{3}", frame_ref):
+            frame_ref = ""
+        container_ref = str(raw.get("container_ref") or "")
+        if not re.fullmatch(r"c_[a-f0-9]{12}_\d{3}", container_ref):
+            container_ref = ""
+        record = {
+            "schema_version": AUTO_LOGIN_EXPORT_SCHEMA_VERSION,
+            "timestamp_utc": timestamp,
+            "sequence": _diagnostic_int(raw.get("sequence")),
+            "event": _diagnostic_enum(
+                raw.get("event"),
+                {"interaction", "observation", "terminal"},
+                "observation",
+            ),
+            "attempt_number": _diagnostic_int(
+                raw.get("attempt_number"), maximum=999
+            ),
+            "document_epoch": _diagnostic_int(
+                raw.get("document_epoch"), maximum=99_999
+            ),
+            "mutation_epoch": _diagnostic_int(
+                raw.get("mutation_epoch")
+            ),
+            "state": _diagnostic_enum(
+                raw.get("state"),
+                _AUTO_LOGIN_EXPORT_STATES,
+                "unknown",
+            ),
+            "url_category": _diagnostic_enum(
+                raw.get("url_category"),
+                {
+                    "challenge",
+                    "consent",
+                    "instagram",
+                    "login_family",
+                    "two_factor",
+                    "unknown",
+                },
+                "unknown",
+            ),
+            "frame_ref": frame_ref,
+            "container_ref": container_ref,
+            "candidate_counts": {
+                intent: _diagnostic_int(
+                    counts.get(intent), maximum=999
+                )
+                for intent in ("username", "password", "otp", "other")
+            },
+            "selected_candidate": candidate,
+            "interaction": {
+                "attempted": bool(interaction_raw.get("attempted")),
+                "kind": _diagnostic_enum(
+                    interaction_raw.get("kind"),
+                    {"click_fill", "native_setter", "none", "reacquire"},
+                    "none",
+                ),
+                "exception_class": _diagnostic_identifier(
+                    interaction_raw.get("exception_class"),
+                    "UnknownError"
+                    if interaction_raw.get("exception_class")
+                    else "",
+                ),
+            },
+            "postcondition": {
+                "value_match": _diagnostic_bool(
+                    postcondition_raw.get("value_match")
+                )
+            },
+            "terminal": {
+                "owner": (
+                    "auto_login_transaction_coordinator"
+                    if terminal_code
+                    and terminal_raw.get("owner")
+                    == "auto_login_transaction_coordinator"
+                    else ""
+                ),
+                "code": terminal_code,
+                "reason_category": _diagnostic_enum(
+                    terminal_raw.get("reason_category"),
+                    {
+                        "blocker",
+                        "candidate_absent",
+                        "challenge",
+                        "interaction_not_verified",
+                        "none",
+                        "postcondition_negative",
+                        "submit_no_transition",
+                        "submit_not_dispatched",
+                        "transition_timeout",
+                        "unsupported_state",
+                    },
+                    "none",
+                ),
+            },
+        }
+        records.append(
+            json.dumps(record, ensure_ascii=True, separators=(",", ":"))
+        )
+    return "\n".join(records) + ("\n" if records else "")
+
+
+def _sanitize_human_actions_jsonl(text: str) -> str:
+    allowed_kinds = {
+        "click",
+        "click_error",
+        "cursor_overlay",
+        "cursor_overlay_restore",
+        "cursor_overlay_restore_error",
+        "direct_fallback",
+        "hover",
+        "idle",
+        "move",
+        "move_error",
+        "press",
+        "scroll",
+        "scroll_error",
+        "target",
+        "type",
+        "type_error",
+        "wander",
+    }
+    records: list[str] = []
+    for line in str(text or "").splitlines():
+        try:
+            raw = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        error_value = raw.get("error")
+        records.append(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": _diagnostic_enum(
+                        raw.get("kind") or raw.get("event"),
+                        allowed_kinds,
+                        "unknown",
+                    ),
+                    "method": _diagnostic_identifier(
+                        raw.get("method"), ""
+                    ),
+                    "exception_class": _diagnostic_identifier(
+                        error_value,
+                        "UnknownError" if error_value else "",
+                    ),
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+        )
+    return "\n".join(records) + ("\n" if records else "")
+
+
+def _sanitize_worker_state_records(text: str, *, jsonl: bool) -> str:
+    raw_values: list[Any] = []
+    if jsonl:
+        for line in str(text or "").splitlines():
+            try:
+                raw_values.append(json.loads(line))
+            except (TypeError, ValueError):
+                continue
+    else:
+        try:
+            raw_values.append(json.loads(str(text or "")))
+        except (TypeError, ValueError):
+            pass
+    records = []
+    for raw in raw_values:
+        if not isinstance(raw, dict):
+            continue
+        records.append(
+            {
+                "schema_version": 1,
+                "state": _diagnostic_enum(
+                    raw.get("state")
+                    or raw.get("classified_state")
+                    or raw.get("event"),
+                    {
+                        "authenticated",
+                        "failed",
+                        "login_required",
+                        "login_transition",
+                        "logged_in",
+                        "request_failed",
+                        "request_finished",
+                        "request_started",
+                        "response_received",
+                        "telemetry_started",
+                        "telemetry_stopped",
+                        "transition_timeout",
+                        "transitioning",
+                        "two_factor_required",
+                        "unknown",
+                    },
+                    "unknown",
+                ),
+                "iteration": _diagnostic_int(
+                    raw.get("iteration"), maximum=99_999
+                ),
+            }
+        )
+    if jsonl:
+        return "".join(
+            json.dumps(item, ensure_ascii=True, separators=(",", ":"))
+            + "\n"
+            for item in records
+        )
+    return json.dumps(
+        records[0] if records else {},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def _sanitize_worker_artifact(name: str, text: str) -> str:
+    if name == AUTO_LOGIN_EXPORT_FILE:
+        return _sanitize_auto_login_diagnostic_jsonl(text)
+    if name == "human_actions.jsonl":
+        return _sanitize_human_actions_jsonl(text)
+    return _sanitize_worker_state_records(
+        text,
+        jsonl=name.endswith(".jsonl"),
+    )
+
+
+def _sanitize_task_log_excerpt(
+    text: str, account_name: str
+) -> str:
+    categories = {
+        "authenticated": ("authenticated", "logged_in"),
+        "blocker": ("blocker", "popup"),
+        "challenge": ("challenge", "checkpoint", "restricted"),
+        "consent": ("consent", "cookie"),
+        "login": ("login", "password", "username"),
+        "network": ("network", "connection", "proxy"),
+        "timeout": ("timeout", "timed out"),
+        "two_factor": ("two_factor", "2fa", "otp"),
+        "worker_exit": ("worker_exit", "process_exit", "heartbeat"),
+    }
+    records = []
+    for line_number, line in enumerate(str(text or "").splitlines(), 1):
+        if account_name not in line:
+            continue
+        lowered = line.lower()
+        matched = sorted(
+            name
+            for name, markers in categories.items()
+            if any(marker in lowered for marker in markers)
+        )
+        records.append(
+            {
+                "schema_version": 1,
+                "line_number": line_number,
+                "categories": matched or ["other"],
+            }
+        )
+    return "".join(
+        json.dumps(item, ensure_ascii=True, separators=(",", ":"))
+        + "\n"
+        for item in records
+    )
+
+
+def _diagnostic_error_category(value: Any) -> str:
+    lowered = str(value or "").lower()
+    for category, markers in (
+        ("challenge", ("challenge", "checkpoint", "restricted")),
+        ("consent", ("consent", "cookie")),
+        ("credential_rejected", ("incorrect", "rejected", "invalid")),
+        ("network", ("network", "proxy", "connection", "tunnel")),
+        ("timeout", ("timeout", "timed out")),
+        ("two_factor", ("two_factor", "2fa", "otp")),
+    ):
+        if any(marker in lowered for marker in markers):
+            return category
+    return "none" if not lowered else "other"
+
+
+def _sanitized_dom_for_export(text: str, secrets: list[str]) -> str:
+    value = _redact_diagnostic_text(text, secrets)
+    value = re.sub(
+        r"(?is)<(script|style|textarea)\b[^>]*>.*?</\1>",
+        "",
+        value,
+    )
+    value = re.sub(
+        r'(?i)\s(value|src|href|name|placeholder|aria-label|'
+        r'class|id|style|action|'
+        r'data-[\w-]+)="[^"]*"',
+        r' \1="[REDACTED]"',
+        value,
+    )
+    # Keep structural tags and accessibility attributes, but not arbitrary
+    # page text which can contain captions, DMs, or other private content.
+    value = re.sub(
+        r">([^<]+)<",
+        lambda match: (
+            "><"
+            if not match.group(1).strip()
+            else ">[TEXT_REDACTED]<"
+        ),
+        value,
+    )
+    return value
+
+
+def _diagnostic_build_identity() -> dict[str, str]:
+    result = {
+        "app_version": APP_VERSION,
+        "release_commit": "source-tree",
+    }
+    roots = [ROOT]
+    frozen_root = getattr(sys, "_MEIPASS", "")
+    if frozen_root:
+        roots.insert(0, Path(str(frozen_root)))
+    for root in roots:
+        manifest_path = root / "build_manifest.json"
+        try:
+            payload = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, TypeError):
+            continue
+        result["app_version"] = str(
+            payload.get("app_version") or APP_VERSION
+        )[:80]
+        result["release_commit"] = str(
+            payload.get("release_commit") or "unknown"
+        )[:80]
+        break
     return result
 
 
 def build_account_diagnostic(account_name: str) -> Path:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", account_name)[:80] or "account"
     candidates: list[Path] = []
-    for root in (DEBUG_UPLOAD, DEBUG_WARMUP):
+    for root in (WORKER_DEBUG_UPLOAD, WORKER_DEBUG_WARMUP):
         try:
             candidates.extend(path for path in root.glob(f"*/{safe}") if path.is_dir())
             candidates.extend(path for path in root.glob(f"*/{account_name}") if path.is_dir())
@@ -734,7 +1671,10 @@ def build_account_diagnostic(account_name: str) -> Path:
             pass
     candidates = sorted(set(candidates), key=lambda path: path.stat().st_mtime, reverse=True)
     source = candidates[0] if candidates else None
-    output = DIAGNOSTICS_DIR / f"SparkGrid-diagnostic-{safe}-{int(time.time())}.zip"
+    output = DIAGNOSTICS_DIR / (
+        f"SparkGrid-diagnostic-{int(time.time())}-"
+        f"{uuid.uuid4().hex[:12]}.zip"
+    )
     secrets = _diagnostic_redactions(account_name)
     conn = db_conn()
     try:
@@ -743,24 +1683,213 @@ def build_account_diagnostic(account_name: str) -> Path:
             (account_name,),
         ).fetchone()
         manifest = {
-            "account": account_name,
-            "status": str(row[0] or "") if row else "missing",
-            "login_status": str(row[1] or "") if row else "",
-            "error": _redact_diagnostic_text(str(row[2] or "") if row else "", secrets),
-            "note": "Cookies, passwords, proxy credentials, rotation links, HAR and network captures are excluded.",
+            "schema_version": 2,
+            "status": _diagnostic_identifier(
+                str(row[0] or "") if row else "missing",
+                "unknown",
+            ),
+            "login_status": _diagnostic_identifier(
+                str(row[1] or "") if row else "",
+                "unknown",
+            ),
+            "error_category": _diagnostic_error_category(
+                str(row[2] or "") if row else ""
+            ),
+            "build": _diagnostic_build_identity(),
+            "note": (
+                "Cookies, passwords, tokens, proxy credentials, captions, "
+                "private page text, screenshots, HAR, network captures and "
+                "bot.db are excluded."
+            ),
+        }
+        job = conn.execute(
+            """
+            SELECT id,run_id,status,current_step,domain_outcome,
+                   infrastructure_outcome,closure_owner,closure_reason,
+                   debug_dir,started_at,finished_at,updated_at
+            FROM ig_web_upload_jobs
+            WHERE account_name=? ORDER BY id DESC LIMIT 1
+            """,
+            (account_name,),
+        ).fetchone()
+        raw_job = dict(job) if job else {}
+        job_evidence = {
+            "id": _diagnostic_int(raw_job.get("id")),
+            "status": _diagnostic_identifier(
+                raw_job.get("status"), "unknown"
+            ),
+            "current_step": _diagnostic_identifier(
+                raw_job.get("current_step"), "unknown"
+            ),
+            "domain_outcome": _diagnostic_identifier(
+                raw_job.get("domain_outcome"), ""
+            ),
+            "infrastructure_outcome": _diagnostic_identifier(
+                raw_job.get("infrastructure_outcome"), ""
+            ),
+            "closure_owner": _diagnostic_identifier(
+                raw_job.get("closure_owner"), ""
+            ),
+            "closure_reason": _diagnostic_identifier(
+                raw_job.get("closure_reason"), ""
+            ),
+            "started": bool(raw_job.get("started_at")),
+            "finished": bool(raw_job.get("finished_at")),
+            "updated": bool(raw_job.get("updated_at")),
         }
     finally:
         conn.close()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("diagnostic.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         if source:
-            for name in ("latest_state.json", "latest_text.txt"):
+            for name in sorted(_DIAGNOSTIC_WORKER_FILE_ALLOWLIST):
                 file = source / name
-                if file.is_file() and file.stat().st_size <= 2_000_000:
-                    archive.writestr(name, _redact_diagnostic_text(file.read_text(encoding="utf-8", errors="replace"), secrets))
-            image = source / "latest.png"
-            if image.is_file() and image.stat().st_size <= 12_000_000:
-                archive.write(image, "latest.png")
+                if file.is_file() and file.stat().st_size <= 5_000_000:
+                    sanitized = _sanitize_worker_artifact(
+                        name,
+                        file.read_text(
+                            encoding="utf-8", errors="replace"
+                        ),
+                    )
+                    archive.writestr(
+                        f"worker/{name}",
+                        sanitized,
+                    )
+            snapshots = source / "snapshots"
+            if snapshots.is_dir():
+                structured = sorted(
+                    snapshots.glob("*.json"),
+                    key=lambda path: path.stat().st_mtime,
+                    reverse=True,
+                )[:20]
+                dom_files = sorted(
+                    snapshots.glob("*.html"),
+                    key=lambda path: path.stat().st_mtime,
+                    reverse=True,
+                )[:5]
+                latest_dom = source / "latest_safe_dom.html"
+                if latest_dom.is_file():
+                    dom_files.insert(0, latest_dom)
+                for index, file in enumerate(structured):
+                    if file.stat().st_size <= 2_000_000:
+                        archive.writestr(
+                            f"worker/snapshots/{index:02d}.json",
+                            _sanitize_worker_state_records(
+                                file.read_text(
+                                    encoding="utf-8", errors="replace"
+                                ),
+                                jsonl=False,
+                            ),
+                        )
+                for index, file in enumerate(dom_files):
+                    if file.stat().st_size <= 2_000_000:
+                        archive.writestr(
+                            f"worker/sanitized_dom/{index:02d}.html",
+                            _sanitized_dom_for_export(
+                                file.read_text(
+                                    encoding="utf-8", errors="replace"
+                                ),
+                                secrets,
+                            ),
+                        )
+        task_logs = sorted(
+            LOG_DIR.glob("task-*.log"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for log_file in task_logs:
+            if log_file.stat().st_size > 5_000_000:
+                continue
+            text = log_file.read_text(
+                encoding="utf-8", errors="replace"
+            )
+            if account_name not in text:
+                continue
+            archive.writestr(
+                "runtime/task.log",
+                _sanitize_task_log_excerpt(text, account_name),
+            )
+            break
+        runtime_files: list[dict[str, Any]] = []
+        heartbeat_root = DATA_DIR / "runtime" / "heartbeats"
+        for pattern in (
+            f"*-{safe}.closure.json",
+            f"*-{safe}.transport_error.json",
+            f"*-{safe}.heartbeat",
+        ):
+            for file in sorted(
+                heartbeat_root.glob(pattern),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )[:5]:
+                try:
+                    raw_evidence = json.loads(
+                        file.read_text(encoding="utf-8")
+                    )
+                    if not isinstance(raw_evidence, dict):
+                        continue
+                    suffix = (
+                        "closure"
+                        if file.name.endswith(".closure.json")
+                        else "transport_error"
+                        if file.name.endswith(".transport_error.json")
+                        else "heartbeat"
+                    )
+                    runtime_files.append(
+                        {
+                            "kind": suffix,
+                            "evidence": {
+                                "closure_owner": _diagnostic_identifier(
+                                    raw_evidence.get("closure_owner"), ""
+                                ),
+                                "closure_reason": _diagnostic_identifier(
+                                    raw_evidence.get("closure_reason"), ""
+                                ),
+                                "worker_pid": _diagnostic_int(
+                                    raw_evidence.get("worker_pid")
+                                ),
+                                "last_liveness_sequence": (
+                                    _diagnostic_int(
+                                        raw_evidence.get(
+                                            "last_liveness_sequence"
+                                        )
+                                    )
+                                ),
+                                "last_semantic_phase": (
+                                    _diagnostic_identifier(
+                                        raw_evidence.get(
+                                            "last_semantic_phase"
+                                        ),
+                                        "",
+                                    )
+                                ),
+                            },
+                        }
+                    )
+                except (OSError, ValueError, TypeError):
+                    continue
+        runtime = {
+            "job": job_evidence,
+            "heartbeat_and_closure": runtime_files,
+            "build": _diagnostic_build_identity(),
+        }
+        archive.writestr(
+            "runtime/evidence.json",
+            _redact_diagnostic_text(
+                json.dumps(runtime, ensure_ascii=False, indent=2),
+                secrets,
+            ),
+        )
+    with zipfile.ZipFile(output, "r") as archive:
+        unexpected = [
+            name
+            for name in archive.namelist()
+            if not _diagnostic_archive_path_allowed(name)
+        ]
+    if unexpected:
+        raise RuntimeError(
+            "diagnostic archive allowlist rejected generated artifacts"
+        )
     return output
 
 
@@ -1108,7 +2237,12 @@ def latest_dump() -> dict[str, Any]:
     return latest
 
 
-def mark_orphan_jobs_stopped(account_names: list[str] | None = None) -> None:
+def mark_orphan_jobs_stopped(
+    account_names: list[str] | None = None,
+    *,
+    closure_owner: str = "scheduler_cleanup",
+    closure_reason: str = "worker_process_missing",
+) -> None:
     names = list(dict.fromkeys(str(name).strip().lstrip("@") for name in (account_names or []) if str(name).strip()))
     if not names and procman.status()["running"]:
         return
@@ -1130,6 +2264,10 @@ def mark_orphan_jobs_stopped(account_names: list[str] | None = None) -> None:
             """
             UPDATE ig_web_upload_jobs
             SET status='stopped',
+                domain_outcome='stopped',
+                infrastructure_outcome=?,
+                closure_owner=?,
+                closure_reason=?,
                 current_step=CASE WHEN current_step='' THEN 'stopped' ELSE current_step END,
                 last_error=CASE WHEN last_error='' THEN 'worker_process_missing' ELSE last_error END,
                 finished_at=CASE WHEN finished_at='' THEN datetime('now') ELSE finished_at END,
@@ -1139,13 +2277,23 @@ def mark_orphan_jobs_stopped(account_names: list[str] | None = None) -> None:
                 'submitted_unverified','uploaded_unverified'
             )
             """ + where,
-            names,
+            [
+                str(closure_reason or "worker_process_missing"),
+                str(closure_owner or "scheduler_cleanup"),
+                str(closure_reason or "worker_process_missing"),
+                *names,
+            ],
         )
         for job in orphan_jobs:
             job_id = int(job["id"])
             if preserve_verified_publication_job(
                 conn, job_id, stop_reason="user_stop_after_verified_publication"
             ):
+                conn.execute(
+                    "UPDATE ig_web_upload_jobs SET domain_outcome=status "
+                    "WHERE id=?",
+                    (job_id,),
+                )
                 continue
             if job_id in clicked_job_ids:
                 conn.execute("UPDATE ig_web_upload_jobs SET status='uploaded_unverified',current_step='uploaded_unverified',last_error='startup_verification_required',finished_at=datetime('now'),updated_at=datetime('now') WHERE id=?", (job_id,))
@@ -1160,6 +2308,11 @@ def mark_orphan_jobs_stopped(account_names: list[str] | None = None) -> None:
                 reconcile_terminal_upload_history(conn, job_id, "submitted_unverified", "startup_reconciliation_required")
             else:
                 reconcile_terminal_upload_history(conn, job_id, "stopped", "worker_process_missing")
+            conn.execute(
+                "UPDATE ig_web_upload_jobs SET domain_outcome=status "
+                "WHERE id=?",
+                (job_id,),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -1323,6 +2476,7 @@ def overview() -> dict[str, Any]:
             "ok": True,
             "accounts": accounts,
             "jobs": jobs,
+            "task_receipts": recent_receipts(100),
             "ready_content": int(ready_content or 0),
             "latest": latest_dump(),
             "process": procman.status(),
@@ -2284,13 +3438,77 @@ def _process_resources(command: list[str]) -> tuple[set[str], list[str]]:
 
 
 def start_process(command: list[str], label: str) -> JSONResponse:
+    run_id = new_task_run_id()
     try:
         resources, accounts = _process_resources(command)
-        ok, message = procman.start(command, label, resources=resources, accounts=accounts)
-        return JSONResponse({"ok": ok, "message": message, "cmd": command, "accounts": accounts},
+        account_refs = [
+            opaque_account_ref(run_id, account) for account in accounts
+        ]
+        diagnostics_dir = ensure_run_diagnostics(
+            run_id,
+            task_category=normalize_task_category(label),
+            account_refs=account_refs,
+        )
+        create_receipt(
+            run_id,
+            label,
+            accounts,
+            diagnostics_dir=str(diagnostics_dir),
+        )
+        ok, message = procman.start(
+            command,
+            label,
+            resources=resources,
+            accounts=accounts,
+            run_id=run_id,
+        )
+        return JSONResponse({"ok": ok, "message": message, "run_id": run_id, "accounts": accounts},
                             status_code=200 if ok else 409)
     except Exception as exc:
+        try:
+            if not recent_receipts(1) or not any(
+                item.get("run_id") == run_id for item in recent_receipts(20)
+            ):
+                create_receipt(run_id, label, [])
+            receipt = finalize_process_exit(
+                run_id,
+                1,
+                closure_owner="process_manager",
+                closure_reason="browser_start_failed",
+            )
+            ensure_task_detail_rows(run_id, list(locals().get("accounts") or []), receipt)
+            finalize_run_diagnostics(
+                run_id,
+                domain_outcome=str(receipt.get("domain_outcome") or ""),
+                infrastructure_outcome=str(
+                    receipt.get("infrastructure_outcome") or "browser_start_failed"
+                ),
+                closure_owner="process_manager",
+                closure_reason="browser_start_failed",
+            )
+        except Exception:
+            pass
         return response_error(str(exc), 500)
+
+
+@app.get("/api/diagnostics/runs/{run_id}/export")
+async def run_diagnostic_api(
+    run_id: str, include_images: bool = False
+):
+    """Export a finalized run; visual evidence is opt-in."""
+    try:
+        output = build_run_archive(
+            run_id, include_images=bool(include_images)
+        )
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        return response_error(
+            "Could not build run diagnostic: " + type(exc).__name__, 400
+        )
+    return FileResponse(
+        str(output),
+        media_type="application/zip",
+        filename=f"SparkGrid-run-diagnostic-{int(time.time())}.zip",
+    )
 
 
 @app.post("/api/ig-web-upload/workflow")
@@ -3154,13 +4372,18 @@ def stop() -> dict[str, Any]:
     stopped = procman.stop()
     for job in list(before.get("jobs") or []):
         for account_name in list(job.get("accounts") or []):
-            recovery = get_active_password_recovery(str(account_name))
+            recovery = get_active_password_recovery(
+                str(account_name), run_id=str(job.get("run_id") or "")
+            )
             if recovery:
                 mark_password_recovery_stopped(
                     str(account_name),
                     str(recovery.get("workflow_id") or ""),
                 )
-    mark_orphan_jobs_stopped()
+    mark_orphan_jobs_stopped(
+        closure_owner="user_stop",
+        closure_reason="stop_all",
+    )
     return {
         "ok": True,
         "stopped": stopped,
@@ -3177,13 +4400,19 @@ def stop_job(job_id: int) -> JSONResponse:
         return response_error("Task is not active", 404)
     accounts = list(stopped.get("accounts") or [])
     for account_name in accounts:
-        recovery = get_active_password_recovery(str(account_name))
+        recovery = get_active_password_recovery(
+            str(account_name), run_id=str(stopped.get("run_id") or "")
+        )
         if recovery:
             mark_password_recovery_stopped(
                 str(account_name),
                 str(recovery.get("workflow_id") or ""),
             )
-    mark_orphan_jobs_stopped(accounts)
+    mark_orphan_jobs_stopped(
+        accounts,
+        closure_owner="targeted_stop",
+        closure_reason="targeted_stop",
+    )
     return JSONResponse({
         "ok": True,
         "stopped": True,

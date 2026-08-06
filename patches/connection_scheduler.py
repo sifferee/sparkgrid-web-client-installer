@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -44,6 +45,14 @@ from password_ip_recovery import (
     record_first_rejection as record_password_rejection,
     update_initial_context as update_password_recovery_context,
 )
+from task_receipts import (
+    current_run_id,
+    mark_child as mark_task_child,
+    opaque_account_ref,
+    record_outcome as record_task_outcome,
+    update_receipt as update_task_receipt,
+)
+from run_diagnostics import append_event as append_run_event
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SPARKGRID_DATA_DIR") or ROOT / "data").resolve()
@@ -69,6 +78,23 @@ _BROWSER_LAUNCH_LOCK = threading.Lock()
 _LAST_BROWSER_LAUNCH = 0.0
 MOBILE_ROTATION_LEASE_WAIT_SECONDS = 240.0
 MOBILE_ROTATION_LEASE_POLL_SECONDS = 0.25
+MOBILE_READINESS_PROBE_ATTEMPTS = 5
+MOBILE_READINESS_BACKOFF_SECONDS = (0.0, 2.0, 4.0, 5.0, 5.0)
+MOBILE_STALE_IP_CONFIRMATIONS = 2
+MOBILE_MAX_ROTATION_REQUESTS = 2
+
+
+class ProxyReadinessResult:
+    """Two-value-compatible readiness result that also retains the observed IP."""
+
+    def __init__(self, ok: bool, detail: str, exit_ip: str = "") -> None:
+        self.ok = bool(ok)
+        self.detail = str(detail or "")
+        self.exit_ip = str(exit_ip or "")
+
+    def __iter__(self):
+        yield self.ok
+        yield self.detail
 
 def browser_storage_targets() -> list[Path]:
     """Every runtime location which can grow during a browser job."""
@@ -463,9 +489,152 @@ def _recovery_exit_ip_probe(
         return probe_proxy_exit_ip(proxy_url)
 
 
-def verify_proxy_after_rotation(proxy_url: str, timeout: float = 8.0) -> tuple[bool, str]:
-    ok, detail, _exit_ip = probe_proxy_exit_ip(proxy_url, timeout=timeout)
-    return ok, detail
+def verify_proxy_after_rotation(proxy_url: str, timeout: float = 8.0) -> ProxyReadinessResult:
+    ok, detail, exit_ip = probe_proxy_exit_ip(proxy_url, timeout=timeout)
+    return ProxyReadinessResult(ok, detail, exit_ip)
+
+
+def _proxy_probe_classification(ok: bool, detail: str, exit_ip: str) -> str:
+    """Classify a secret-free proxy probe without changing its tuple API."""
+    text = str(detail or "").lower()
+    if any(token in text for token in (
+        "407", "proxy authentication", "proxy auth", "authentication required",
+        "invalid proxy credentials", "socks5 authentication",
+    )):
+        return "proxy_auth_failed"
+    if exit_ip:
+        return "ip_observed"
+    if any(token in text for token in (
+        "http 500", "http 502", "http 503", "http 504", "empty",
+        "jsondecodeerror", "invalid ip", "does not appear to be an ipv",
+    )):
+        return "connectivity_confirmed_ip_unavailable"
+    return "transient_connection_failure"
+
+
+def _static_proxy_failure_outcome(detail: str) -> str:
+    """Map private probe detail to the existing public static-proxy taxonomy."""
+    text = str(detail or "").lower()
+    if any(token in text for token in (
+        "407", "proxy authentication", "proxy auth", "authentication required",
+        "invalid proxy credentials", "socks5 authentication",
+    )):
+        return "proxy_auth_failed"
+    if any(token in text for token in (
+        "timed out", "timeout", "timeouterror", "read operation timed out",
+    )):
+        return "proxy_connection_timeout"
+    if any(token in text for token in (
+        "name or service not known", "temporary failure in name resolution",
+        "nodename nor servname", "getaddrinfo", "gaierror", "dns",
+        "network is unreachable", "no route to host", "connection refused",
+        "actively refused", "proxy unreachable",
+    )):
+        return "proxy_unreachable"
+    if any(token in text for token in (
+        "http 500", "http 502", "http 503", "http 504", "empty",
+        "jsondecodeerror", "invalid ip", "does not appear to be an ipv",
+    )):
+        return "proxy_readiness_timeout"
+    return "proxy_connection_failed"
+
+
+def _connection_ref(run_id: str, connection_id: int) -> str:
+    return "connection-" + hashlib.sha256(
+        (str(run_id) + "\0" + str(int(connection_id or 0))).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _record_static_proxy_gate_outcome(
+    args: argparse.Namespace,
+    account: dict[str, Any],
+    outcome: str,
+) -> int:
+    """Close the real account attempt when its worker was blocked by the gate."""
+    name = str(account.get("name") or "")
+    run_id = str(
+        getattr(args, "workflow_run_id", "") or current_run_id() or uuid.uuid4().hex
+    )
+    setattr(args, "workflow_run_id", run_id)
+    code = str(outcome or "proxy_connection_failed")
+    conn = db_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT id FROM ig_web_upload_jobs
+            WHERE run_id=? AND account_name=? ORDER BY id DESC LIMIT 1
+            """,
+            (run_id, name),
+        ).fetchone()
+        if row:
+            job_id = int(row[0])
+            worker_not_started = False
+            conn.execute(
+                """
+                UPDATE ig_web_upload_jobs SET
+                    status='failed',current_step=?,last_error=?,
+                    domain_outcome=?,
+                    closure_owner='connection_scheduler',
+                    closure_reason='proxy_gate_failed',
+                    finished_at=datetime('now'),updated_at=datetime('now')
+                WHERE id=?
+                """,
+                (code, code, code, job_id),
+            )
+        else:
+            worker_not_started = True
+            cursor = conn.execute(
+                """
+                INSERT INTO ig_web_upload_jobs(
+                    run_id,account_name,mode,provider,status,target_uploads,
+                    current_step,last_error,domain_outcome,infrastructure_outcome,
+                    closure_owner,closure_reason,started_at,finished_at,updated_at
+                ) VALUES(?,?,?,?,'failed',0,?,?,?,'worker_not_started',
+                         'connection_scheduler','proxy_gate_failed',
+                         datetime('now'),datetime('now'),datetime('now'))
+                """,
+                (
+                    run_id, name, str(getattr(args, "operation", "workflow")),
+                    str(getattr(args, "provider", "camoufox")), code, code, code,
+                ),
+            )
+            job_id = int(cursor.lastrowid)
+        conn.commit()
+    finally:
+        conn.close()
+    record_task_outcome(
+        run_id,
+        domain_outcome=code,
+        infrastructure_outcome=("worker_not_started" if worker_not_started else ""),
+        connection_state="unavailable",
+        scheduler_state="prelaunch_failed",
+        closure_owner="connection_scheduler",
+        closure_reason="proxy_gate_failed",
+    )
+    event_fields = {
+        "account_ref": opaque_account_ref(run_id, name),
+        "connection_ref": _connection_ref(
+            run_id, int(account.get("web_connection_id") or 0)
+        ),
+    }
+    try:
+        append_run_event(
+            run_id, "domain_outcome", stream="outcomes",
+            domain_outcome=code, **event_fields,
+        )
+        if worker_not_started:
+            append_run_event(
+                run_id, "infrastructure_outcome", stream="outcomes",
+                infrastructure_outcome="worker_not_started", **event_fields,
+            )
+        append_run_event(
+            run_id, "closure", stream="outcomes",
+            closure_owner="connection_scheduler",
+            closure_reason="proxy_gate_failed", **event_fields,
+        )
+    except Exception:
+        pass
+    return job_id
 
 
 def probe_instagram_transport(proxy_url: str, timeout: float = 12.0) -> tuple[bool, str]:
@@ -573,10 +742,10 @@ def durable_mobile_rotation(
                 conn.close()
             if status.get("state") == "terminal" and str(status.get("generation") or "") == generation:
                 outcome = str(status.get("outcome") or "rotation_failed")
-                reused = outcome == "rotation_ready"
+                reused = outcome == "rotation_verified"
                 emit_proxy_telemetry(proxy_url, proxy_type=ctype, phase="rotation_lock", normalized_result="rotation_lock_reused_result",
                                      provider_state="not_applicable", final_classification="rotation_lock_reused_result")
-                return {"ok": reused, "error": "" if reused else outcome, "outcome": "rotation_lock_reused_result", "reused": True}
+                return {"ok": reused, "error": "" if reused else outcome, "outcome": outcome, "lock_outcome": "rotation_lock_reused_result", "reused": True}
         conn = db_conn()
         try:
             # Only followers in this logical rotation generation consume its
@@ -585,8 +754,8 @@ def durable_mobile_rotation(
             status = mobile_rotation_lease_status(conn, connection_id)
             if status.get("state") == "terminal" and str(status.get("generation") or "") == generation:
                 outcome = str(status.get("outcome") or "rotation_failed")
-                reused = outcome == "rotation_ready"
-                return {"ok": reused, "error": "" if reused else outcome, "outcome": "rotation_lock_reused_result", "reused": True}
+                reused = outcome == "rotation_verified"
+                return {"ok": reused, "error": "" if reused else outcome, "outcome": outcome, "lock_outcome": "rotation_lock_reused_result", "reused": True}
             acquired = acquire_mobile_rotation_lease(
                 conn, connection_id, owner_id, lease_seconds, generation=generation,
             )
@@ -607,10 +776,10 @@ def durable_mobile_rotation(
             conn.close()
         if status.get("state") == "terminal" and str(status.get("generation") or "") == generation:
             outcome = str(status.get("outcome") or "rotation_failed")
-            reused = outcome == "rotation_ready"
+            reused = outcome == "rotation_verified"
             emit_proxy_telemetry(proxy_url, proxy_type=ctype, phase="rotation_lock", normalized_result="rotation_lock_reused_result",
                                  provider_state="not_applicable", final_classification="rotation_lock_reused_result")
-            return {"ok": reused, "error": "" if reused else outcome, "outcome": "rotation_lock_reused_result", "reused": True}
+            return {"ok": reused, "error": "" if reused else outcome, "outcome": outcome, "lock_outcome": "rotation_lock_reused_result", "reused": True}
         if time.monotonic() >= deadline:
             emit_proxy_telemetry(proxy_url, proxy_type=ctype, phase="rotation_lock", normalized_result="rotation_lock_timeout",
                                  provider_state="not_applicable", final_classification="rotation_lock_timeout")
@@ -631,47 +800,194 @@ def durable_mobile_rotation(
 
     thread = threading.Thread(target=heartbeat, name="mobile-rotation-lease", daemon=True)
     thread.start()
-    terminal = "rotation_failed"
+    terminal = "rotation_request_failed"
     try:
-        rotation_conn = db_conn()
-        try:
-            result = rotate_connection(rotation_conn, connection_id, sleep_after=sleep_after)
-        finally:
-            rotation_conn.close()
-        if not result.get("ok"):
-            return {"ok": False, "error": str(result.get("error") or "rotation failed"), "outcome": lock_outcome}
-        provider_state = str(result.get("provider_state") or "unknown")
-        if stage_callback is not None:
-            stage_callback(
-                "ROTATION_COMMAND_ACCEPTED"
-                if provider_state in {"accepted", "ready"}
-                else "ROTATION_REQUESTED"
-            )
-            if int(result.get("provider_wait_seconds") or 0) > 0:
+        pre_ok, pre_detail, pre_rotation_ip = probe_proxy_exit_ip(
+            proxy_url, timeout=2.0
+        )
+        if pre_ok and pre_rotation_ip:
+            pre_conn = db_conn()
+            try:
+                pre_conn.execute(
+                    "UPDATE web_connections SET last_ip=?,last_checked_at=datetime('now'),updated_at=datetime('now') WHERE id=?",
+                    (pre_rotation_ip, connection_id),
+                )
+                pre_conn.commit()
+            except sqlite3.Error:
+                pre_conn.rollback()
+            finally:
+                pre_conn.close()
+        if _proxy_probe_classification(pre_ok, pre_detail, pre_rotation_ip) == "proxy_auth_failed":
+            terminal = "proxy_auth_failed"
+            return {
+                "ok": False, "error": terminal, "outcome": terminal,
+                "rotation_requests": 0, "pre_rotation_ip": "",
+            }
+
+        rotation_requests = 0
+        last_detail = ""
+        connectivity_confirmed = False
+        for series in range(MOBILE_MAX_ROTATION_REQUESTS):
+            rotation_conn = db_conn()
+            try:
+                # Grace is owned here so readiness is never skipped when an
+                # older call site passes sleep_after=False.
+                result = rotate_connection(
+                    rotation_conn, connection_id, sleep_after=False
+                )
+            finally:
+                rotation_conn.close()
+            rotation_requests += int(result.get("rotation_requests") or 1)
+            if not result.get("ok"):
+                terminal = str(result.get("outcome") or "rotation_request_failed")
+                wait = min(30.0, max(0.0, float(result.get("provider_wait_seconds") or 0)))
+                if wait:
+                    time.sleep(wait)
+                return {
+                    "ok": False, "error": terminal, "outcome": terminal,
+                    "rotation_requests": rotation_requests,
+                    "retryable": terminal in {
+                        "rotation_endpoint_timeout", "rotation_endpoint_connection_failure",
+                        "rotation_endpoint_rate_limited", "rotation_endpoint_busy",
+                    },
+                }
+
+            provider_state = str(result.get("provider_state") or "unknown")
+            terminal = "rotation_request_accepted"
+            if stage_callback is not None:
+                stage_callback("ROTATION_COMMAND_ACCEPTED")
                 stage_callback("ROTATION_COOLDOWN")
-            stage_callback("ROTATION_STABILIZING")
-        settle_deadline = time.monotonic() + min(120.0, max(0.0, float(result.get("provider_wait_seconds") or 0)))
-        while True:
-            ready, detail = readiness()
-            if ready:
-                terminal = "rotation_ready"
+                stage_callback("ROTATION_STABILIZING")
+            grace = min(120.0, max(0.0, float(result.get("provider_wait_seconds") or 0)))
+            if grace:
+                time.sleep(grace)
+
+            stale_confirmations = 0
+            stale_confirmed = False
+            for probe_index in range(MOBILE_READINESS_PROBE_ATTEMPTS):
+                delay = MOBILE_READINESS_BACKOFF_SECONDS[
+                    min(probe_index, len(MOBILE_READINESS_BACKOFF_SECONDS) - 1)
+                ]
+                if delay:
+                    time.sleep(delay)
+                callback_result = readiness()
+                try:
+                    ready_hint, readiness_detail = callback_result
+                except ValueError:
+                    ready_hint, readiness_detail, callback_ip = callback_result
+                else:
+                    callback_ip = str(
+                        getattr(callback_result, "exit_ip", "") or ""
+                    )
+                ok = bool(ready_hint)
+                detail = str(readiness_detail or "")
+                candidate_ip = callback_ip
+                last_detail = str(detail or "")
+                classification = _proxy_probe_classification(ok, detail, candidate_ip)
+                if classification == "proxy_auth_failed":
+                    terminal = "proxy_auth_failed"
+                    return {
+                        "ok": False, "error": terminal, "outcome": terminal,
+                        "rotation_requests": rotation_requests, "retryable": False,
+                    }
+                if classification == "connectivity_confirmed_ip_unavailable":
+                    connectivity_confirmed = True
+                    stale_confirmations = 0
+                    continue
+                if classification != "ip_observed":
+                    if ok and not pre_rotation_ip and not candidate_ip:
+                        terminal = "rotation_verified"
+                        if stage_callback is not None:
+                            stage_callback("PROXY_READINESS_CONFIRMED")
+                        return {
+                            "ok": True, "error": "", "detail": last_detail,
+                            "outcome": terminal, "lock_outcome": lock_outcome,
+                            "reused": False, "provider_state": provider_state,
+                            "generation": generation,
+                            "rotation_requests": rotation_requests,
+                            "pre_rotation_ip": "", "exit_ip": "",
+                        }
+                    stale_confirmations = 0
+                    continue
+
+                connectivity_confirmed = True
+                if pre_rotation_ip and candidate_ip == pre_rotation_ip:
+                    stale_confirmations += 1
+                    if stale_confirmations < MOBILE_STALE_IP_CONFIRMATIONS:
+                        continue
+                    stale_confirmed = True
+                    terminal = (
+                        "rotation_stale_ip_confirmed"
+                        if series == 0
+                        else "rotation_stale_ip_after_retry"
+                    )
+                    break
+
+                stale_confirmations = 0
+                ready = bool(ready_hint)
+                last_detail = str(readiness_detail or detail or "")
+                callback_classification = _proxy_probe_classification(
+                    bool(ready), last_detail, candidate_ip if ready else ""
+                )
+                if callback_classification == "proxy_auth_failed":
+                    terminal = "proxy_auth_failed"
+                    return {
+                        "ok": False, "error": terminal, "outcome": terminal,
+                        "rotation_requests": rotation_requests, "retryable": False,
+                    }
+                if not ready:
+                    continue
+                terminal = "rotation_verified"
                 if stage_callback is not None:
                     stage_callback("PROXY_READINESS_CONFIRMED")
+                emit_proxy_telemetry(
+                    proxy_url, proxy_type=ctype, phase="readiness",
+                    normalized_result=terminal, provider_state=provider_state,
+                    connectivity=True, ip_changed=(
+                        True if pre_rotation_ip else "unknown"
+                    ), instagram_reachable="unknown", browser_launched=False,
+                    retry_attempt=probe_index + 1,
+                    final_classification=terminal,
+                )
                 return {
-                    "ok": True,
-                    "error": "",
-                    "detail": str(detail or ""),
-                    "outcome": lock_outcome,
-                    "reused": False,
-                    "provider_state": provider_state,
-                    "generation": generation,
+                    "ok": True, "error": "", "detail": last_detail,
+                    "outcome": terminal, "lock_outcome": lock_outcome,
+                    "reused": False, "provider_state": provider_state,
+                    "generation": generation, "rotation_requests": rotation_requests,
+                    "pre_rotation_ip": pre_rotation_ip, "exit_ip": candidate_ip,
                 }
-            if not result.get("pending") or time.monotonic() >= settle_deadline:
-                outcome = "provider_busy" if provider_state in {"provider_busy", "cooldown", "rate_limited"} else "rotation_timeout"
-                return {"ok": False, "error": str(detail or outcome), "outcome": outcome}
-            # The provider request was already accepted: poll the authoritative
-            # exit-IP gate while the owner heartbeat keeps the lease active.
-            time.sleep(min(5.0, max(0.0, settle_deadline - time.monotonic())))
+
+            if stale_confirmed and series == 0:
+                emit_proxy_telemetry(
+                    proxy_url, proxy_type=ctype, phase="readiness",
+                    normalized_result="rotation_stale_ip_confirmed",
+                    provider_state=provider_state, connectivity=True,
+                    ip_changed=False, instagram_reachable="unknown",
+                    browser_launched=False,
+                    retry_attempt=MOBILE_READINESS_PROBE_ATTEMPTS,
+                    final_classification="rotation_stale_ip_confirmed",
+                )
+                continue
+            if stale_confirmed:
+                return {
+                    "ok": False, "error": terminal, "outcome": terminal,
+                    "rotation_requests": rotation_requests, "retryable": True,
+                }
+            terminal = (
+                "proxy_readiness_timeout"
+                if connectivity_confirmed else "proxy_connection_failed"
+            )
+            return {
+                "ok": False, "error": terminal, "outcome": terminal,
+                "accepted_outcome": "rotation_accepted_but_not_ready",
+                "detail": last_detail, "rotation_requests": rotation_requests,
+                "retryable": True,
+            }
+        terminal = "proxy_readiness_timeout"
+        return {
+            "ok": False, "error": terminal, "outcome": terminal,
+            "rotation_requests": rotation_requests, "retryable": True,
+        }
     finally:
         stopped.set()
         thread.join(timeout=1.0)
@@ -687,11 +1003,15 @@ def mark_proxy_failed(
     account: dict[str, Any],
     detail: str,
     allow_static_replacement: bool = True,
+    outcome: str = "",
 ) -> dict[str, Any] | None:
     name = str(account.get("name") or "")
     connection_id = int(account.get("web_connection_id") or 0)
     is_static = str(account.get("connection_type") or "") == "static"
-    error = ("low_quality_proxy: " if is_static else "proxy_failed: ") + str(detail or "proxy validation failed")
+    code = str(outcome or "proxy_connection_failed")
+    error = (
+        "low_quality_proxy: " if is_static else code + ": "
+    ) + str(detail or "proxy validation failed")
     conn = db_conn()
     try:
         try:
@@ -717,24 +1037,47 @@ def mark_proxy_failed(
             if connection_id and not is_static:
                 conn.execute(
                     "UPDATE web_connections SET enabled=CASE WHEN connection_type='static' THEN 0 ELSE enabled END,last_status=?,last_error=?,last_checked_at=datetime('now'),updated_at=datetime('now') WHERE id=?",
-                    ("low_quality_proxy" if is_static else "proxy_failed", str(detail or "proxy validation failed"), connection_id),
+                    (code, str(detail or "proxy validation failed"), connection_id),
                 )
-            conn.execute(
-                """
-                INSERT INTO ig_web_upload_jobs(
-                    run_id,account_name,mode,provider,status,target_uploads,current_step,last_error,
-                    started_at,finished_at,updated_at
-                ) VALUES(?,?,?,?,'failed',0,'proxy_failed',?,datetime('now'),datetime('now'),datetime('now'))
-                """,
-                (
-                    f"proxy-gate-{int(time.time())}",
-                    name,
-                    str(getattr(args, "operation", "workflow")),
-                    str(getattr(args, "provider", "camoufox")),
-                    (f"{error}; automatically assigned {replacement['name']}" if replacement else error),
-                ),
-            )
             conn.commit()
+            if is_static:
+                # A replacement candidate keeps the same account attempt open.
+                # Only a terminal gate failure owns the real job closure.
+                if not replacement:
+                    _record_static_proxy_gate_outcome(args, account, code)
+            else:
+                run_id = str(
+                    getattr(args, "workflow_run_id", "")
+                    or current_run_id()
+                    or f"proxy-gate-{int(time.time())}"
+                )
+                conn.execute(
+                    """
+                    INSERT INTO ig_web_upload_jobs(
+                        run_id,account_name,mode,provider,status,target_uploads,current_step,last_error,
+                        domain_outcome,infrastructure_outcome,closure_owner,
+                        closure_reason,started_at,finished_at,updated_at
+                    ) VALUES(?,?,?,?,'failed',0,?,?,?,'worker_not_started',
+                             'connection_scheduler','proxy_gate_failed','',
+                             datetime('now'),datetime('now'))
+                    """,
+                    (
+                        run_id, name,
+                        str(getattr(args, "operation", "workflow")),
+                        str(getattr(args, "provider", "camoufox")),
+                        code, error, code,
+                    ),
+                )
+                conn.commit()
+                record_task_outcome(
+                    run_id,
+                    domain_outcome=code,
+                    infrastructure_outcome="worker_not_started",
+                    connection_state="unavailable",
+                    scheduler_state="prelaunch_failed",
+                    closure_owner="connection_scheduler",
+                    closure_reason="proxy_gate_failed",
+                )
             return dict(account) if replacement else None
         except Exception as exc:
             conn.rollback()
@@ -759,14 +1102,35 @@ def strict_proxy_gate(
         return True, ""
     attempts = 3
     last_detail = ""
+    mobile_stale_confirmations = 0
+    mobile_rotation_used = False
+    terminal_outcome = "proxy_connection_failed"
     for attempt in range(attempts):
-        ok, detail, exit_ip = probe_proxy_exit_ip(proxy_url)
+        try:
+            ok, detail, exit_ip = probe_proxy_exit_ip(proxy_url)
+        except Exception as exc:
+            if ctype != "static":
+                raise
+            ok, detail, exit_ip = False, type(exc).__name__, ""
+            terminal_outcome = "proxy_gate_internal_error"
+            last_detail = detail
+            break
         last_detail = detail
+        probe_classification = _proxy_probe_classification(ok, detail, exit_ip)
+        if probe_classification == "proxy_auth_failed":
+            terminal_outcome = "proxy_auth_failed"
+            break
+        if ctype == "static" and not ok:
+            terminal_outcome = _static_proxy_failure_outcome(detail)
         if ok:
             instagram_ok, instagram_detail = probe_instagram_transport(proxy_url)
             if not instagram_ok:
                 last_detail = instagram_detail
                 ok = False
+                if ctype == "static":
+                    terminal_outcome = _static_proxy_failure_outcome(
+                        instagram_detail
+                    )
             elif "inconclusive" in instagram_detail.lower():
                 log(f"{connection_name}: {name} {instagram_detail}", "WARNING")
             else:
@@ -805,14 +1169,37 @@ def strict_proxy_gate(
                     owner = db_owner
             last_detail = f"exit IP {exit_ip} was recently used by {owner}; a fresh IP is required"
         if has_rotation and attempt + 1 < attempts:
-            log(f"{connection_name}: {name} {last_detail}; rotating again before browser launch", "ACT")
-            rotation = durable_mobile_rotation(
-                account,
-                lambda: verify_proxy_after_rotation(str(account.get("proxy_url") or "")),
-            )
-            if not rotation.get("ok"):
-                last_detail = f"rotation retry failed: {rotation.get('error')}"
-                break
+            if exit_ip and "used by" in last_detail:
+                mobile_stale_confirmations += 1
+            else:
+                mobile_stale_confirmations = 0
+            if (
+                mobile_stale_confirmations >= MOBILE_STALE_IP_CONFIRMATIONS
+                and not mobile_rotation_used
+            ):
+                log(
+                    f"{connection_name}: {name} stale exit IP confirmed; rotating before browser launch",
+                    "ACT",
+                )
+                rotation = durable_mobile_rotation(
+                    account,
+                    lambda: verify_proxy_after_rotation(
+                        str(account.get("proxy_url") or "")
+                    ),
+                )
+                mobile_rotation_used = True
+                if not rotation.get("ok"):
+                    terminal_outcome = str(
+                        rotation.get("outcome") or "proxy_readiness_timeout"
+                    )
+                    last_detail = str(rotation.get("error") or terminal_outcome)
+                    break
+            else:
+                # A single timeout or stale observation is evidence for another
+                # probe, never permission to send a rotation request.
+                time.sleep(MOBILE_READINESS_BACKOFF_SECONDS[min(
+                    attempt + 1, len(MOBILE_READINESS_BACKOFF_SECONDS) - 1
+                )])
         elif not has_rotation and attempt + 1 < attempts:
             # A duplicate static IP cannot become fresh by retrying the same
             # endpoint. Network timeouts, resets and refused connections can.
@@ -820,12 +1207,26 @@ def strict_proxy_gate(
                 break
             log(f"{connection_name}: {name} {last_detail}; retrying the same static proxy", "ACT")
             time.sleep(3.0)
-    replacement = mark_proxy_failed(args, account, last_detail, allow_static_replacement)
+    if has_rotation and terminal_outcome == "proxy_connection_failed":
+        terminal_outcome = "proxy_readiness_timeout"
+    replacement = (
+        mark_proxy_failed(
+            args, account, last_detail, allow_static_replacement,
+            outcome=terminal_outcome,
+        )
+        if ctype == "static"
+        else mark_proxy_failed(
+            args, account, last_detail, allow_static_replacement,
+            outcome=terminal_outcome,
+        )
+    )
     emit_proxy_telemetry(
         proxy_url, proxy_type=ctype, phase="readiness", normalized_result="not_ready",
         provider_state="unknown", connectivity=False, ip_changed="unknown",
         instagram_reachable="unknown", browser_launched=False, retry_attempt=attempts,
-        final_classification="proxy_readiness_failed",
+        final_classification=(
+            "proxy_readiness_failed" if ctype == "static" else terminal_outcome
+        ),
     )
     if is_static := (ctype == "static"):
         if replacement and allow_static_replacement:
@@ -850,9 +1251,135 @@ def _heartbeat_mtime(path: Path) -> float:
         return 0.0
 
 
+def _read_heartbeat(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return dict(value) if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _classify_worker_liveness(
+    proc: Any,
+    payload: dict[str, Any],
+    *,
+    transport_error: bool,
+) -> str:
+    if proc.poll() is not None:
+        return "worker_process_dead"
+    if transport_error:
+        return "heartbeat_transport_failed"
+    if payload.get("browser_process_tree_present") is False:
+        return "browser_process_tree_missing"
+    return "worker_alive"
+
+
+def _persist_watchdog_closure(path: Path, evidence: dict[str, Any]) -> None:
+    """Atomically preserve closure ownership before terminating a process tree."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(evidence, ensure_ascii=True, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _record_infrastructure_outcome(
+    account_name: str,
+    outcome: str,
+    *,
+    closure_owner: str = "",
+    closure_reason: str = "",
+) -> None:
+    """Persist process/cleanup evidence without changing the domain status."""
+    conn = db_conn()
+    try:
+        columns = {
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(ig_web_upload_jobs)"
+            ).fetchall()
+        }
+        for column in (
+            "domain_outcome",
+            "infrastructure_outcome",
+            "closure_owner",
+            "closure_reason",
+        ):
+            if column not in columns:
+                conn.execute(
+                    "ALTER TABLE ig_web_upload_jobs "
+                    f"ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                )
+        row = conn.execute(
+            """
+            SELECT id,COALESCE(status,''),COALESCE(domain_outcome,''),
+                   COALESCE(infrastructure_outcome,'')
+            FROM ig_web_upload_jobs
+            WHERE account_name=?
+              AND (?='' OR run_id=?)
+            ORDER BY id DESC LIMIT 1
+            """,
+            (
+                str(account_name or ""),
+                str(current_run_id() or ""),
+                str(current_run_id() or ""),
+            ),
+        ).fetchone()
+        if not row:
+            conn.commit()
+            return
+        prior = str(row[3] or "")
+        value = str(outcome or "")
+        infrastructure = prior
+        if value and value not in prior.split(";"):
+            infrastructure = ";".join(
+                item for item in (prior, value) if item
+            )
+        domain = str(row[2] or row[1] or "")
+        conn.execute(
+            """
+            UPDATE ig_web_upload_jobs
+            SET domain_outcome=?,infrastructure_outcome=?,
+                closure_owner=CASE WHEN ?<>'' THEN ? ELSE closure_owner END,
+                closure_reason=CASE WHEN ?<>'' THEN ? ELSE closure_reason END,
+                updated_at=datetime('now')
+            WHERE id=?
+            """,
+            (
+                domain,
+                infrastructure,
+                closure_owner,
+                closure_owner,
+                closure_reason,
+                closure_reason,
+                int(row[0]),
+            ),
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        log(
+            f"{account_name}: could not persist infrastructure outcome: "
+            f"{type(exc).__name__}",
+            "WARNING",
+        )
+    finally:
+        conn.close()
+
+
 def _mark_workflow_stalled(account: dict[str, Any], seconds: int, reason: str = "workflow_stalled") -> None:
     name = str(account.get("name") or "")
-    safe_reason = "browser_start_stalled" if reason == "browser_start_stalled" else "workflow_stalled"
+    safe_reason = (
+        reason
+        if reason in {
+            "browser_start_stalled",
+            "worker_liveness_lost",
+            "browser_process_tree_missing",
+        }
+        else "workflow_stalled"
+    )
     phase = "browser startup" if safe_reason == "browser_start_stalled" else "browser workflow"
     error = f"{safe_reason}: no heartbeat during {phase} for {int(seconds)} seconds; process tree closed safely"
     conn = db_conn()
@@ -919,12 +1446,17 @@ def _run_worker_with_watchdog(command: list[str], env: dict[str, str], account: 
     heartbeat_root = DATA_DIR / "runtime" / "heartbeats"
     heartbeat_root.mkdir(parents=True, exist_ok=True)
     heartbeat_path = heartbeat_root / f"{int(time.time() * 1000)}-{threading.get_ident()}-{name}.heartbeat"
+    heartbeat_error_path = heartbeat_path.with_suffix(".transport_error.json")
+    closure_path = heartbeat_path.with_suffix(".closure.json")
     heartbeat_path.write_text("scheduler_start\n", encoding="utf-8")
     env["SPARKGRID_HEARTBEAT_PATH"] = str(heartbeat_path)
+    env["SPARKGRID_HEARTBEAT_ERROR_PATH"] = str(heartbeat_error_path)
     initial_heartbeat = _heartbeat_mtime(heartbeat_path)
     last_heartbeat = 0.0
     heartbeat_count = 0
     last_progress_at = started
+    last_payload: dict[str, Any] = {}
+    transport_error_logged = False
     # Starting several full browser engines in the same millisecond causes a
     # CPU/disk spike and false 240-second startup stalls. Stagger only process
     # creation; already-open independent lanes continue concurrently.
@@ -937,11 +1469,38 @@ def _run_worker_with_watchdog(command: list[str], env: dict[str, str], account: 
             _LAST_BROWSER_LAUNCH = time.time()
     else:
         proc = subprocess.Popen(command, cwd=str(ROOT), env=env, **process_group_kwargs())
+    receipt_run_id = str(env.get("SPARKGRID_RUN_ID") or current_run_id())
+    account_ref = (
+        opaque_account_ref(receipt_run_id, name)
+        if receipt_run_id and name
+        else ""
+    )
+    if receipt_run_id:
+        mark_task_child(receipt_run_id, "running", int(proc.pid or 0))
+        try:
+            append_run_event(
+                receipt_run_id, "child_start", stream="process_events",
+                child_process_state="running", pid=int(proc.pid or 0),
+                account_ref=account_ref, worker_started=True,
+            )
+        except Exception:
+            pass
     if str(operation or "") in {"api", "analytics_session"}:
         # These are request workers without a browser dump heartbeat. Their
         # own HTTP timeouts remain authoritative; a browser-heartbeat watchdog
         # would incorrectly kill a large own-API scan.
         code = int(proc.wait() or 0)
+        if receipt_run_id:
+            mark_task_child(receipt_run_id, "exited", int(proc.pid or 0))
+            try:
+                append_run_event(
+                    receipt_run_id, "child_exit", stream="process_events",
+                    child_process_state="exited", pid=int(proc.pid or 0),
+                    return_code=code, account_ref=account_ref,
+                    worker_started=True,
+                )
+            except Exception:
+                pass
         heartbeat_path.unlink(missing_ok=True)
         return code
     try:
@@ -952,18 +1511,97 @@ def _run_worker_with_watchdog(command: list[str], env: dict[str, str], account: 
                 last_heartbeat = heartbeat
                 heartbeat_count += 1
                 last_progress_at = time.time()
+                last_payload = _read_heartbeat(heartbeat_path)
             now = time.time()
+            transport_error = heartbeat_error_path.is_file()
+            liveness = _classify_worker_liveness(
+                proc,
+                last_payload,
+                transport_error=transport_error,
+            )
+            if transport_error:
+                if not transport_error_logged:
+                    _record_infrastructure_outcome(
+                        name, "heartbeat_transport_error"
+                    )
+                    log(
+                        f"{name}: heartbeat_transport_error; worker remains "
+                        "owned by its semantic workflow result",
+                        "ERROR",
+                    )
+                    transport_error_logged = True
+                # A broken file transport cannot prove a workflow stall.
+                continue
             startup_stalled = heartbeat_count < 2 and now - started > 300
             active_stalled = heartbeat_count >= 2 and now - last_progress_at > 180
             if startup_stalled or active_stalled:
                 threshold = 300 if startup_stalled else 180
-                reason = "browser_start_stalled" if startup_stalled else "workflow_stalled"
-                log(f"{name}: {reason}; no direct worker heartbeat for {threshold}s; closing process tree", "ERROR")
-                stop_process_tree(proc)
+                reason = (
+                    "browser_start_stalled"
+                    if startup_stalled
+                    else (
+                        "browser_process_tree_missing"
+                        if liveness == "browser_process_tree_missing"
+                        else "worker_liveness_lost"
+                    )
+                )
+                evidence = {
+                    "closure_owner": "connection_scheduler_watchdog",
+                    "closure_reason": reason,
+                    "worker_pid": int(getattr(proc, "pid", 0) or 0),
+                    "last_liveness_sequence": int(
+                        last_payload.get("heartbeat_sequence") or heartbeat_count
+                    ),
+                    "last_semantic_phase": str(
+                        last_payload.get("current_operation") or ""
+                    ),
+                    "last_fresh_evidence_timestamp": int(
+                        last_payload.get("monotonic_timestamp_ms") or 0
+                    ),
+                    "liveness_state": liveness,
+                    "threshold_seconds": threshold,
+                }
+                _persist_watchdog_closure(closure_path, evidence)
                 _mark_workflow_stalled(account, threshold, reason)
+                _record_infrastructure_outcome(
+                    name,
+                    reason,
+                    closure_owner="connection_scheduler_watchdog",
+                    closure_reason=reason,
+                )
+                log(
+                    f"{name}: {reason}; independent worker liveness stopped "
+                    f"for {threshold}s; closing process tree",
+                    "ERROR",
+                )
+                stop_process_tree(proc)
                 return 124
-        return int(proc.returncode or 0)
+        returncode = int(proc.returncode or 0)
+        if receipt_run_id:
+            mark_task_child(receipt_run_id, "exited", int(proc.pid or 0))
+        _record_infrastructure_outcome(
+            name,
+            "worker_exit_0" if returncode == 0 else "worker_exit_nonzero",
+            closure_owner="worker_process",
+            closure_reason=(
+                "normal_exit"
+                if returncode == 0
+                else "process_exit_nonzero"
+            ),
+        )
+        return returncode
     finally:
+        if receipt_run_id and proc.poll() is not None:
+            mark_task_child(receipt_run_id, "exited", int(proc.pid or 0))
+            try:
+                append_run_event(
+                    receipt_run_id, "child_exit", stream="process_events",
+                    child_process_state="exited", pid=int(proc.pid or 0),
+                    return_code=int(proc.returncode or 0),
+                    account_ref=account_ref, worker_started=True,
+                )
+            except Exception:
+                pass
         heartbeat_path.unlink(missing_ok=True)
 
 
@@ -1012,6 +1650,57 @@ def _set_auto_login_terminal(name: str, code: str, detail: str) -> None:
         conn.close()
 
 
+def _record_static_worker_domain(
+    args: argparse.Namespace,
+    account: dict[str, Any],
+    outcome: str,
+) -> None:
+    """Attach a post-worker static recovery failure to that worker's real job."""
+    run_id = str(getattr(args, "workflow_run_id", "") or current_run_id())
+    name = str(account.get("name") or "")
+    code = str(outcome or "static_proxy_pool_exhausted")
+    if not run_id:
+        return
+    conn = db_conn()
+    try:
+        conn.execute(
+            """
+            UPDATE ig_web_upload_jobs SET
+                status='failed',current_step=?,last_error=?,domain_outcome=?,
+                closure_owner='connection_scheduler',
+                closure_reason='proxy_gate_failed',
+                finished_at=datetime('now'),updated_at=datetime('now')
+            WHERE id=(
+                SELECT id FROM ig_web_upload_jobs
+                WHERE run_id=? AND account_name=? ORDER BY id DESC LIMIT 1
+            )
+            """,
+            (code, code, code, run_id, name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    record_task_outcome(
+        run_id,
+        domain_outcome=code,
+        connection_state="unavailable",
+        scheduler_state="account_failed",
+        closure_owner="connection_scheduler",
+        closure_reason="proxy_gate_failed",
+    )
+    try:
+        append_run_event(
+            run_id, "domain_outcome", stream="outcomes",
+            account_ref=opaque_account_ref(run_id, name),
+            connection_ref=_connection_ref(
+                run_id, int(account.get("web_connection_id") or 0)
+            ),
+            domain_outcome=code,
+        )
+    except Exception:
+        pass
+
+
 def _record_auto_login_prelaunch_failure(
     args: argparse.Namespace,
     account: dict[str, Any],
@@ -1025,8 +1714,12 @@ def _record_auto_login_prelaunch_failure(
     ):
         return
     name = str(account.get("name") or "")
-    run_id = str(getattr(args, "workflow_run_id", "") or uuid.uuid4().hex)
-    safe_detail = str(detail or code)[:500]
+    run_id = str(
+        getattr(args, "workflow_run_id", "")
+        or current_run_id()
+        or uuid.uuid4().hex
+    )
+    safe_detail = str(detail or code)[:160]
     conn = db_conn()
     try:
         conn.execute(
@@ -1037,21 +1730,64 @@ def _record_auto_login_prelaunch_failure(
             """
             INSERT INTO ig_web_upload_jobs(
                 run_id,account_name,mode,provider,status,target_uploads,current_step,last_error,
-                started_at,finished_at,updated_at
-            ) VALUES(?,?,?,?,'failed',0,?,?,datetime('now'),datetime('now'),datetime('now'))
+                domain_outcome,infrastructure_outcome,closure_owner,
+                closure_reason,started_at,finished_at,updated_at
+            ) VALUES(?,?,?,?,'failed',0,?,?,?,'worker_not_started',
+                     'connection_scheduler',?,'',datetime('now'),datetime('now'))
             """,
             (
-                f"auto-login-{run_id}",
+                run_id,
                 name,
                 str(account.get("web_upload_mode") or "desktop"),
                 str(getattr(args, "provider", "camoufox") or "camoufox"),
                 code,
                 safe_detail,
+                code,
+                code,
             ),
         )
         conn.commit()
     finally:
         conn.close()
+    record_task_outcome(
+        run_id,
+        domain_outcome=code,
+        infrastructure_outcome="worker_not_started",
+        connection_state=safe_detail,
+        scheduler_state="prelaunch_failed",
+        closure_owner="connection_scheduler",
+        closure_reason=code,
+    )
+
+
+def _normalized_rotation_failure(value: Any) -> str:
+    """Collapse provider/network detail to a strict secret-free subtype."""
+    text = str(value or "").lower()
+    known = (
+        "rotation_request_failed", "rotation_request_accepted",
+        "rotation_endpoint_timeout", "rotation_endpoint_connection_failure",
+        "rotation_endpoint_auth_failure", "rotation_endpoint_rate_limited",
+        "rotation_endpoint_busy", "proxy_auth_failed", "proxy_connection_failed",
+        "proxy_readiness_timeout", "rotation_stale_ip_confirmed",
+        "rotation_stale_ip_after_retry", "rotation_accepted_but_not_ready",
+        "rotation_verified",
+    )
+    for outcome in known:
+        if outcome in text:
+            return outcome
+    if any(token in text for token in ("timed out", "timeout", "timeouterror")):
+        return "rotation_endpoint_timeout"
+    if any(token in text for token in ("ip unchanged", "has not changed", "not changed")):
+        return "rotation_stale_ip_after_retry"
+    if any(token in text for token in ("lease is still active", "rotation_lock_timeout")):
+        return "rotation_lease_conflict"
+    if any(token in text for token in ("malformed", "missing rotation", "invalid rotation")):
+        return "malformed_rotation_configuration"
+    if any(token in text for token in ("provider_busy", "cooldown", "rate_limited")):
+        return "rotation_endpoint_busy"
+    if any(token in text for token in ("validation", "proxy not ready", "not stabilized")):
+        return "proxy_readiness_timeout"
+    return "rotation_request_failed"
 
 
 def _rotation_generation(args: argparse.Namespace, account: dict[str, Any], phase: str) -> str:
@@ -1199,21 +1935,23 @@ def _mobile_recovery_rotation(
     fresh_ip = ""
     readiness_detail = ""
 
-    def readiness() -> tuple[bool, str]:
+    def readiness() -> ProxyReadinessResult:
         nonlocal fresh_ip, readiness_detail
         ok, detail, candidate = _recovery_exit_ip_probe(
             str(account.get("proxy_url") or ""), checker
         )
         readiness_detail = detail
         if not ok:
-            return False, detail
+            return ProxyReadinessResult(False, detail, candidate)
         if not candidate or candidate == failed_ip:
-            return False, "mobile recovery exit IP has not changed yet"
+            return ProxyReadinessResult(
+                False, "mobile recovery exit IP has not changed yet", candidate
+            )
         instagram_ok, instagram_detail = probe_instagram_transport(
             str(account.get("proxy_url") or "")
         )
         if not instagram_ok:
-            return False, instagram_detail
+            return ProxyReadinessResult(False, instagram_detail, candidate)
         db_reserved, db_owner = reserve_persisted_exit_ip(
             int(account.get("web_connection_id") or 0),
             account_name,
@@ -1221,16 +1959,20 @@ def _mobile_recovery_rotation(
             True,
         )
         if not db_reserved:
-            return False, (
-                f"mobile recovery exit IP was recently used by {db_owner}"
+            return ProxyReadinessResult(
+                False,
+                f"mobile recovery exit IP was recently used by {db_owner}",
+                candidate,
             )
         reserved, memory_owner = reserve_exit_ip(candidate, account_name)
         if not reserved:
-            return False, (
-                f"mobile recovery exit IP is active for {memory_owner}"
+            return ProxyReadinessResult(
+                False,
+                f"mobile recovery exit IP is active for {memory_owner}",
+                candidate,
             )
         fresh_ip = candidate
-        return True, detail
+        return ProxyReadinessResult(True, detail, candidate)
 
     def stage(stage_name: str) -> None:
         if workflow_id:
@@ -1351,14 +2093,31 @@ def run_account(args: argparse.Namespace, lane: dict[str, Any], account: dict[st
         )
         if not result.get("ok"):
             rotation_error = str(result.get("error") or "rotation_failed")
-            detail = (
-                f"Auto login stopped before browser launch: connection {connection_name} "
-                f"could not rotate ({rotation_error})"
+            detail = _normalized_rotation_failure(
+                result.get("outcome") or rotation_error
             )
+            try:
+                append_run_event(
+                    args.workflow_run_id,
+                    "connection_rotation",
+                    rotation_state=detail,
+                    infrastructure_outcome=(
+                        "connection_rotation_failed_before_browser_launch"
+                    ),
+                )
+            except Exception:
+                pass
             _record_auto_login_prelaunch_failure(
-                args, account, "connection_rotation_failed_before_browser_launch", detail,
+                args, account, detail, detail,
             )
-            log(f"{connection_name}: rotation failed before {name}: {rotation_error}", "ERROR")
+            if not is_auto_login:
+                mark_proxy_failed(
+                    args, account, detail, outcome=detail,
+                )
+            log(
+                f"{connection_name}: rotation failed before {name}: {detail}",
+                "ERROR",
+            )
             return 3
         detail = str(result.get("detail") or "shared rotation result")
         log(f"{connection_name}: initial rotation complete; {detail}; starting {name}", "OK")
@@ -1421,7 +2180,9 @@ def run_account(args: argparse.Namespace, lane: dict[str, Any], account: dict[st
             initial_generation=initial_generation,
             ip_checker=checker,
         )
-        recovery = get_active_password_recovery(name) or recovery
+        recovery = get_active_password_recovery(
+            name, workflow_id=str(recovery.get("workflow_id") or "")
+        ) or recovery
 
     if ctype == "static" and args.operation == "workflow" and str(getattr(args, "task", "")) in {"auto_login", "auto_login_setup"}:
         _credential_recovery_state(lane, account)
@@ -1432,6 +2193,7 @@ def run_account(args: argparse.Namespace, lane: dict[str, Any], account: dict[st
     env["SPARKGRID_DATA_DIR"] = str(DATA_DIR)
     env["PYTHONPATH"] = str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env["SPARKGRID_RECOVERY_ATTEMPT"] = "0"
+    env["SPARKGRID_PROXY_GATE_PASSED"] = "1"
     if recovery:
         env["SPARKGRID_PASSWORD_RECOVERY_WORKFLOW_ID"] = str(
             recovery.get("workflow_id") or ""
@@ -1503,7 +2265,9 @@ def run_account(args: argparse.Namespace, lane: dict[str, Any], account: dict[st
             _set_auto_login_terminal(name, reason, reason)
             return 5
 
-        recovery = get_active_password_recovery(name) or recovery
+        recovery = get_active_password_recovery(
+            name, workflow_id=workflow_id
+        ) or recovery
         if int(recovery.get("recovery_ip_change_count") or 0) >= 1:
             reason = "invalid_credentials_after_ip_retry"
             mark_password_recovery_terminal(name, workflow_id, reason)
@@ -1528,6 +2292,8 @@ def run_account(args: argparse.Namespace, lane: dict[str, Any], account: dict[st
             if not selected:
                 reason = str(recovery_code or "static_proxy_pool_exhausted")
                 mark_password_recovery_terminal(name, workflow_id, reason)
+                if reason == "static_proxy_pool_exhausted":
+                    _record_static_worker_domain(args, account, reason)
                 return 6 if reason == "disk_space_low" else 5
             gate_ok, fresh_ip = strict_proxy_gate(
                 args,
@@ -1590,7 +2356,9 @@ def run_account(args: argparse.Namespace, lane: dict[str, Any], account: dict[st
                 mark_password_recovery_terminal(name, workflow_id, reason)
                 _set_auto_login_terminal(name, reason, reason)
                 return 5
-            recovery = get_active_password_recovery(name) or recovery
+            recovery = get_active_password_recovery(
+                name, workflow_id=workflow_id
+            ) or recovery
             fresh, fresh_ip = _mobile_recovery_rotation(
                 args,
                 lane,
@@ -1738,10 +2506,19 @@ def run_account(args: argparse.Namespace, lane: dict[str, Any], account: dict[st
             generation=_rotation_generation(args, account, f"after:{position}:{name}"),
         )
         if not rotation.get("ok"):
-            log(f"{connection_name}: rotation failed after {name}: {rotation.get('error')}", "ERROR")
+            detail = str(rotation.get("error") or "rotation_failed")
+            _record_infrastructure_outcome(
+                name,
+                "post_workflow_rotation_failed",
+            )
+            log(f"{connection_name}: rotation failed after {name}: {detail}", "ERROR")
             return 3
         verified, detail, prepared_ip = probe_proxy_exit_ip(str(account.get("proxy_url") or ""))
         if not verified:
+            _record_infrastructure_outcome(
+                name,
+                "post_workflow_rotation_verification_failed",
+            )
             log(f"{connection_name}: rotation completed but {detail}", "ERROR")
             return 3
         previous_owner = used_exit_ip_owner(prepared_ip)
@@ -1764,9 +2541,11 @@ def run_lane(args: argparse.Namespace, lane_name: str, accounts: list[dict[str, 
             # continue without a second cascade-style lane error.
             if code == 4:
                 continue
-            if args.stop_lane_on_rotation_error and code == 3:
-                log(f"{lane_name}: lane stopped because IP rotation failed", "ERROR")
-                break
+            if code == 3:
+                log(
+                    f"{lane_name}: account-local rotation failure; continuing queue",
+                    "WARNING",
+                )
     return result
 
 
@@ -1810,9 +2589,25 @@ def main() -> int:
     parser.add_argument("--sticker-x", type=float, default=0.5)
     parser.add_argument("--sticker-y", type=float, default=0.82)
     parser.add_argument("--highlight-name", default="")
-    parser.add_argument("--stop-lane-on-rotation-error", action="store_true", default=True)
+    parser.add_argument("--stop-lane-on-rotation-error", action="store_true", default=False, help=argparse.SUPPRESS)
+    parser.add_argument("--run-id", default="", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    args.workflow_run_id = uuid.uuid4().hex
+    args.workflow_run_id = str(
+        args.run_id or current_run_id() or uuid.uuid4().hex
+    )
+    if args.workflow_run_id:
+        update_task_receipt(
+            args.workflow_run_id,
+            scheduler_state="running",
+            parent_process_state="running",
+        )
+        try:
+            append_run_event(
+                args.workflow_run_id, "scheduler_start",
+                stream="process_events", scheduler_state="running",
+            )
+        except Exception:
+            pass
     args.parallel = max(1, min(int(args.parallel or 1), 100))
 
     names = parse_names(args.accounts)
@@ -1843,6 +2638,25 @@ def main() -> int:
     finally:
         conn.close()
     found = {str(item["name"]) for item in accounts}
+    for account in accounts:
+        try:
+            connection_id = int(account.get("web_connection_id") or 0)
+            connection_ref = _connection_ref(
+                args.workflow_run_id, connection_id
+            )
+            append_run_event(
+                args.workflow_run_id,
+                "connection_assignment",
+                connection_ref=connection_ref,
+                connection_type=str(
+                    account.get("connection_type") or "direct"
+                ),
+                category=(
+                    "available" if connection_id > 0 else "not_applicable"
+                ),
+            )
+        except Exception:
+            pass
     missing = [name for name in names if name not in found]
     if missing:
         log("Accounts not found: " + ", ".join(missing), "WARNING")
@@ -1850,12 +2664,29 @@ def main() -> int:
         return 2
     if args.operation in {"clean_web", "workflow", "web_warmup", "story", "analytics_session"}:
         space = browser_disk_preflight()
+        try:
+            append_run_event(
+                args.workflow_run_id, "disk_preflight",
+                category="passed" if space.get("ok") else "blocked",
+                infrastructure_outcome=(
+                    "" if space.get("ok") else "insufficient_disk_space"
+                ),
+            )
+        except Exception:
+            pass
         if not space.get("ok"):
             code = str(space.get("code") or "disk_space_low")
             detail = f"{code}; free_bytes={int(space.get('free_bytes') or 0)}; required_reserve_bytes={int(space.get('required_reserve_bytes') or DEFAULT_RESERVE_BYTES)}"
             log(f"Browser jobs paused: {detail}", "WARNING")
             # This is system state, not an account/proxy/login fault. No worker,
             # reservation, retry counter, account state, or proxy is changed.
+            record_task_outcome(
+                args.workflow_run_id,
+                infrastructure_outcome="insufficient_disk_space",
+                scheduler_state="preflight_rejected",
+                closure_owner="connection_scheduler",
+                closure_reason="insufficient_disk_space",
+            )
             return 6
     active_accounts = []
     for account in accounts:
@@ -1917,6 +2748,10 @@ def main() -> int:
                     failures += 1
                     log(f"Connection lane crashed: {type(exc).__name__}: {exc}", "ERROR")
     log(f"Connection scheduler finished: failures={failures}", "OK" if failures == 0 else "WARNING")
+    update_task_receipt(
+        args.workflow_run_id,
+        scheduler_state="exiting",
+    )
     return 0 if failures == 0 else 1
 
 

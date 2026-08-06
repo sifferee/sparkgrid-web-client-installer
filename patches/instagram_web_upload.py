@@ -48,7 +48,7 @@ from publishing_history import (
 )
 from content_plans import next_plan_set, advance_plan, complete_plan_item, ensure_plan_schema
 from disk_safety import DiagnosticWriter
-from lifecycle_recovery import classify_blank_document, heartbeat_payload, write_heartbeat
+from lifecycle_recovery import IndependentHeartbeat, classify_blank_document
 from instagram_publish_observer import PublishObserver
 from instagram_publish_goal import (
     PublishActionType,
@@ -343,11 +343,18 @@ def ensure_schema() -> None:
             )
         """)
         job_cols = _cols(c, "ig_web_upload_jobs")
-        if "campaign_run_identity" not in job_cols:
-            c.execute(
-                "ALTER TABLE ig_web_upload_jobs "
-                "ADD COLUMN campaign_run_identity TEXT NOT NULL DEFAULT ''"
-            )
+        for column in (
+            "campaign_run_identity",
+            "domain_outcome",
+            "infrastructure_outcome",
+            "closure_owner",
+            "closure_reason",
+        ):
+            if column not in job_cols:
+                c.execute(
+                    "ALTER TABLE ig_web_upload_jobs "
+                    f"ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                )
         c.commit()
     finally:
         c.close()
@@ -372,28 +379,38 @@ class LiveDump:
         self.last_state = ""
         self.actions_file = self.root / "actions.jsonl"
         self.writer = DiagnosticWriter(self.root)
-        self.heartbeat_sequence = 0
-        self.heartbeat_started = time.monotonic()
+        heartbeat_target = str(
+            os.environ.get("SPARKGRID_HEARTBEAT_PATH") or ""
+        ).strip()
+        scheduler_error = str(
+            os.environ.get("SPARKGRID_HEARTBEAT_ERROR_PATH") or ""
+        ).strip()
+        self.liveness = IndependentHeartbeat(
+            heartbeat_target,
+            run_ref=self.run_id,
+            account_ref=self.account,
+            task_ref=str(os.environ.get("SPARKGRID_TASK_ID") or ""),
+            workflow="upload",
+            role="upload_worker",
+            recovery_attempt=int(
+                os.environ.get("SPARKGRID_RECOVERY_ATTEMPT", "0") or 0
+            ),
+            error_paths=tuple(
+                item
+                for item in (
+                    scheduler_error,
+                    str(self.root / "heartbeat_transport_error.json"),
+                )
+                if item
+            ),
+        ).start()
         DEBUG_ROOT.mkdir(parents=True, exist_ok=True)
         (DEBUG_ROOT / "latest_run.txt").write_text(run_id, encoding="utf-8")
         (DEBUG_ROOT / "latest_account.txt").write_text(self.account, encoding="utf-8")
         self._heartbeat("worker_ready")
 
     def _heartbeat(self, state: str) -> None:
-        target = str(os.environ.get("SPARKGRID_HEARTBEAT_PATH") or "").strip()
-        if not target:
-            return
-        try:
-            self.heartbeat_sequence += 1
-            # The scheduler only needs mtime, while JSON gives a later field
-            # investigation safe lifecycle context without credentials/paths.
-            write_heartbeat(target, heartbeat_payload(
-                job_ref=self.run_id, account_ref=self.account, workflow="upload", operation=state,
-                sequence=self.heartbeat_sequence, started=self.heartbeat_started,
-                recovery_attempt=int(os.environ.get("SPARKGRID_RECOVERY_ATTEMPT", "0") or 0),
-            ))
-        except OSError:
-            pass
+        self.liveness.update_phase(state)
 
     def heartbeat(self, state: str) -> None:
         """Refresh watchdog liveness without taking a screenshot."""
@@ -601,6 +618,8 @@ def update_job(job_id: int, **kw) -> None:
         return
     c = db_conn()
     try:
+        if "status" in kw and "domain_outcome" not in kw:
+            kw["domain_outcome"] = str(kw["status"] or "")
         cols, vals = [], []
         for k, v in kw.items():
             cols.append(f"{k}=?")
@@ -850,14 +869,6 @@ def classify_pre_create_state(page, dump: LiveDump | None = None) -> Dict[str, s
     except Exception:
         pass
     lowered = text.lower()
-    if any(value in lowered for value in ("authentication app", "two-factor", "2fa", "6-digit code", "6 digit code")):
-        return result("two_factor_required")
-    if any(value in lowered for value in ("confirm you're human", "confirm you’re human", "help us confirm")):
-        return result("human_verification")
-    if "checkpoint" in lowered:
-        return result("checkpoint")
-    if "challenge" in lowered:
-        return result("challenge")
     if any(value in lowered for value in ("we suspended your account", "account has been suspended")):
         return result("suspended")
     if any(value in lowered for value in ("account disabled", "your account was disabled")):
@@ -1477,10 +1488,8 @@ def select_instagram_reel_from_create_menu(
 def open_instagram_create(
     page,
     dump: LiveDump | None = None,
-    *,
-    bounded_direct_only: bool = False,
 ) -> Dict[str, str]:
-    """Open Create using locator/geometry discovery and a real pointer click."""
+    """Open one composer intent across direct and existing cluster branches."""
     def create_modal_ready() -> bool:
         txt = visible_text(page).lower()
         return any(s in txt for s in ["create new post", "drag photos and videos here", "select from computer"])
@@ -1494,6 +1503,32 @@ def open_instagram_create(
                 return True
             time.sleep(0.25)
         return create_modal_ready()
+
+    def post_attempt() -> bool:
+        deadline = time.time() + 4.0
+        menu_attempted = False
+        while time.time() < deadline:
+            if create_modal_ready():
+                return True
+            navigation = inspect_instagram_navigation(page)
+            if navigation.get("create_menu_open") and not menu_attempted:
+                menu_attempted = True
+                selected = select_instagram_reel_from_create_menu(page, dump)
+                if selected.get("state") != "ready":
+                    return False
+                continue
+            if dump:
+                dump.heartbeat("upload_wait_create")
+            time.sleep(0.25)
+        return create_modal_ready()
+
+    if create_modal_ready():
+        return {"state": "ready"}
+    initial_navigation = inspect_instagram_navigation(page)
+    if initial_navigation.get("create_menu_open"):
+        selected = select_instagram_reel_from_create_menu(page, dump)
+        if selected.get("state") == "ready" and wait_create_ready():
+            return {"state": "ready"}
 
     actor = _human(page)
     create_re = re.compile(
@@ -1511,13 +1546,10 @@ def open_instagram_create(
             dump.heartbeat("upload_find_create")
         try:
             loc = getter().first
-            if bounded_direct_only:
-                visible = bool(loc.is_visible(timeout=1200))
-            else:
-                visible = bool(
-                    int(loc.count() or 0) > 0
-                    and loc.is_visible(timeout=1200)
-                )
+            visible = bool(
+                int(loc.count() or 0) > 0
+                and loc.is_visible(timeout=1200)
+            )
             if not visible:
                 continue
             clicked = actor.click(loc, timeout=3500) if actor is not None else False
@@ -1526,19 +1558,26 @@ def open_instagram_create(
             jitter(0.8, 1.6)
             if dump:
                 dump.capture(page, "upload_create_clicked", "locator + pointer")
-            if wait_create_ready():
+            if post_attempt():
                 return {"state": "ready"}
         except Exception:
             continue
 
-    if bounded_direct_only:
-        if dump:
-            dump.capture(
-                page,
-                "upload_create_not_found",
-                "proven baseline direct locators exhausted",
-            )
-        return {"state": "create_control_not_found"}
+    # The existing navigation classifier handles full, icon-only, collapsed,
+    # localized and descendant-SVG variants after the direct fast path misses.
+    navigation = inspect_instagram_navigation(page)
+    if navigation.get("navigation_collapsed"):
+        opened_navigation = open_instagram_navigation(page, dump)
+        if opened_navigation.get("state") == "ready":
+            navigation = inspect_instagram_navigation(page)
+    if navigation.get("create_available"):
+        if _click_structural_control(
+            page,
+            navigation.get("create_control"),
+            dump=dump,
+            label="upload_create_cluster_clicked",
+        ) and post_attempt():
+            return {"state": "ready"}
 
     # Geometry fallback: JS only locates the target. Python delivers the click.
     try:
@@ -1605,7 +1644,7 @@ def open_instagram_create(
                 jitter(1.0, 2.0)
                 if dump:
                     dump.capture(page, "upload_create_clicked", json.dumps(result, ensure_ascii=False)[:900])
-                if wait_create_ready():
+                if post_attempt():
                     return {"state": "ready"}
         except Exception:
             pass
@@ -1976,35 +2015,14 @@ def warmup_web(page, dump: LiveDump, minutes: float, mode: str = "desktop", acco
         txt = visible_text(page).lower()
         if ig_signals is not None:
             kind, matched = ig_signals.classify(txt)
-            if kind in ("blocked", "rate_limit", "challenge"):
-                until = ig_signals.note_signal(account, kind)
-                dump.capture(page, "warmup_softblock_" + kind, f"{matched} @{where} cooldown_until={until:.0f}", force_snapshot=True)
-                _save_stats()
-                state = {
-                    "blocked": "restricted",
-                    "rate_limit": "rate_limited",
-                    "challenge": "challenge",
-                }[kind]
-                return {
-                    "ok": False,
-                    "manual": True,
-                    "state": state,
-                    "error": f"{kind}: {matched}",
-                    "authenticated": authenticated_confirmed,
-                    "cooldown_until": until,
-                    "stats": stats,
-                }
-            if kind == "login":
-                dump.capture(page, "manual_required", error=f"logged out @{where}", force_snapshot=True)
-                _save_stats()
-                return {
-                    "ok": False,
-                    "manual": True,
-                    "state": "login_required",
-                    "error": "login_required",
-                    "authenticated": False,
-                    "stats": stats,
-                }
+            if kind in ("blocked", "rate_limit", "challenge", "login"):
+                # Page-wide copy is telemetry only. Scoped auth-goal evidence
+                # below owns login/challenge terminal decisions.
+                dump.capture(
+                    page,
+                    "warmup_body_signal_hint",
+                    f"{kind}:{matched} @{where}",
+                )
         signal = manual_signal(page)
         if signal:
             dump.capture(page, "manual_required", error=f"checkpoint @{where}: {signal}", force_snapshot=True)
@@ -2441,8 +2459,8 @@ def warmup_web(page, dump: LiveDump, minutes: float, mode: str = "desktop", acco
         }
 
 
-def _legacy_composer_gate_snapshot(page) -> Dict[str, Any]:
-    """Bounded pre-composer observation using the proven linear-flow signals."""
+def _composer_entry_snapshot(page) -> Dict[str, Any]:
+    """Fresh scoped auth/navigation/composer observation before file attach."""
     url = str(getattr(page, "url", "") or "")
     lowered_url = url.lower()
     text = visible_text(page)
@@ -2458,51 +2476,14 @@ def _legacy_composer_gate_snapshot(page) -> Dict[str, Any]:
         pass
     lowered_dialog = dialog_text.lower()
 
-    password_visible = False
-    try:
-        password_visible = bool(
-            page.locator(
-                "input[type='password'], input[name='password'], "
-                "input[autocomplete='current-password']"
-            ).first.is_visible(timeout=700)
-        )
-    except Exception:
-        pass
-
-    login_required = bool(
-        "/accounts/login" in lowered_url
-        or "/accounts/emailsignup" in lowered_url
-        or password_visible
-        or "enter your password" in lowered
-    )
-    checkpoint = bool(
-        "/checkpoint" in lowered_url
-        or "/challenge" in lowered_url
-        or "checkpoint" in lowered
-        or "confirm you're human" in lowered
-        or "confirm you’re human" in lowered
-        or "help us confirm" in lowered
-        or any(
-            marker in lowered
-            for marker in (
-                "authentication app", "two-factor", "2fa",
-                "6-digit code", "6 digit code",
-            )
-        )
-    )
-    restricted = bool(
-        "/accounts/suspended" in lowered_url
-        or "/disabled" in lowered_url
-        or any(
-            marker in lowered
-            for marker in (
-                "we suspended your account",
-                "account has been suspended",
-                "account disabled",
-                "your account was disabled",
-            )
-        )
-    )
+    pre_create = classify_pre_create_state(page)
+    pre_state = str(pre_create.get("state") or "")
+    login_required = pre_state == "login_required"
+    checkpoint = pre_state in {
+        "checkpoint", "challenge", "human_verification",
+        "two_factor_required",
+    }
+    restricted = pre_state in {"restricted", "restriction", "suspended", "disabled"}
     modal_ready_markers = (
         "create new post",
         "drag photos and videos here",
@@ -2522,19 +2503,15 @@ def _legacy_composer_gate_snapshot(page) -> Dict[str, Any]:
         and "reel" in menu_lines
         and ("post" in menu_lines or "story" in menu_lines)
     )
-    authenticated = bool(
-        "instagram.com" in lowered_url
-        and text.strip()
-        and not login_required
-        and not checkpoint
-        and not restricted
-    )
+    navigation = inspect_instagram_navigation(page)
+    authenticated = pre_state == "ready"
     fingerprint_source = "|".join(
         (
             lowered_url.split("?", 1)[0],
             "composer" if composer_open else "",
             "create-menu" if create_menu_open else "",
             "authenticated" if authenticated else "",
+            str(navigation.get("fingerprint") or ""),
             hashlib.sha256(dialog_text[:2000].encode("utf-8")).hexdigest()[:16],
         )
     )
@@ -2550,8 +2527,15 @@ def _legacy_composer_gate_snapshot(page) -> Dict[str, Any]:
         ),
         "visible_headings": (),
         "visible_enabled_actions": actions,
-        "authenticated_evidence": (
-            ("instagram_application",) if authenticated else ()
+        "authenticated_evidence": tuple(
+            item
+            for item, present in (
+                ("instagram_application", authenticated),
+                ("instagram_app_shell", navigation.get("app_shell")),
+                ("account_menu", navigation.get("account_menu")),
+                ("navigation_rail", navigation.get("known_rail")),
+            )
+            if present
         ),
         "login_required_evidence": (
             ("credential_surface",) if login_required else ()
@@ -2569,7 +2553,11 @@ def _legacy_composer_gate_snapshot(page) -> Dict[str, Any]:
         "checkpoint_or_challenge": checkpoint,
         "account_restricted": restricted,
         "authenticated_application": authenticated,
-        "create_menu_open": create_menu_open,
+        "create_menu_open": bool(
+            create_menu_open or navigation.get("create_menu_open")
+        ),
+        "create_available": bool(navigation.get("create_available")),
+        "navigation_collapsed": bool(navigation.get("navigation_collapsed")),
         "composer_open": composer_open,
         "loading": False,
         "navigation_in_progress": False,
@@ -2577,11 +2565,11 @@ def _legacy_composer_gate_snapshot(page) -> Dict[str, Any]:
     }
 
 
-def open_instagram_composer_legacy_bridge(
+def open_instagram_composer(
     page, dump: LiveDump | None = None
 ) -> Dict[str, str]:
-    """Open the composer through the proven a7a60e2 direct Create path."""
-    before = _legacy_composer_gate_snapshot(page)
+    """Run the single production composer intent through every existing path."""
+    before = _composer_entry_snapshot(page)
     if before.get("login_required"):
         return {"state": "login_required"}
     if before.get("checkpoint_or_challenge"):
@@ -2592,22 +2580,22 @@ def open_instagram_composer_legacy_bridge(
         return {"state": "ready"}
 
     if before.get("create_menu_open"):
-        if not click_by_candidates(page, ["Reel"], timeout=3500):
+        selected = select_instagram_reel_from_create_menu(page, dump)
+        if selected.get("state") != "ready":
             return {"state": "create_menu_reel_not_found"}
     else:
-        opened = open_instagram_create(
-            page, dump, bounded_direct_only=True
-        )
+        opened = open_instagram_create(page, dump)
         if opened.get("state") != "ready":
-            after_create = _legacy_composer_gate_snapshot(page)
+            after_create = _composer_entry_snapshot(page)
             if not after_create.get("create_menu_open"):
                 return opened
-            if not click_by_candidates(page, ["Reel"], timeout=3500):
+            selected = select_instagram_reel_from_create_menu(page, dump)
+            if selected.get("state") != "ready":
                 return {"state": "create_menu_reel_not_found"}
 
     deadline = time.monotonic() + 4.0
     while time.monotonic() < deadline:
-        if _legacy_composer_gate_snapshot(page).get("composer_open"):
+        if _composer_entry_snapshot(page).get("composer_open"):
             return {"state": "ready"}
         time.sleep(0.25)
     return {"state": "composer_not_opened"}
@@ -2649,6 +2637,7 @@ class _CleanWebPublishAdapter:
         }
         self.last_error = ""
         self._composer_bridge_complete = False
+        self._composer_action_exhausted = False
         self.publish_observer = PublishObserver(page)
         self.success_observer = PublishSuccessObserver(page)
 
@@ -2706,7 +2695,8 @@ class _CleanWebPublishAdapter:
             }
         self.page = ensure_single_browser_page(self.page, self.dump)
         if not self._composer_bridge_complete:
-            gate = _legacy_composer_gate_snapshot(self.page)
+            gate = _composer_entry_snapshot(self.page)
+            gate["open_composer_failed"] = self._composer_action_exhausted
             gate["share_boundary"] = self.share_boundary
             gate["publish_intent"] = self.publish_intent
             if gate.get("composer_open"):
@@ -3002,16 +2992,20 @@ class _CleanWebPublishAdapter:
         self.dump.capture(
             self.page, "publish_action_decision", action_type.value
         )
-        if action_type is PublishActionType.LEGACY_OPEN_COMPOSER_BRIDGE:
-            opened = open_instagram_composer_legacy_bridge(
+        if action_type is PublishActionType.OPEN_COMPOSER:
+            opened = open_instagram_composer(
                 self.page, self.dump
             )
             if opened.get("state") == "ready":
                 self._composer_bridge_complete = True
+                self._composer_action_exhausted = False
                 return BrowserWorkflowResult.of(ACTION_PERFORMED)
             self.last_error = str(opened.get("state") or "composer_not_opened")
+            self._composer_action_exhausted = True
             return BrowserWorkflowResult.of(
-                STABLE_BLOCKER, error_category=self.last_error
+                STABLE_BLOCKER,
+                operation_state=PublishObservedState.OPEN_COMPOSER_FAILED.value,
+                error_category=self.last_error,
             )
         if action_type is PublishActionType.ATTACH_MEDIA:
             return self._attach_media()
@@ -3392,11 +3386,17 @@ def _legacy_upload_video_web_linear(page, dump: LiveDump, video_path: str, capti
                 if kind == "success":
                     dump.capture(page, "upload_posted", f"success:{matched}", force_snapshot=True)
                     return {"ok": True, "status": "POSTED", "observation": observation}
-                if kind in ("blocked", "rate_limit", "challenge"):
+                if kind in ("blocked", "rate_limit"):
                     until = ig_signals.note_signal(account, kind)
-                    status = "RATE_LIMITED" if kind == "rate_limit" else ("CHALLENGE" if kind == "challenge" else "BLOCKED")
+                    status = "RATE_LIMITED" if kind == "rate_limit" else "BLOCKED"
                     dump.capture(page, "upload_softblock_" + kind, f"{matched} cooldown_until={until:.0f}", force_snapshot=True)
                     return {"ok": False, "status": status, "error": f"{kind}: {matched}", "cooldown_until": until}
+                if kind == "challenge":
+                    dump.capture(
+                        page,
+                        "upload_body_signal_hint",
+                        f"challenge:{matched}",
+                    )
                 if kind == "error":
                     dump.capture(page, "upload_error", matched, force_snapshot=True)
                     return {"ok": False, "status": "FAILED", "error": f"upload error: {matched}"}
@@ -4164,7 +4164,10 @@ def main() -> int:
     if not accounts:
         log("No enabled accounts selected for Instagram Web Upload", "WARNING")
         return 2
-    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_id = str(
+        os.environ.get("SPARKGRID_RUN_ID")
+        or datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    )
     workers = max(1, min(int(args.max_workers or 1), len(accounts), 8))
     log(f"Starting run_id={run_id}; accounts={len(accounts)}; mode={args.mode}; provider={args.provider}; workers={workers}", "OK")
     if workers <= 1:

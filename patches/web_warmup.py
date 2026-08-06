@@ -34,8 +34,8 @@ DRIVER CRASHES / HANGS (important)
         pip install -U "camoufox[geoip]==0.4.11" "playwright==1.53.0"
         python3 -m camoufox fetch
     Each warmup runs as a CHILD subprocess under a SUPERVISOR that relaunches on
-    crash AND on hang (it watches the child's heartbeat = latest_state.json
-    mtime; no progress for ~75s with the browser up => kill & resume).
+    crash AND on lost worker liveness (it watches an independent heartbeat;
+    semantic state remains diagnostic and is not treated as process liveness).
     Python 3.11/3.12 recommended (system 3.9 + very new Node can be unstable).
 
 USAGE
@@ -75,6 +75,7 @@ from pathlib import Path
 from platform_runtime import process_group_kwargs, stop_process_tree
 from typing import Callable, Dict, List, Optional, Tuple
 from disk_safety import DiagnosticWriter
+from lifecycle_recovery import IndependentHeartbeat
 
 try:
     from browser_launcher import (
@@ -280,19 +281,35 @@ class WarmupDump:
         self.last_state = ""
         self.actions_file = self.root / "actions.jsonl"
         self.writer = DiagnosticWriter(self.root)
+        scheduler_target = str(
+            os.environ.get("SPARKGRID_HEARTBEAT_PATH") or ""
+        ).strip()
+        scheduler_error = str(
+            os.environ.get("SPARKGRID_HEARTBEAT_ERROR_PATH") or ""
+        ).strip()
+        self.liveness = IndependentHeartbeat(
+            scheduler_target or str(self.root / "liveness.heartbeat"),
+            run_ref=self.run_id,
+            account_ref=self.profile,
+            task_ref=str(os.environ.get("SPARKGRID_TASK_ID") or ""),
+            workflow="web_warmup",
+            role="warmup_worker",
+            error_paths=tuple(
+                item
+                for item in (
+                    scheduler_error,
+                    str(self.root / "heartbeat_transport_error.json"),
+                )
+                if item
+            ),
+        ).start()
         DEBUG_ROOT.mkdir(parents=True, exist_ok=True)
         (DEBUG_ROOT / "latest_run.txt").write_text(run_id, encoding="utf-8")
         (DEBUG_ROOT / "latest_profile.txt").write_text(self.profile, encoding="utf-8")
         self._heartbeat("worker_ready")
 
     def _heartbeat(self, state: str) -> None:
-        target = str(os.environ.get("SPARKGRID_HEARTBEAT_PATH") or "").strip()
-        if not target:
-            return
-        try:
-            Path(target).write_text(f"{now_iso()} {state}\n", encoding="utf-8")
-        except OSError:
-            pass
+        self.liveness.update_phase(state)
 
     def capture(self, page, state: str, action: str = "", error: str = "",
                 extra: Optional[dict] = None, force_snapshot: bool = False) -> None:
@@ -1282,7 +1299,11 @@ def main() -> int:
             f"mode={args.mode} (supervised)", "OK")
         return _supervise(args)
 
-    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = str(
+        args.run_id
+        or os.environ.get("SPARKGRID_RUN_ID")
+        or datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
     dump = WarmupDump(run_id, args.profile, max_snapshots=args.max_snapshots,
                       screenshots=getattr(args, "debug_screenshots", False))
     log(f"run_id={run_id} profile={args.profile} persona={persona.name} "
@@ -1401,14 +1422,13 @@ def _pick_persona(name: str) -> str:
 
 
 def _heartbeat_path(run_id: str, profile: str) -> Path:
-    # the child's WarmupDump rewrites latest_state.json on every captured action,
-    # so its mtime is a real "browser made progress" heartbeat.
-    return DEBUG_ROOT / run_id / safe_name(profile) / "latest_state.json"
+    # Liveness is independent of semantic action/state diagnostics.
+    return DEBUG_ROOT / run_id / safe_name(profile) / "liveness.heartbeat"
 
 
 # watchdog tuning
 _LAUNCH_GRACE = 130   # s allowed for Camoufox launch before first heartbeat
-_STALE_SECS = 75      # s without progress (with browser up) => hung => kill
+_STALE_SECS = 75      # s without an independent worker pulse => kill
 
 
 def _wait_child(popen, hb_path: Path, hard_deadline: float):

@@ -35,9 +35,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; Application code and all PyInstaller-bundled packages
-Source: "{#SourceDir}\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "app.py,automation_worker.py,connection_scheduler.py,instagram_web_upload.py,instagram_web_profile_workflow.py,instagram_private_web_api_upload.py,instagram_publication_verifier.py,web_warmup.py,proxy_telemetry.py,view_analytics.py,quality_account_onboarding.py,windows_playwright_guard.py"
+Source: "{#SourceDir}\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "app.py,automation_worker.py,connection_scheduler.py,instagram_web_upload.py,instagram_web_profile_workflow.py,instagram_private_web_api_upload.py,instagram_publication_verifier.py,web_warmup.py,proxy_telemetry.py,view_analytics.py,quality_account_onboarding.py,windows_playwright_guard.py,blocking_popup_transaction.py,initial_browser_load.py,run_diagnostics.py,task_receipts.py,instagram_dialog_gate.py,instagram_consent_flow.py,instagram_auth_goal.py,lifecycle_recovery.py,password_ip_recovery.py,ui\index.html,ui\static\*"
 
-; Patched files with logging system
+; Patched files with logging system (from beta.6 + logging patches)
 Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\app.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
 Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\automation_worker.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
 Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\connection_scheduler.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
@@ -50,6 +50,20 @@ Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\proxy_telemetry.py"; D
 Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\view_analytics.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
 Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\quality_account_onboarding.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
 Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\windows_playwright_guard.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
+; New modules from beta.6 (were missing from our PyInstaller extraction)
+Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\blocking_popup_transaction.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
+Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\initial_browser_load.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
+Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\run_diagnostics.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
+Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\task_receipts.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
+; Updated modules from beta.6 (larger than our version)
+Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\instagram_dialog_gate.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
+Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\instagram_consent_flow.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
+Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\instagram_auth_goal.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
+Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\lifecycle_recovery.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
+Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\password_ip_recovery.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
+; UI from beta.6
+Source: "C:\Users\Warda\Downloads\SparkGrid_Build\patches\ui\index.html"; DestDir: "{app}\_internal\ui"; Flags: ignoreversion overwritereadonly
+; Logging system
 Source: "C:\Users\Warda\Downloads\SparkGrid_Build\log_config.py"; DestDir: "{app}\_internal"; Flags: ignoreversion overwritereadonly
 
 ; Portable Python 3.12.13 (embeddable, no external dependencies)

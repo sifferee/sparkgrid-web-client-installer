@@ -1,0 +1,17 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="SparkGrid mark">
+  <defs>
+    <linearGradient id="sparkgrid-stroke" x1="15" y1="18" x2="113" y2="112" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#36F3E3"/>
+      <stop offset="0.52" stop-color="#27A8F2"/>
+      <stop offset="1" stop-color="#7657FF"/>
+    </linearGradient>
+    <linearGradient id="sparkgrid-star" x1="42" y1="45" x2="84" y2="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4CF4E4"/>
+      <stop offset="1" stop-color="#5D63FF"/>
+    </linearGradient>
+  </defs>
+  <path d="M39 15H103L82 35L110 62L90 111H26L49 88L18 57L39 15Z" stroke="url(#sparkgrid-stroke)" stroke-width="8" stroke-linejoin="round"/>
+  <path d="M39 15L49 88M103 15H64L82 35M18 57H56L26 111M110 62H74L90 111" stroke="url(#sparkgrid-stroke)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M64 38L70 57L90 64L70 71L64 91L58 71L38 64L58 57L64 38Z" fill="url(#sparkgrid-star)"/>
+  <path d="M34 54L60 29M77 39L96 57M35 77L52 94M76 87L95 101" stroke="url(#sparkgrid-stroke)" stroke-width="2.5" stroke-linecap="round" opacity="0.42"/>
+</svg>

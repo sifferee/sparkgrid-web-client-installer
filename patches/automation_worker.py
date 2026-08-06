@@ -165,7 +165,12 @@ def run(slot_id: int) -> int:
     try:
         final_status, detail = _latest_job_status(conn, str(slot["account_name"]), started_at)
         if completed.returncode != 0 and final_status == "success":
-            final_status, detail = "failed", f"connection scheduler exited with code {completed.returncode}"
+            log(
+                "Connection scheduler infrastructure exit "
+                f"{completed.returncode} did not revoke persisted workflow "
+                "success",
+                "WARNING",
+            )
         mark_slot(conn, slot_id, final_status, detail)
     finally:
         conn.close()
