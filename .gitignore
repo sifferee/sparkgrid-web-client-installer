@@ -1,0 +1,5 @@
+# Large files — uploaded via GitHub Releases, not in git
+Output/
+*.exe
+__pycache__/
+*.pyc
