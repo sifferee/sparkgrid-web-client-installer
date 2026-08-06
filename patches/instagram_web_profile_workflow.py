@@ -7751,6 +7751,8 @@ def _settings_click(page, names, timeout_ms: int = 8000) -> str:
             page.get_by_role("button", name=pattern),
             page.get_by_role("radio", name=pattern),
             page.get_by_text(pattern),
+            page.locator("button").filter(has_text=pattern),
+            page.locator("[role='button']").filter(has_text=pattern),
         ]
         for candidate in candidates:
             try:
