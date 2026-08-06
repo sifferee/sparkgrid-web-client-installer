@@ -7825,14 +7825,31 @@ def _browser_account_state(page, username: str) -> dict:
 def _private_switch(page):
     candidates = [
         page.get_by_role("switch", name=re.compile(r"private account", re.I)),
+        page.locator("input[role='switch'][aria-label*='Private account' i]"),
+        page.locator("[role='switch'][aria-label*='Private account' i]"),
+        page.locator("input[type='checkbox'][aria-label*='Private account' i]"),
         page.locator("input[type='checkbox']"),
     ]
     for candidate in candidates:
         try:
-            for index in range(min(int(candidate.count() or 0), 20)):
+            count = int(candidate.count() or 0)
+            for index in range(min(count, 20)):
                 loc = candidate.nth(index)
-                if loc.is_visible(timeout=1000):
+                try:
+                    visible = loc.is_visible(timeout=2000)
+                except Exception:
+                    visible = False
+                if visible:
                     return loc
+                # Element exists but may be visually hidden (CSS opacity/size).
+                # Instagram hides the real <input> under a styled <div> overlay.
+                # If attached and has role=switch or type=checkbox, return it anyway.
+                try:
+                    tag = loc.evaluate("el => el.tagName")
+                    if tag and tag.lower() in ("input", "div", "button"):
+                        return loc
+                except Exception:
+                    pass
         except Exception:
             continue
     return None
