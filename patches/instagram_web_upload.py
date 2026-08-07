@@ -2062,7 +2062,7 @@ def _install_traffic_saver(page) -> bool:
         # For media type requests on non-Instagram domains (CDN video chunks):
         # abort the large-segment downloads but keep the initial metadata request
         resource_type = str(request.resource_type or "").lower()
-        if resource_type == "media" and "video" in resource_type:
+        if resource_type in ("media", "video"):
             # Allow the first segment (metadata + first frame) but abort
             # subsequent range requests that pull the full video stream.
             # Instagram makes initial request without Range header, then
