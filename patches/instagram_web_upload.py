@@ -1540,6 +1540,9 @@ def open_instagram_create(
         lambda: page.get_by_role("link", name=create_re),
         lambda: page.get_by_role("button", name=create_re),
         lambda: page.locator("[aria-label*='Create' i], [title*='Create' i]"),
+        lambda: page.locator("svg[aria-label='New post']"),
+        lambda: page.locator("a:has(svg[aria-label='New post'])"),
+        lambda: page.locator("[aria-label='New post']"),
     ]
     for getter in direct_candidates:
         if dump:

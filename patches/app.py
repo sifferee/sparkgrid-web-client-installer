@@ -73,7 +73,8 @@ from connections import (
     assign_connection, remove_connection, rotate_connection, import_static_connections,
     available_static_connections, connection_payload, direct_connection_id,
     list_proxy_groups, assign_static_group, restore_quarantined_connection,
-    delete_proxy_group,
+    delete_proxy_group, create_proxy_group, rename_proxy_group,
+    add_proxies_to_group, delete_proxy_from_group,
 )
 from content_plans import (
     ensure_plan_schema, get_plan, save_plan, reset_plan_position, plan_summaries, save_scale_settings,
@@ -2874,6 +2875,66 @@ def delete_static_proxy_group(group_id: int) -> JSONResponse:
     conn = db_conn()
     try:
         result = delete_proxy_group(conn, int(group_id))
+        return JSONResponse({"ok": True, **result})
+    except ValueError as exc:
+        return response_error(str(exc), 400)
+    finally:
+        conn.close()
+
+
+@app.post("/api/ig-web-upload/connection-groups")
+async def create_proxy_group_endpoint(request: Request) -> JSONResponse:
+    ensure_schema()
+    body = await request.json()
+    conn = db_conn()
+    try:
+        result = create_proxy_group(conn, str(body.get("name") or ""))
+        return JSONResponse({"ok": True, "group": result})
+    except ValueError as exc:
+        return response_error(str(exc), 400)
+    finally:
+        conn.close()
+
+
+@app.patch("/api/ig-web-upload/connection-groups/{group_id}")
+async def rename_proxy_group_endpoint(group_id: int, request: Request) -> JSONResponse:
+    ensure_schema()
+    body = await request.json()
+    conn = db_conn()
+    try:
+        result = rename_proxy_group(conn, int(group_id), str(body.get("name") or ""))
+        return JSONResponse({"ok": True, "group": result})
+    except ValueError as exc:
+        return response_error(str(exc), 400)
+    finally:
+        conn.close()
+
+
+@app.post("/api/ig-web-upload/connection-groups/{group_id}/proxies")
+async def add_proxies_endpoint(group_id: int, request: Request) -> JSONResponse:
+    ensure_schema()
+    body = await request.json()
+    conn = db_conn()
+    try:
+        created = add_proxies_to_group(
+            conn,
+            int(group_id),
+            str(body.get("proxies") or ""),
+            str(body.get("prefix") or "Static"),
+        )
+        return JSONResponse({"ok": True, "created": len(created), "connections": [connection_payload(item) for item in created]})
+    except ValueError as exc:
+        return response_error(str(exc), 400)
+    finally:
+        conn.close()
+
+
+@app.delete("/api/ig-web-upload/connections/{connection_id}")
+def delete_proxy_connection(connection_id: int) -> JSONResponse:
+    ensure_schema()
+    conn = db_conn()
+    try:
+        result = delete_proxy_from_group(conn, int(connection_id))
         return JSONResponse({"ok": True, **result})
     except ValueError as exc:
         return response_error(str(exc), 400)
