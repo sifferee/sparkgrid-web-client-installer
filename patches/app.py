@@ -2016,7 +2016,8 @@ def upload_settings(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             browser_parallel = max(1, min(int(values.get("browser_parallel", "3") or 3), 50))
         except Exception:
             browser_parallel = 3
-        return {"upload_engine": engine, "api_parallel": parallel, "browser_parallel": browser_parallel}
+        return {"upload_engine": engine, "api_parallel": parallel, "browser_parallel": browser_parallel,
+                "traffic_saver": str(values.get("traffic_saver") or "off")}
     finally:
         if own and conn is not None:
             conn.close()
@@ -2026,12 +2027,13 @@ def current_browser_parallel() -> int:
     return int(upload_settings().get("browser_parallel") or 3)
 
 
-def save_upload_settings(engine: str, api_parallel: int, browser_parallel: int = 3) -> dict[str, Any]:
+def save_upload_settings(engine: str, api_parallel: int, browser_parallel: int = 3, traffic_saver: str = "") -> dict[str, Any]:
     engine = str(engine or "clean_web").strip().lower()
     if engine not in {"manual", "clean_web", "api"}:
         engine = "clean_web"
     parallel = max(1, min(int(api_parallel or 3), 100))
     browser_parallel = max(1, min(int(browser_parallel or 3), 50))
+    ts_value = "on" if str(traffic_saver or "").lower() in {"on", "1", "true", "yes"} else "off"
     conn = db_conn()
     try:
         conn.execute(
@@ -2054,10 +2056,15 @@ def save_upload_settings(engine: str, api_parallel: int, browser_parallel: int =
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
             (str(browser_parallel),),
         )
+        conn.execute(
+            "INSERT INTO ig_web_upload_settings(key,value,updated_at) VALUES ('traffic_saver',?,datetime('now')) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
+            (ts_value,),
+        )
         conn.commit()
     finally:
         conn.close()
-    return {"upload_engine": engine, "api_parallel": parallel, "browser_parallel": browser_parallel}
+    return {"upload_engine": engine, "api_parallel": parallel, "browser_parallel": browser_parallel, "traffic_saver": ts_value}
 
 
 def assign_legacy_proxy_connection(conn: sqlite3.Connection, account_name: str, proxy: str) -> dict[str, Any]:
@@ -2503,7 +2510,8 @@ async def set_upload_settings(request: Request) -> JSONResponse:
     engine = str(body.get("upload_engine") or body.get("engine") or current["upload_engine"])
     parallel = body.get("api_parallel") if body.get("api_parallel") not in (None, "") else current["api_parallel"]
     browser_parallel = body.get("browser_parallel") if body.get("browser_parallel") not in (None, "") else current["browser_parallel"]
-    saved = save_upload_settings(engine, int(parallel), int(browser_parallel))
+    traffic_saver = str(body.get("traffic_saver") or current.get("traffic_saver") or "off")
+    saved = save_upload_settings(engine, int(parallel), int(browser_parallel), traffic_saver)
     return JSONResponse({"ok": True, **saved})
 
 

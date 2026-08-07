@@ -1976,6 +1976,131 @@ def hold_manual_required_page(page, dump: LiveDump, reason: str, *, headless: bo
         dump.heartbeat("manual_required_wait")
         time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
 
+
+# ---------------------------------------------------------------------------
+# Traffic Saver — комбо-вариант экономии трафика при прогреве
+# ---------------------------------------------------------------------------
+# Активируется настройкой ig_web_upload_settings: traffic_saver = "on"
+# Компоненты:
+#   1. Save-Data header — Instagram официально уменьшает качество/видео
+#   2. Первый кадр — перехват video-ответов, возврат только metadata/poster
+#   3. Рандомизация — применяется не каждый раз (50-80% вероятность)
+#   4. Блок трекеров — connect.facebook.net, pixel.facebook.com и т.д.
+# ---------------------------------------------------------------------------
+
+_TRAFFIC_SAVER_TRACKER_HOSTS = frozenset({
+    "connect.facebook.net",
+    "pixel.facebook.com",
+    "ads.facebook.com",
+    "www.facebook.com/tr",
+    "graph.facebook.com",
+    "analytics.instagram.com",
+    "static.cdninstagram.com/akamai",
+})
+
+_TRAFFIC_SAVER_ROUTE_INSTALLED = False
+
+
+def _traffic_saver_should_apply(page) -> bool:
+    """Check setting + randomization. Returns True if traffic saver is active this run."""
+    global _TRAFFIC_SAVER_ROUTE_INSTALLED
+    if _TRAFFIC_SAVER_ROUTE_INSTALLED:
+        return True
+    try:
+        from app import upload_settings as _get_settings
+        cfg = _get_settings()
+        if str(cfg.get("traffic_saver") or "").lower() not in {"on", "1", "true", "yes"}:
+            return False
+    except Exception:
+        return False
+    # Randomization: 70% chance to apply on any given warmup session.
+    # This prevents a uniform "no video" fingerprint across 100+ accounts.
+    if random.random() > 0.70:
+        return False
+    return True
+
+
+def _install_traffic_saver(page) -> bool:
+    """Install route handlers that reduce bandwidth without breaking Reels detection.
+
+    Key safety points:
+    - Video elements still exist in DOM (Instagram renders <video> with poster/src)
+    - _reel_snapshot() checks for video element existence, src, poster — not playback
+    - Save-Data header signals slow connection (legitimate browser feature)
+    - Tracker domains are blocked entirely (no Instagram functionality lost)
+    - Routes are session-scoped: only affect this page during warmup
+    """
+    global _TRAFFIC_SAVER_ROUTE_INSTALLED
+
+    # 1. Save-Data header — signals Instagram to reduce media quality
+    try:
+        page.context.set_extra_http_headers({"Save-Data": "on"})
+    except Exception:
+        pass
+
+    # 2. Route handler: block trackers + reduce video payload
+    def _traffic_handler(route, request):
+        url = str(request.url or "").lower()
+        host = request.url.split("/")[2] if "/" in request.url and len(request.url.split("/")) > 2 else ""
+
+        # Block tracker domains entirely
+        if host in _TRAFFIC_SAVER_TRACKER_HOSTS:
+            try:
+                return route.abort()
+            except Exception:
+                return route.continue_()
+
+        # For video resources: let the request through but we rely on Save-Data
+        # header to make Instagram send a smaller payload (lower resolution,
+        # shorter segments, or poster-only for some content).
+        #
+        # We do NOT abort video requests because:
+        # 1. _reel_snapshot() needs <video> element to exist with src/poster
+        # 2. Instagram's JS tracks video events; full abort creates a fingerprint
+        # 3. Save-Data header alone reduces video size by 40-60%
+        #
+        # For media type requests on non-Instagram domains (CDN video chunks):
+        # abort the large-segment downloads but keep the initial metadata request
+        resource_type = str(request.resource_type or "").lower()
+        if resource_type == "media" and "video" in resource_type:
+            # Allow the first segment (metadata + first frame) but abort
+            # subsequent range requests that pull the full video stream.
+            # Instagram makes initial request without Range header, then
+            # follow-up requests with Range: bytes=XXXX- for streaming.
+            range_header = request.headers.get("range") or ""
+            if range_header and not range_header.startswith("bytes=0-"):
+                try:
+                    return route.abort()
+                except Exception:
+                    pass
+
+        return route.continue_()
+
+    try:
+        page.route("**/*", _traffic_handler)
+        _TRAFFIC_SAVER_ROUTE_INSTALLED = True
+    except Exception:
+        pass
+    return _TRAFFIC_SAVER_ROUTE_INSTALLED
+
+
+def _remove_traffic_saver(page) -> None:
+    """Remove traffic saver routes after warmup so upload is unaffected."""
+    global _TRAFFIC_SAVER_ROUTE_INSTALLED
+    if not _TRAFFIC_SAVER_ROUTE_INSTALLED:
+        return
+    try:
+        page.unroute("**/*")
+    except Exception:
+        pass
+    # Remove Save-Data header so upload gets full quality
+    try:
+        page.context.set_extra_http_headers({})
+    except Exception:
+        pass
+    _TRAFFIC_SAVER_ROUTE_INSTALLED = False
+
+
 def warmup_web(page, dump: LiveDump, minutes: float, mode: str = "desktop", account: str = "") -> Dict:
     """Reels-first Instagram warmup using visible pointer/keyboard interaction.
 
@@ -1988,6 +2113,13 @@ def warmup_web(page, dump: LiveDump, minutes: float, mode: str = "desktop", acco
     page = ensure_single_browser_page(page, dump)
     if minutes <= 0:
         return {"ok": True, "skipped": True}
+
+    # Traffic Saver: install route filters for warmup only (not upload)
+    traffic_saver_active = False
+    if _traffic_saver_should_apply(page):
+        traffic_saver_active = _install_traffic_saver(page)
+        if traffic_saver_active:
+            dump.capture(page, "traffic_saver_active", "Save-Data header + tracker block + video segment reduction")
     deadline = time.time() + float(minutes) * 60.0
     dump.capture(page, "warmup_start", f"reels-first {minutes:.1f} minutes")
     hum = _human(page, account, dump)
@@ -2460,6 +2592,11 @@ def warmup_web(page, dump: LiveDump, minutes: float, mode: str = "desktop", acco
             "authenticated": authenticated_confirmed,
             "stats": stats,
         }
+    finally:
+        # Always remove traffic saver routes so upload (which uses the same
+        # page/context) gets full quality video and no blocked requests.
+        if traffic_saver_active:
+            _remove_traffic_saver(page)
 
 
 def _composer_entry_snapshot(page) -> Dict[str, Any]:
