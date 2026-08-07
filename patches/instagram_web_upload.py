@@ -2995,7 +2995,7 @@ class _CleanWebPublishAdapter:
         self.dump.capture(
             self.page, "publish_action_decision", action_type.value
         )
-        if action_type is PublishActionType.OPEN_COMPOSER:
+        if action_type is PublishActionType.LEGACY_OPEN_COMPOSER_BRIDGE:
             opened = open_instagram_composer(
                 self.page, self.dump
             )
