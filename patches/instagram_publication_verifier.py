@@ -258,6 +258,44 @@ def note_retry(row: Dict[str, Any], error: str, *, session_problem: bool = False
             last_checked_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             next_verify_at="" if final else utc_after(delay),
         )
+        # When a publication is definitively unavailable (5/5 attempts, 15+ min
+        # old, not a session problem), the asset was marked "uploaded" by the
+        # worker's optimistic accounting but Instagram never actually published
+        # it.  Roll the asset back to "ready" so it re-enters the queue and the
+        # UI stops counting it as published.  Decrement the job's posted_count
+        # and relabel the job partial_success so the overview reflects reality.
+        if final:
+            asset_id = int(row.get("asset_id") or 0)
+            job_id = int(row.get("job_id") or 0)
+            if asset_id:
+                conn.execute(
+                    "UPDATE api_content_assets SET status='ready', last_error=?, updated_at=datetime('now') WHERE id=?",
+                    (str(error or "publication unavailable after verification")[:4000], asset_id),
+                )
+            if job_id:
+                job_row = conn.execute(
+                    "SELECT posted_count, target_uploads, status FROM ig_web_upload_jobs WHERE id=?",
+                    (job_id,),
+                ).fetchone()
+                if job_row:
+                    new_posted = max(0, int(job_row["posted_count"] or 0) - 1)
+                    target = int(job_row["target_uploads"] or 0)
+                    job_status = str(job_row["status"] or "")
+                    # Only demote a job that was considered successful; failed
+                    # or already-partial jobs keep their status.
+                    if job_status in {"success", "partial_success"}:
+                        if new_posted < target:
+                            conn.execute(
+                                "UPDATE ig_web_upload_jobs SET status='partial_success',"
+                                " posted_count=?, current_step=?, last_error=?, updated_at=datetime('now') WHERE id=?",
+                                (new_posted, f"verified {new_posted}/{target}; unavailable asset reverted", str(error or "publication unavailable")[:4000], job_id),
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE ig_web_upload_jobs SET posted_count=?, updated_at=datetime('now') WHERE id=?",
+                                (new_posted, job_id),
+                            )
+            conn.commit()
     finally:
         conn.close()
     log(f"{row.get('account_name')}: history #{row['id']} -> {status} ({attempts}/5): {error}", "WARNING")
