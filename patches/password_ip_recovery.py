@@ -124,13 +124,13 @@ def begin_or_resume(
                         UPDATE password_ip_recovery
                         SET submission_reserved=0,
                             recovery_stage=CASE
-                              WHEN password_submission_count>=2
+                              WHEN password_submission_count>=3
                               THEN 'TERMINAL' ELSE recovery_stage END,
                             status=CASE
-                              WHEN password_submission_count>=2
+                              WHEN password_submission_count>=3
                               THEN 'terminal' ELSE status END,
                             terminal_reason=CASE
-                              WHEN password_submission_count>=2
+                              WHEN password_submission_count>=3
                               THEN 'invalid_credentials_after_ip_retry'
                               ELSE terminal_reason END,
                             updated_at=datetime('now')
@@ -138,8 +138,8 @@ def begin_or_resume(
                         """,
                         (int(exact["id"]),),
                     )
-                conn.commit()
-                return _row(conn, int(exact["id"]))
+                    conn.commit()
+                    return _row(conn, int(exact["id"]))
             if exact:
                 # The caller supplied a receipt owned by another accepted run.
                 # Never reactivate or clone its counters.
@@ -162,13 +162,13 @@ def begin_or_resume(
                     UPDATE password_ip_recovery
                     SET submission_reserved=0,
                         recovery_stage=CASE
-                          WHEN password_submission_count>=2 THEN 'TERMINAL'
+                          WHEN password_submission_count>=3 THEN 'TERMINAL'
                           ELSE recovery_stage END,
                         status=CASE
-                          WHEN password_submission_count>=2 THEN 'terminal'
+                          WHEN password_submission_count>=3 THEN 'terminal'
                           ELSE status END,
                         terminal_reason=CASE
-                          WHEN password_submission_count>=2
+                          WHEN password_submission_count>=3
                           THEN 'invalid_credentials_after_ip_retry'
                           ELSE terminal_reason END,
                         updated_at=datetime('now')
@@ -321,10 +321,10 @@ def reserve_submission(account_name: str, workflow_id: str) -> dict[str, Any]:
         if int(row["submission_reserved"] or 0):
             conn.rollback()
             return {"ok": False, "reason": "password_submission_already_reserved"}
-        if count >= 2:
+        if count >= 3:
             conn.rollback()
             return {"ok": False, "reason": "password_submission_limit_reached"}
-        if count == 1 and stage != "READY_FOR_SECOND_SUBMISSION":
+        if count == 1 and stage != "READY_FOR_SECOND_SUBMISSION" and not stage.startswith("READY_FOR_SUBMISSION"):
             conn.rollback()
             return {"ok": False, "reason": "second_submission_not_ready"}
         conn.execute(
@@ -391,6 +391,13 @@ def finish_submission(
 
 
 def record_first_rejection(account_name: str, workflow_id: str) -> dict[str, Any]:
+    """Record a credential rejection and determine if more retries are allowed.
+
+    With a 3-submission budget:
+    - 1st rejection (count 0→1): not terminal, continue to retry.
+    - 2nd rejection (count 1→2): not terminal, continue to retry.
+    - 3rd rejection (count 2→3): terminal, account will be deleted.
+    """
     conn = _connect()
     try:
         ensure_schema(conn)
@@ -403,21 +410,37 @@ def record_first_rejection(account_name: str, workflow_id: str) -> dict[str, Any
             conn.rollback()
             return {"ok": False, "reason": "recovery_workflow_missing"}
         count = int(row["password_submission_count"] or 0)
-        if (
-            count == 1
-            and str(row["recovery_stage"] or "") == "READY_FOR_SECOND_SUBMISSION"
-        ):
+        stage = str(row["recovery_stage"] or "")
+        # Accept a rejection when the worker has reserved a submission
+        # (count already incremented) or when the stage indicates a fresh
+        # submission was attempted (READY_FOR_SUBMISSION_N).
+        if count == 0 and stage.startswith("READY_FOR_SUBMISSION"):
+            # The worker reserved and attempted a submission but the
+            # reservation was not yet counted.  Increment now.
             conn.execute(
                 """
                 UPDATE password_ip_recovery
-                SET password_submission_count=2,
+                SET password_submission_count=1,
                     last_submission_at=datetime('now')
                 WHERE id=?
                 """,
                 (int(row["id"]),),
             )
-            count = 2
-        if count >= 2:
+            count = 1
+        elif count > 0 and stage.startswith("READY_FOR_SUBMISSION"):
+            # A subsequent rejection after a reserved submission.
+            new_count = count + 1
+            conn.execute(
+                """
+                UPDATE password_ip_recovery
+                SET password_submission_count=?,
+                    last_submission_at=datetime('now')
+                WHERE id=?
+                """,
+                (new_count, int(row["id"])),
+            )
+            count = new_count
+        if count >= 3:
             conn.execute(
                 """
                 UPDATE password_ip_recovery
@@ -444,9 +467,6 @@ def record_first_rejection(account_name: str, workflow_id: str) -> dict[str, Any
                 (int(row["id"]),),
             )
             count = 1
-        if count != 1:
-            conn.rollback()
-            return {"ok": False, "reason": "password_rejection_without_submission"}
         conn.execute(
             """
             UPDATE password_ip_recovery

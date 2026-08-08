@@ -1650,6 +1650,61 @@ def _set_auto_login_terminal(name: str, code: str, detail: str) -> None:
         conn.close()
 
 
+def _delete_account_and_proxy(name: str) -> None:
+    """Permanently delete an account and its sole-use proxy after 3 credential failures.
+
+    Mirrors app.delete_account() but is callable from the scheduler without
+    importing app.py (avoids circular import).  Deletes the account's proxy
+    from web_connections (if sole user), all related jobs/history/assets, and
+    the account row itself.
+    """
+    from connections import direct_connection_id
+    conn = db_conn()
+    try:
+        if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (name,)).fetchone():
+            return
+        direct_id = direct_connection_id(conn)
+        account_row = conn.execute(
+            "SELECT web_connection_id FROM accounts WHERE name=?", (name,)
+        ).fetchone()
+        connection_id = int(account_row["web_connection_id"] or 0) if account_row else 0
+        proxy_deleted = False
+        if connection_id and connection_id != direct_id:
+            other_users = int(conn.execute(
+                "SELECT COUNT(*) FROM accounts WHERE web_connection_id=? AND name!=?",
+                (connection_id, name),
+            ).fetchone()[0])
+            if other_users == 0:
+                conn.execute("DELETE FROM web_connections WHERE id=?", (connection_id,))
+                proxy_deleted = True
+        set_ids = [int(row[0]) for row in conn.execute(
+            "SELECT id FROM ig_account_content_plan_sets WHERE account_name=?", (name,)
+        ).fetchall()]
+        if set_ids:
+            placeholders = ",".join("?" for _ in set_ids)
+            conn.execute(f"DELETE FROM ig_account_content_plan_items WHERE set_id IN ({placeholders})", set_ids)
+        for table in (
+            "ig_account_content_plan_sets",
+            "ig_account_content_plan_state",
+            "ig_web_upload_jobs",
+            "ig_publishing_history",
+            "api_content_assets",
+        ):
+            conn.execute(f"DELETE FROM {table} WHERE account_name=?", (name,))
+        conn.execute("DELETE FROM accounts WHERE name=?", (name,))
+        conn.commit()
+        log(
+            f"account {name} deleted permanently after 3 credential failures"
+            + (f"; proxy {connection_id} also deleted" if proxy_deleted else ""),
+            "WARNING",
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _record_static_worker_domain(
     args: argparse.Namespace,
     account: dict[str, Any],
@@ -2383,54 +2438,170 @@ def run_account(args: argparse.Namespace, lane: dict[str, Any], account: dict[st
             _set_auto_login_terminal(name, reason, reason)
             return 5
 
-        mark_password_recovery_stage(
-            name, workflow_id, "READY_FOR_SECOND_SUBMISSION"
-        )
-        env["SPARKGRID_RECOVERY_ATTEMPT"] = "1"
-        if not args.no_proxy:
-            env["SPARKGRID_ACCOUNT_PROXY"] = str(
-                account.get("proxy_url") or ""
-            )
-        log(
-            f"{connection_name}: {name} Auto Login submission 2/2 starting in a fresh browser",
-            "ACT",
-        )
-        retry_returncode = _run_worker_with_watchdog(
-            base_command(args, account), env, account, str(args.operation)
-        )
-        retry_ok, retry_outcome = (
-            _auto_login_outcome(account, args)
-            if retry_returncode == 0
-            else (False, "")
-        )
-        if retry_ok:
-            mark_password_recovery_success(name, workflow_id)
-            log(
-                f"{connection_name}: {name} logged in after one fresh-IP retry",
-                "OK",
-            )
-            # Recovery success must not trigger another mobile rotation.
-            return 0
-        if (
-            retry_returncode == 0
-            and str(retry_outcome).startswith("incorrect_credentials")
-        ):
-            record_password_rejection(name, workflow_id)
-            reason = "invalid_credentials_after_ip_retry"
-            mark_password_recovery_terminal(name, workflow_id, reason)
-            _set_auto_login_terminal(
+        # --- Retry loop: up to 3 proxy rotations + login retries. ---
+        # Each iteration: mark stage, update env, run worker, check result.
+        # On incorrect_credentials: delete the failed proxy permanently,
+        # assign a fresh one, continue to the next iteration.  After 3
+        # failed submissions, delete the account permanently.
+        max_recovery_submissions = 3
+        for attempt_idx in range(2, max_recovery_submissions + 1):
+            mark_password_recovery_stage(
                 name,
-                reason,
-                "password rejected after one fresh-IP retry",
+                workflow_id,
+                f"READY_FOR_SUBMISSION_{attempt_idx}",
             )
-            return 5
-        reason = (
-            str(retry_outcome).split(":", 1)[0]
-            if retry_outcome
-            else "password_recovery_retry_failed"
-        )
-        mark_password_recovery_terminal(name, workflow_id, reason)
-        return int(retry_returncode or 5)
+            env["SPARKGRID_RECOVERY_ATTEMPT"] = str(attempt_idx - 1)
+            if not args.no_proxy:
+                env["SPARKGRID_ACCOUNT_PROXY"] = str(
+                    account.get("proxy_url") or ""
+                )
+            log(
+                f"{connection_name}: {name} Auto Login submission {attempt_idx}/{max_recovery_submissions} starting in a fresh browser",
+                "ACT",
+            )
+            retry_returncode = _run_worker_with_watchdog(
+                base_command(args, account), env, account, str(args.operation)
+            )
+            retry_ok, retry_outcome = (
+                _auto_login_outcome(account, args)
+                if retry_returncode == 0
+                else (False, "")
+            )
+            if retry_ok:
+                mark_password_recovery_success(name, workflow_id)
+                log(
+                    f"{connection_name}: {name} logged in after fresh-IP retry {attempt_idx}/{max_recovery_submissions}",
+                    "OK",
+                )
+                return 0
+            if (
+                retry_returncode == 0
+                and str(retry_outcome).startswith("incorrect_credentials")
+            ):
+                rejection = record_password_rejection(name, workflow_id)
+                if rejection.get("terminal"):
+                    # 3 submissions exhausted: delete the account permanently.
+                    reason = "invalid_credentials_after_3_ip_retries"
+                    mark_password_recovery_terminal(name, workflow_id, reason)
+                    _set_auto_login_terminal(
+                        name,
+                        reason,
+                        f"password rejected after {max_recovery_submissions} fresh-IP retries; account deleted",
+                    )
+                    log(
+                        f"{connection_name}: {name} password rejected after {max_recovery_submissions} submissions; deleting account and its proxy",
+                        "WARNING",
+                    )
+                    _delete_account_and_proxy(name)
+                    return 5
+                # Not terminal yet: delete failed proxy, assign a fresh one.
+                if ctype == "static":
+                    selected, repl_code = _replace_static_after_credential_rejection(
+                        args, lane, account, connection_name
+                    )
+                    if not selected:
+                        reason = str(repl_code or "static_proxy_pool_exhausted")
+                        mark_password_recovery_terminal(name, workflow_id, reason)
+                        _set_auto_login_terminal(name, reason, reason)
+                        return 6 if reason == "disk_space_low" else 5
+                    gate_ok, fresh_ip = strict_proxy_gate(
+                        args,
+                        lane,
+                        account,
+                        "static",
+                        str(account.get("connection_name") or connection_name),
+                        False,
+                        allow_static_replacement=False,
+                    )
+                    if gate_ok:
+                        consistent_ok, _consistent_detail, consistent_ip = (
+                            _recovery_exit_ip_probe(
+                                str(account.get("proxy_url") or ""),
+                                str(
+                                    recovery.get("ip_checker")
+                                    or "https://api.ipify.org?format=json"
+                                ),
+                            )
+                        )
+                        gate_ok = bool(consistent_ok)
+                        fresh_ip = consistent_ip if consistent_ok else ""
+                    if not gate_ok or not fresh_ip or fresh_ip == used_exit_ip:
+                        reason = (
+                            "static_replacement_exit_ip_unchanged"
+                            if fresh_ip == used_exit_ip
+                            else "static_replacement_not_ready"
+                        )
+                        mark_password_recovery_terminal(name, workflow_id, reason)
+                        _set_auto_login_terminal(name, reason, reason)
+                        return 5
+                    used_exit_ip = fresh_ip
+                    mark_password_recovery_stage(
+                        name,
+                        workflow_id,
+                        "EXIT_IP_CHANGED",
+                        replacement_connection_id=int(
+                            account.get("web_connection_id") or 0
+                        ),
+                        replacement_exit_ip=fresh_ip,
+                    )
+                elif is_mobile and has_rotation:
+                    generation = _rotation_generation(
+                        args, account, "password-recovery"
+                    )
+                    changed = mark_password_rotation_requested(
+                        name,
+                        workflow_id,
+                        generation=generation,
+                        lease_id=(
+                            f"mobile:{int(account.get('web_connection_id') or 0)}:"
+                            f"{generation}"
+                        ),
+                        lease_owner=workflow_id,
+                    )
+                    if not changed.get("ok"):
+                        reason = str(
+                            changed.get("reason")
+                            or "mobile_recovery_rotation_not_allowed"
+                        )
+                        mark_password_recovery_terminal(name, workflow_id, reason)
+                        _set_auto_login_terminal(name, reason, reason)
+                        return 5
+                    recovery = get_active_password_recovery(
+                        name, workflow_id=workflow_id
+                    ) or recovery
+                    fresh, fresh_ip = _mobile_recovery_rotation(
+                        args,
+                        lane,
+                        account,
+                        connection_name,
+                        used_exit_ip,
+                        sleep_after=True,
+                        recovery=recovery,
+                    )
+                    if not fresh:
+                        reason = "mobile_rotation_not_stabilized"
+                        mark_password_recovery_terminal(name, workflow_id, reason)
+                        _set_auto_login_terminal(name, reason, str(fresh_ip or reason))
+                        log(
+                            f"{connection_name}: {name} recovery rotation did not stabilize; password retry blocked",
+                            "ERROR",
+                        )
+                        return 3
+                    used_exit_ip = fresh_ip
+                else:
+                    reason = "password_ip_recovery_connection_unsupported"
+                    mark_password_recovery_terminal(name, workflow_id, reason)
+                    _set_auto_login_terminal(name, reason, reason)
+                    return 5
+                continue
+            # Non-credential failure: terminal, no account deletion.
+            reason = (
+                str(retry_outcome).split(":", 1)[0]
+                if retry_outcome
+                else "password_recovery_retry_failed"
+            )
+            mark_password_recovery_terminal(name, workflow_id, reason)
+            return int(retry_returncode or 5)
 
     if is_mobile and has_rotation and _mobile_retry_safe(args, account, typed, worker_status, worker_step):
         failed_ip = used_exit_ip or str(lane.get("last_exit_ip") or "")

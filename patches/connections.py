@@ -633,11 +633,11 @@ def quarantine_static_connection(
     detail: str,
     allow_replacement: bool = True,
 ) -> dict[str, Any] | None:
-    """Quarantine a confirmed bad static slot and atomically assign a free peer.
+    """Permanently delete a confirmed bad static slot and assign a free peer.
 
-    The old endpoint remains saved and visible for retesting; an account is
-    never silently moved to Direct. A replacement is drawn only from the same
-    saved group so geography/provider intent is preserved.
+    The old endpoint is physically deleted from web_connections so it can
+    never be re-used. A replacement is drawn only from the same saved group
+    so geography/provider intent is preserved.
     """
     ensure_connection_schema(conn)
     old = conn.execute(
@@ -649,16 +649,6 @@ def quarantine_static_connection(
     group_id = int(old["group_id"] or 0)
     conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute(
-            """
-            UPDATE web_connections
-            SET quarantined=1,failure_count=COALESCE(failure_count,0)+1,
-                last_status='quarantined',last_error=?,last_checked_at=datetime('now'),
-                quarantined_at=datetime('now'),updated_at=datetime('now')
-            WHERE id=?
-            """,
-            (str(detail or "proxy validation failed"), int(connection_id)),
-        )
         replacement = conn.execute(
             """
             SELECT c.* FROM web_connections c
@@ -672,6 +662,10 @@ def quarantine_static_connection(
             """,
             (int(connection_id), group_id),
         ).fetchone() if allow_replacement else None
+        conn.execute(
+            "DELETE FROM web_connections WHERE id=?",
+            (int(connection_id),),
+        )
         if replacement:
             conn.execute(
                 """
@@ -683,7 +677,7 @@ def quarantine_static_connection(
                 (
                     int(replacement["id"]),
                     str(replacement["proxy_url"] or ""),
-                    f"proxy_replaced: quarantined connection {int(connection_id)}; replacement {replacement['name']}",
+                    f"proxy_deleted: removed connection {int(connection_id)} ({detail}); replacement {replacement['name']}",
                     str(account_name),
                 ),
             )
@@ -697,7 +691,7 @@ def quarantine_static_connection(
             WHERE name=?
             """,
             (
-                "low_quality_proxy: quarantined; no free replacement in the same proxy group",
+                "low_quality_proxy: proxy deleted; no free replacement in the same proxy group",
                 str(account_name),
             ),
         )
