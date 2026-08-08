@@ -2114,6 +2114,21 @@ def warmup_web(page, dump: LiveDump, minutes: float, mode: str = "desktop", acco
     if minutes <= 0:
         return {"ok": True, "skipped": True}
 
+    # --- Traffic meter: sum content-length from every response (read-only, no
+    # extra requests, invisible to Instagram).  Stored per-account in DB. ---
+    _traffic_bytes = [0]
+    def _on_traffic_response(response):
+        try:
+            cl = response.headers.get("content-length") or ""
+            if cl.isdigit():
+                _traffic_bytes[0] += int(cl)
+        except Exception:
+            pass
+    try:
+        page.on("response", _on_traffic_response)
+    except Exception:
+        pass
+
     # Traffic Saver: install route filters for warmup only (not upload)
     traffic_saver_active = False
     if _traffic_saver_should_apply(page):
@@ -2597,6 +2612,26 @@ def warmup_web(page, dump: LiveDump, minutes: float, mode: str = "desktop", acco
         # page/context) gets full quality video and no blocked requests.
         if traffic_saver_active:
             _remove_traffic_saver(page)
+        # Persist traffic meter for this account (best-effort, never fails
+        # the warmup).  Updates web_upload_traffic_last (this session) and
+        # web_upload_traffic_total (all-time cumulative).
+        if account and _traffic_bytes[0] > 0:
+            try:
+                from app import db_conn as _metrics_db
+                _c = _metrics_db()
+                try:
+                    _c.execute(
+                        "UPDATE accounts SET "
+                        "web_upload_traffic_last=?, "
+                        "web_upload_traffic_total=web_upload_traffic_total+?, "
+                        "updated_at=datetime('now') WHERE name=?",
+                        (_traffic_bytes[0], _traffic_bytes[0], account),
+                    )
+                    _c.commit()
+                finally:
+                    _c.close()
+            except Exception:
+                pass
 
 
 def _composer_entry_snapshot(page) -> Dict[str, Any]:

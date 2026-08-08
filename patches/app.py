@@ -218,6 +218,8 @@ def ensure_schema() -> None:
             "web_professional_checked_at": "TEXT NOT NULL DEFAULT ''",
             "web_professional_category": "TEXT NOT NULL DEFAULT ''",
             "web_professional_last_error": "TEXT NOT NULL DEFAULT ''",
+            "web_upload_traffic_total": "INTEGER NOT NULL DEFAULT 0",
+            "web_upload_traffic_last": "INTEGER NOT NULL DEFAULT 0",
             "created_at": "TEXT NOT NULL DEFAULT ''",
             "updated_at": "TEXT NOT NULL DEFAULT ''",
         }
@@ -2437,7 +2439,9 @@ def overview() -> dict[str, Any]:
                    COALESCE(web_professional_status,'unchecked') AS web_professional_status,
                    COALESCE(web_professional_checked_at,'') AS web_professional_checked_at,
                    COALESCE(web_professional_category,'') AS web_professional_category,
-                   COALESCE(web_professional_last_error,'') AS web_professional_last_error
+                   COALESCE(web_professional_last_error,'') AS web_professional_last_error,
+                   COALESCE(web_upload_traffic_total,0) AS web_upload_traffic_total,
+                   COALESCE(web_upload_traffic_last,0) AS web_upload_traffic_last
             FROM accounts a
             LEFT JOIN web_connections c ON c.id=a.web_connection_id
             WHERE COALESCE(a.enabled,1)=1
