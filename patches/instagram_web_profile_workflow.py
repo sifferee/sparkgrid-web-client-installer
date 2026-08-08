@@ -7792,9 +7792,13 @@ def _settings_click(page, names, timeout_ms: int = 8000) -> str:
         candidates = [
             page.get_by_role("button", name=pattern),
             page.get_by_role("radio", name=pattern),
+            page.get_by_role("link", name=pattern),
             page.get_by_text(pattern),
             page.locator("button").filter(has_text=pattern),
             page.locator("[role='button']").filter(has_text=pattern),
+            page.locator("[role='link']").filter(has_text=pattern),
+            page.locator("a").filter(has_text=pattern),
+            page.locator("div").filter(has_text=pattern),
         ]
         for candidate in candidates:
             try:
@@ -7938,11 +7942,40 @@ def do_make_public(account: dict, args, run_id: str):
                 update_job(job, status="success", current_step="already_public", finished_at=now_iso())
                 return
             switch.click(timeout=8000)
-            if not _settings_wait_text(page, ["Switch to public account?", "Switch to public"], 15):
-                raise RuntimeError("Switch-to-public confirmation did not appear")
-            dump.capture(page, "privacy_public_confirmation", "confirmation shown", force_snapshot=True)
-            if not _settings_click(page, ["Switch to public"], 10000):
-                raise RuntimeError("Switch to public confirmation button was not found")
+            # After clicking the toggle, Instagram shows a confirmation
+            # dialog "Switch to public account?" with a blue "Switch to
+            # public" text button.  Playwright may refuse to click because
+            # Instagram overlays the dialog with a semi-transparent layer.
+            # Use force=True to bypass the visibility/intercept check.
+            time.sleep(2.0)  # Let the dialog render.
+            dump.capture(page, "privacy_public_confirmation", "after toggle click", force_snapshot=True)
+            clicked = False
+            for sel in (
+                page.get_by_text(re.compile(r"^Switch to public$", re.I)),
+                page.locator("button", has_text=re.compile(r"Switch to public", re.I)),
+                page.locator("[role='button']", has_text=re.compile(r"Switch to public", re.I)),
+                page.locator("a", has_text=re.compile(r"Switch to public", re.I)),
+                page.locator("[role='link']", has_text=re.compile(r"Switch to public", re.I)),
+                page.locator("div", has_text=re.compile(r"^Switch to public$", re.I)),
+            ):
+                try:
+                    cnt = int(sel.count() or 0)
+                    if cnt > 0:
+                        # Try normal click first, then force click.
+                        try:
+                            sel.first.click(timeout=3000)
+                        except Exception:
+                            sel.first.click(timeout=3000, force=True)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                # Check if toggle already switched (no dialog needed).
+                if not _control_checked(switch):
+                    dump.capture(page, "privacy_public_no_dialog", "toggle switched without dialog", force_snapshot=True)
+                else:
+                    raise RuntimeError("Switch to public confirmation button was not found")
             time.sleep(2.0)
             page.reload(wait_until="domcontentloaded", timeout=90000)
             _settings_wait_text(page, ["Account privacy", "Private account"], 20)
