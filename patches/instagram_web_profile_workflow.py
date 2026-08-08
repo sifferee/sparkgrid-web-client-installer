@@ -5784,10 +5784,42 @@ def _wait_after_2fa_submit(page, dump: LiveDump, max_seconds: int = 60) -> tuple
             time.sleep(2.0)
             continue
         try:
-            if "/challenge" in str(page.url or "").lower():
-                return "challenge", "Instagram opened a challenge after 2FA submission"
+            current_url_lower = str(page.url or "").lower()
         except Exception:
-            pass
+            current_url_lower = ""
+        if "/challenge" in current_url_lower:
+            return "challenge", "Instagram opened a challenge after 2FA submission"
+        # Instagram redirects to /accounts/onetap/ (Save Login Info) or
+        # /consent/ after a successful 2FA.  get_state() gives
+        # continue_after_dialog only 0.8 s to find and click the save_login
+        # dialog, which races with React lazy-mounting of [role='dialog'].
+        # When the dialog is not found in time, get_state returns "unknown"
+        # (session cookie exists but IG did not confirm authentication), and
+        # the loop spins until the 60 s timeout.  Dispatching the full
+        # _dismiss_post_login_prompts pipeline (settle_seconds=8, text-based
+        # _login_info_prompt_present, dialog gate with 4 s budget) resolves
+        # the intermediate page deterministically instead of relying on the
+        # 0.8 s get_state budget.
+        if (
+            "/accounts/onetap/" in current_url_lower
+            or "/consent/" in current_url_lower
+            or _login_info_prompt_present(page)
+        ):
+            dump.capture(page, "auto_login_2fa_post_login_page", f"post-2FA intermediate page: {current_url_lower}")
+            post_login = _dismiss_post_login_prompts(
+                page,
+                dump,
+                "instagram_2fa",
+                authenticated_confirmed=False,
+                settle_seconds=8.0,
+            )
+            post_state = str(post_login.get("state") or "")
+            if post_state == "logged_in" or post_login.get("operationally_ready"):
+                return "logged_in", str(post_login.get("reason") or "post-2FA login info prompt resolved")
+            if post_login.get("manual_required"):
+                return str(post_login.get("state") or "unknown_popup"), str(post_login.get("reason") or "post-2FA dialog requires manual review")
+            # The intermediate page was not resolved; fall through to get_state
+            # which may still detect the session on the next iteration.
         state, reason = get_state(page)
         last_state, last_reason = state, reason
         if state in {"logged_in", "human_verification", "checkpoint", "challenge", "restricted", "suspended", "login_required"}:
