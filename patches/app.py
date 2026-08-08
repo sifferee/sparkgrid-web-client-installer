@@ -3284,11 +3284,21 @@ def delete_banned_accounts() -> JSONResponse:
     finally:
         conn.close()
     failed = []
+    proxies_deleted = 0
     for name in names:
         response = delete_account(name)
-        if response.status_code != 200:
+        if response.status_code == 200:
+            try:
+                body = response.body
+                import json as _json
+                data = _json.loads(body) if isinstance(body, (bytes, bytearray)) else body
+                if isinstance(data, dict) and data.get("proxy_deleted"):
+                    proxies_deleted += 1
+            except Exception:
+                pass
+        else:
             failed.append(name)
-    return JSONResponse({"ok": True, "selected": len(names), "deleted": len(names) - len(failed), "failed": failed})
+    return JSONResponse({"ok": True, "selected": len(names), "deleted": len(names) - len(failed), "failed": failed, "proxies_deleted": proxies_deleted})
 
 
 @app.delete("/api/ig-web-upload/accounts/{account_name}")
@@ -3304,6 +3314,30 @@ def delete_account(account_name: str) -> JSONResponse:
     try:
         if not conn.execute("SELECT 1 FROM accounts WHERE name=?", (name,)).fetchone():
             return response_error("Account not found", 404)
+
+        # --- Proxy cleanup: when a banned/blocked account is deleted, also
+        # delete its assigned proxy from the pool so it can never be
+        # accidentally assigned to a fresh account.  Only delete the proxy
+        # if this was the sole account using it; shared proxies (multiple
+        # accounts on one mobile/static connection) are left intact. ---
+        from connections import ensure_connection_schema, direct_connection_id
+        ensure_connection_schema(conn)
+        direct_id = direct_connection_id(conn)
+        account_row = conn.execute(
+            "SELECT web_connection_id FROM accounts WHERE name=?", (name,)
+        ).fetchone()
+        connection_id = int(account_row["web_connection_id"] or 0) if account_row else 0
+        proxy_deleted = False
+        if connection_id and connection_id != direct_id:
+            other_users = int(conn.execute(
+                "SELECT COUNT(*) FROM accounts WHERE web_connection_id=? AND name!=?",
+                (connection_id, name),
+            ).fetchone()[0])
+            if other_users == 0:
+                # No other account uses this proxy — delete it entirely.
+                conn.execute("DELETE FROM web_connections WHERE id=?", (connection_id,))
+                proxy_deleted = True
+
         set_ids = [int(row[0]) for row in conn.execute(
             "SELECT id FROM ig_account_content_plan_sets WHERE account_name=?", (name,)
         ).fetchall()]
@@ -3346,7 +3380,7 @@ def delete_account(account_name: str) -> JSONResponse:
                 removed_paths.append(str(target))
         except Exception:
             pass
-    return JSONResponse({"ok": True, "account": name, "deleted": deleted, "removed_paths": len(removed_paths)})
+    return JSONResponse({"ok": True, "account": name, "deleted": deleted, "removed_paths": len(removed_paths), "proxy_deleted": proxy_deleted})
 
 
 @app.post("/api/ig-web-upload/onboard-accounts")

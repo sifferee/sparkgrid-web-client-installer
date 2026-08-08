@@ -1985,17 +1985,17 @@ function openDetails(name){const a=ACCOUNTS.find(x=>x.name===name);if(!a)return;
 async function deleteSuspendedAccounts(){
   if(PROCESS_BUSY)return toast('stop the current task before deleting accounts','err');
   const dead=ACCOUNTS.filter(isDead).map(a=>a.name);if(!dead.length)return toast('No suspended accounts','ok');
-  if(!confirm(`Delete ${dead.length} suspended account(s)? Profiles, jobs, history and local account files will also be removed.`))return;
-  let removed=0,failed=0;for(const name of dead){try{await api('/api/ig-web-upload/accounts/'+encodeURIComponent(name),{method:'DELETE'});SEL.delete(name);removed++;}catch(e){failed++;}}
-  toast(`${removed} suspended account(s) deleted${failed?' · '+failed+' failed':''}`,failed?'err':'ok');await loadAll();
+  if(!confirm(`Delete ${dead.length} suspended account(s)? Profiles, jobs, history, local files AND assigned proxies will be removed.`))return;
+  let removed=0,failed=0,proxies=0;for(const name of dead){try{const r=await api('/api/ig-web-upload/accounts/'+encodeURIComponent(name),{method:'DELETE'});SEL.delete(name);removed++;if(r.proxy_deleted)proxies++;}catch(e){failed++;}}
+  toast(`${removed} account(s) deleted${proxies?` · ${proxies} proxy(ies) removed`:''}${failed?' · '+failed+' failed':''}`,failed?'err':'ok');await loadAll();
 }
 
 async function deleteBannedAccounts(){
   if(PROCESS_BUSY)return toast('stop the current task before deleting accounts','err');
   try{const preview=await api('/api/ig-web-upload/accounts/banned'),count=Number(preview.count||0);if(!count)return toast('0 Banned accounts found','ok');
-    if(!confirm(`Delete ${count} Banned account(s)? Profiles, jobs, history and local account files will also be removed.`))return;
+    if(!confirm(`Delete ${count} Banned account(s)? Profiles, jobs, history, local files AND assigned proxies will be removed.`))return;
     const result=await api('/api/ig-web-upload/accounts/delete-banned',{method:'POST'}),failed=(result.failed||[]).length;
-    toast(`${result.deleted||0} Banned account(s) deleted${failed?' · '+failed+' failed':''}`,failed?'err':'ok');await loadAll();
+    toast(`${result.deleted||0} Banned account(s) deleted${result.proxies_deleted?` · ${result.proxies_deleted} proxy(ies) removed`:''}${failed?' · '+failed+' failed':''}`,failed?'err':'ok');await loadAll();
   }catch(e){toast(e.message,'err');}
 }
 
