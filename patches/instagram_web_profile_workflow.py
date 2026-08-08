@@ -7217,8 +7217,18 @@ def do_check_login(account: dict, args, run_id: str):
             elif result.code is SESSION_STABLE_BLOCKER:
                 state = result.operation_state or "unknown"
                 reason = "stable browser blocker confirmed"
+                # When the session check hits a stable blocker that it cannot
+                # classify (checkpoint, face verification, phone/email challenge,
+                # restriction, or an unknown block page), treat the account as
+                # suspended so it shows up in "Delete banned" and is excluded
+                # from future workflows.  The blocker text is preserved in
+                # web_upload_last_error for manual inspection.
+                if state in ("unknown", "unknown_dialog", "") or state not in (
+                    "cookie_consent", "save_login", "notification", "policy_notice"
+                ):
+                    state = "suspended"
             elif result.code is SESSION_NO_PROGRESS_TIMEOUT:
-                state, reason = "unknown", "session check made no progress"
+                state, reason = "suspended", "session check made no progress; account may be blocked"
             else:
                 state = result.operation_state or "failed"
                 reason = result.error_category or "session check failed"

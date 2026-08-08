@@ -918,7 +918,7 @@ function profileExists(a){
   const prof=a.web_upload_profile_status||'';
   return /creat|profile_ready|exist|done|ok/i.test(prof);
 }
-function isDead(a){return /suspend|banned|account disabled/i.test((a.web_upload_login_status||'')+' '+(a.status||'')+' '+(a.web_upload_last_error||''));}
+function isDead(a){return /suspend|banned|account disabled|restrict|checkpoint|challenge|human_verification/i.test((a.web_upload_login_status||'')+' '+(a.status||'')+' '+(a.web_upload_last_error||''));}
 function workspaceNiches(){return ACTIVE_WORKSPACE==='quality'?QUALITY_NICHES:SCALE_NICHES;}
 function workspaceNicheField(a){return String(ACTIVE_WORKSPACE==='quality'?(a.web_upload_quality_niche||''):(a.web_upload_scale_niche||'')).trim();}
 function workspaceNicheStorageKey(){return ACTIVE_WORKSPACE==='quality'?'sparkgrid_quality_niche':'sparkgrid_scale_niche';}

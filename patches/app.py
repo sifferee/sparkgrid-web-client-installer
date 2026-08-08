@@ -1951,13 +1951,14 @@ def ensure_story_library_schema(conn: sqlite3.Connection) -> None:
 
 def suspended_account(name: str, status: str, login_status: str, error: str) -> bool:
     haystack = " ".join((str(status or ""), str(login_status or ""), str(error or ""))).lower()
-    return "suspend" in haystack or "banned" in haystack or "account disabled" in haystack
+    return any(word in haystack for word in ("suspend", "banned", "account disabled", "restrict", "checkpoint", "challenge", "human_verification"))
 
 
 # Product-facing Banned is deliberately narrower than generic workflow trouble.
 # The current normalized login state wins over an older account status/error.
 BANNED_ACCOUNT_STATES = frozenset({
     "human_verification", "checkpoint", "challenge", "suspended", "disabled",
+    "restricted", "account_restricted",
 })
 
 
