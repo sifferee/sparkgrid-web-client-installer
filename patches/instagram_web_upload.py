@@ -4190,7 +4190,10 @@ def account_lane(account: dict, args, run_id: str) -> None:
                     post_warm = random.uniform(float(args.post_warmup_min), float(args.post_warmup_max))
                     update_job(job_id, current_step=f"post-warmup {post_warm:.1f}m", posted_count=posted)
                     if post_warm > 0:
-                        warm = warmup_web(page, dump, post_warm, mode=mode, account=name)
+                        try:
+                            warm = warmup_web(page, dump, post_warm, mode=mode, account=name)
+                        except Exception as warm_exc:
+                            warm = {"ok": False, "error": f"post_warmup_exception: {warm_exc}"}
                         if not warm.get("ok"):
                             error = warm.get("error") or str(warm)
                             update_job(job_id, **partial_success_after_warmup(posted, target, error))
