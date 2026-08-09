@@ -5234,6 +5234,8 @@ async def metrics_config(request: Request) -> JSONResponse:
             ads_power_checker.set_config(conn, "parser_profiles", str(body["parser_profiles"]))
         if "ads_power_api_url" in body:
             ads_power_checker.set_config(conn, "ads_power_api_url", str(body["ads_power_api_url"]))
+        if "ads_power_api_key" in body:
+            ads_power_checker.set_config(conn, "ads_power_api_key", str(body["ads_power_api_key"]))
         if "enabled" in body:
             ads_power_checker.set_config(conn, "enabled", str(body["enabled"]))
         return {"ok": True}

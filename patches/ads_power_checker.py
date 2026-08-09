@@ -122,10 +122,26 @@ def set_config(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 def start_ads_browser(profile_id: str, timeout: int = 30) -> dict[str, Any]:
     """Start Ads Power browser and return CDP endpoint."""
-    url = f"{ADS_POWER_API_URL}/api/v1/browser/start?user_id={profile_id}&headless=0"
-    log(f"Starting Ads Power browser for profile {profile_id}")
+    # Get config from DB
+    api_key = ""
+    api_url = ADS_POWER_API_URL
     try:
-        req = Request(url)
+        conn = _db_conn()
+        api_key = get_config(conn, "ads_power_api_key", "")
+        db_url = get_config(conn, "ads_power_api_url", "")
+        if db_url:
+            api_url = db_url
+        conn.close()
+    except Exception:
+        pass
+
+    url = f"{api_url}/api/v1/browser/start?user_id={profile_id}&headless=0"
+    log(f"Starting Ads Power browser for profile {profile_id} (url={api_url}, key={'yes' if api_key else 'no'})")
+    try:
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = Request(url, headers=headers)
         resp = urlopen(req, timeout=timeout)
         data = json.loads(resp.read())
         if data.get("code") != 0:
@@ -148,9 +164,24 @@ def start_ads_browser(profile_id: str, timeout: int = 30) -> dict[str, Any]:
 
 def stop_ads_browser(profile_id: str, timeout: int = 15) -> None:
     """Stop Ads Power browser."""
-    url = f"{ADS_POWER_API_URL}/api/v1/browser/stop?user_id={profile_id}"
+    api_key = ""
+    api_url = ADS_POWER_API_URL
     try:
-        urlopen(Request(url), timeout=timeout)
+        conn = _db_conn()
+        api_key = get_config(conn, "ads_power_api_key", "")
+        db_url = get_config(conn, "ads_power_api_url", "")
+        if db_url:
+            api_url = db_url
+        conn.close()
+    except Exception:
+        pass
+
+    url = f"{api_url}/api/v1/browser/stop?user_id={profile_id}"
+    try:
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        urlopen(Request(url, headers=headers), timeout=timeout)
         log(f"Ads Power browser stopped for profile {profile_id}")
     except Exception as e:
         log(f"Failed to stop Ads Power browser: {e}", "WARNING")
@@ -159,19 +190,43 @@ def stop_ads_browser(profile_id: str, timeout: int = 15) -> None:
 # ─── Playwright Connection ────────────────────────────────────────────────────
 
 def connect_browser(ws_url: str):
-    """Connect to running browser via CDP. Returns (browser, context, page)."""
-    try:
-        from playwright.sync_api import sync_playwright
-        p = sync_playwright().start()
-        # ws_url from Ads Power is a WebSocket URL like ws://127.0.0.1:XXXX
-        browser = p.chromium.connect_over_cdp(ws_url)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = context.pages[0] if context.pages else context.new_page()
-        return p, browser, context, page
-    except ImportError:
-        raise RuntimeError("Playwright not installed")
-    except Exception as e:
-        raise RuntimeError(f"Cannot connect to browser: {e}")
+    """Connect to running browser via CDP. Returns (browser, context, page).
+    
+    Uses sync_playwright in a separate thread to avoid asyncio conflicts with FastAPI.
+    """
+    # Normalize ws_url
+    if ws_url and not ws_url.startswith("ws://") and not ws_url.startswith("http"):
+        ws_url = f"http://{ws_url}"
+    
+    import threading
+    
+    result = {"page": None, "browser": None, "p": None, "error": None}
+    
+    def _connect():
+        try:
+            from playwright.sync_api import sync_playwright
+            p = sync_playwright().start()
+            browser = p.chromium.connect_over_cdp(ws_url)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = context.pages[0] if context.pages else context.new_page()
+            result["p"] = p
+            result["browser"] = browser
+            result["page"] = page
+            result["_thread_id"] = threading.get_ident()
+        except Exception as e:
+            result["error"] = str(e)
+    
+    t = threading.Thread(target=_connect, daemon=True)
+    t.start()
+    t.join(timeout=15)
+    
+    if result["error"]:
+        raise RuntimeError(f"Cannot connect to browser: {result['error']}")
+    if not result["page"]:
+        raise RuntimeError("Cannot connect to browser: timeout")
+    
+    # Return thread info so caller can use same thread for evaluate calls
+    return result["p"], result["browser"], None, result["page"], result.get("_thread_id")
 
 
 def disconnect_browser(p, browser) -> None:
@@ -374,6 +429,101 @@ def get_target_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def _run_browser_session(ws_url: str, targets: list[dict[str, Any]], profile_id: str) -> tuple[int, list[str]]:
+    """Run all browser operations in a single thread to avoid greenlet conflicts.
+    
+    Returns (checked_count, errors).
+    """
+    import threading
+    
+    # Normalize ws_url
+    if ws_url and not ws_url.startswith("ws://") and not ws_url.startswith("http"):
+        ws_url = f"http://{ws_url}"
+    
+    result = {"checked": 0, "errors": [], "done": False}
+    
+    def _worker():
+        try:
+            from playwright.sync_api import sync_playwright
+            p = sync_playwright().start()
+            try:
+                browser = p.chromium.connect_over_cdp(ws_url)
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = context.pages[0] if context.pages else context.new_page()
+                
+                # Navigate to Instagram first
+                try:
+                    page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=15000)
+                    time.sleep(2)
+                except Exception:
+                    pass
+                
+                for target in targets:
+                    username = target["name"]
+                    try:
+                        log(f"Checking @{username}...")
+                        
+                        # 1. Profile metrics
+                        profile_data = fetch_profile_metrics(page, username)
+                        if not profile_data.get("ok"):
+                            error = profile_data.get("error", "profile fetch failed")
+                            log(f"  @{username}: profile failed: {error}", "WARNING")
+                            save_snapshot(username, {}, profile_id, error)
+                            result["errors"].append(f"{username}: {error}")
+                            continue
+                        
+                        user_id = profile_data.get("user_id", "")
+                        
+                        # 2. Post metrics
+                        post_data = fetch_post_metrics(page, user_id, count=12)
+                        
+                        # 3. Reels count
+                        reels_data = fetch_reels_metrics(page, user_id)
+                        
+                        metrics = {
+                            "followers": profile_data.get("followers", 0),
+                            "following": profile_data.get("following", 0),
+                            "posts_count": profile_data.get("posts_count", 0),
+                            "total_likes": post_data.get("total_likes", 0),
+                            "total_comments": post_data.get("total_comments", 0),
+                            "total_views": post_data.get("total_views", 0),
+                            "active_stories_count": reels_data.get("active_stories_count", 0),
+                            "posts": post_data.get("posts", []),
+                        }
+                        
+                        save_snapshot(username, metrics, profile_id)
+                        result["checked"] += 1
+                        log(f"  @{username}: ✅ followers={metrics['followers']}, views={metrics['total_views']}, likes={metrics['total_likes']}")
+                        
+                        time.sleep(random.uniform(2.0, 5.0))
+                        
+                    except Exception as e:
+                        log(f"  @{username}: ERROR: {e}", "ERROR")
+                        save_snapshot(username, {}, profile_id, str(e))
+                        result["errors"].append(f"{username}: {e}")
+                
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                try:
+                    p.stop()
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"Browser session error: {e}", "ERROR")
+            result["errors"].append(f"browser: {e}")
+        finally:
+            result["done"] = True
+    
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=180)  # 3 min max
+    
+    return result["checked"], result["errors"]
+
+
 def run_once() -> int:
     """One check cycle. Returns number of accounts successfully checked."""
     conn = _db_conn()
@@ -387,7 +537,7 @@ def run_once() -> int:
             profiles = [p.strip() for p in profiles_raw.split(",") if p.strip()]
 
         if not profiles:
-            log("No parser profiles configured. Set ads_power_config.parser_profiles or ADS_POWER_PARSER_PROFILES env.", "WARNING")
+            log("No parser profiles configured.", "WARNING")
             return 0
 
         targets = get_target_accounts(conn)
@@ -410,66 +560,11 @@ def run_once() -> int:
 
             ws_url = start_result.get("ws_url", "")
             try:
-                p, browser, context, page = connect_browser(ws_url)
+                c, errors = _run_browser_session(ws_url, targets, profile_id)
+                checked += c
             except Exception as e:
-                log(f"Cannot connect to browser: {e}", "ERROR")
-                stop_ads_browser(profile_id)
-                continue
-
-            try:
-                # Navigate to Instagram first (for cookies/session)
-                try:
-                    page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=15000)
-                    time.sleep(2)
-                except Exception:
-                    pass
-
-                for target in targets:
-                    username = target["name"]
-                    try:
-                        log(f"Checking @{username}...")
-
-                        # 1. Profile metrics
-                        profile_data = fetch_profile_metrics(page, username)
-                        if not profile_data.get("ok"):
-                            error = profile_data.get("error", "profile fetch failed")
-                            log(f"  @{username}: profile failed: {error}", "WARNING")
-                            save_snapshot(username, {}, profile_id, error)
-                            continue
-
-                        user_id = profile_data.get("user_id", "")
-
-                        # 2. Post metrics (likes, comments, views)
-                        post_data = fetch_post_metrics(page, user_id, count=12)
-
-                        # 3. Reels/stories count
-                        reels_data = fetch_reels_metrics(page, user_id)
-
-                        # Combine
-                        metrics = {
-                            "followers": profile_data.get("followers", 0),
-                            "following": profile_data.get("following", 0),
-                            "posts_count": profile_data.get("posts_count", 0),
-                            "total_likes": post_data.get("total_likes", 0),
-                            "total_comments": post_data.get("total_comments", 0),
-                            "total_views": post_data.get("total_views", 0),
-                            "active_stories_count": reels_data.get("active_stories_count", 0),
-                            "posts": post_data.get("posts", []),
-                        }
-
-                        save_snapshot(username, metrics, profile_id)
-                        checked += 1
-                        log(f"  @{username}: ✅ followers={metrics['followers']}, views={metrics['total_views']}, likes={metrics['total_likes']}")
-
-                        # Small random delay between accounts
-                        time.sleep(random.uniform(2.0, 5.0))
-
-                    except Exception as e:
-                        log(f"  @{username}: ERROR: {e}", "ERROR")
-                        save_snapshot(username, {}, profile_id, str(e))
-
+                log(f"Browser session failed: {e}", "ERROR")
             finally:
-                disconnect_browser(p, browser)
                 stop_ads_browser(profile_id)
 
         log(f"Cycle complete: {checked}/{len(targets)} accounts checked")
