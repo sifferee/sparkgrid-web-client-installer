@@ -550,6 +550,9 @@ def mark_stage(
         "READY_FOR_SECOND_SUBMISSION",
         "ROTATION_NOT_STABILIZED",
         "ROTATION_FAILED",
+        "READY_FOR_SUBMISSION_2",
+        "READY_FOR_SUBMISSION_3",
+        "FIRST_PASSWORD_REJECTED",
     }
     if stage not in allowed:
         raise ValueError(f"unsupported recovery stage: {stage}")
@@ -558,7 +561,8 @@ def mark_stage(
         ensure_schema(conn)
         accepted = ",rotation_accepted_at=datetime('now')" if stage == "ROTATION_COMMAND_ACCEPTED" else ""
         readiness = ",readiness_confirmed_at=datetime('now')" if stage in {
-            "PROXY_READINESS_CONFIRMED", "EXIT_IP_CHANGED", "READY_FOR_SECOND_SUBMISSION"
+            "PROXY_READINESS_CONFIRMED", "EXIT_IP_CHANGED", "READY_FOR_SECOND_SUBMISSION",
+            "READY_FOR_SUBMISSION_2", "READY_FOR_SUBMISSION_3",
         } else ""
         conn.execute(
             f"""
