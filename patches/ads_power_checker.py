@@ -1,0 +1,621 @@
+"""
+Ads Power Account Metrics Checker.
+
+Uses Ads Power browser profiles to fetch Instagram metrics via private API.
+One parser profile checks all target accounts per cycle.
+
+Architecture:
+  1. Start Ads Power browser (puppeteer/connect CDP)
+  2. For each target account: 2 API calls (profile_info + feed)
+  3. Save snapshot to DB
+  4. Close browser
+  5. Sleep with randomization (55-75 min)
+  6. Repeat
+
+Traffic per cycle (10 accounts): ~200 KB API + ~5 MB browser open = ~5.2 MB
+"""
+
+from __future__ import annotations
+
+import json
+import random
+import sqlite3
+import threading
+import time
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.request import urlopen, Request
+from urllib.error import URLError
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" if Path(__file__).resolve().parent.parent.parent.parent.name == "SparkGrid Web Client" else Path(__file__).resolve().parent.parent / "data"
+
+# Try to find DATA_DIR from environment
+import os
+DATA_DIR = Path(os.environ.get("SPARKGRID_DATA_DIR") or DATA_DIR).resolve()
+DB_PATH = DATA_DIR / "bot.db"
+LOG_DIR = DATA_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+ADS_POWER_API_URL = os.environ.get("ADS_POWER_API_URL", "http://localhost:50325")
+ADS_POWER_PARSER_PROFILES = [p.strip() for p in os.environ.get("ADS_POWER_PARSER_PROFILES", "").split(",") if p.strip()]
+
+CHECKER_ENABLED = os.environ.get("METRICS_CHECKER_ENABLED", "1") == "1"
+BASE_INTERVAL_MIN = 55  # minutes
+BASE_INTERVAL_MAX = 75  # minutes
+MAX_TARGETS_PER_CYCLE = 10
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+def log(msg: str, level: str = "INFO") -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts} {level}: [metrics] {msg}"
+    print(line, flush=True)
+    try:
+        log_file = LOG_DIR / "metrics_checker.log"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+# ─── DB Schema ─────────────────────────────────────────────────────────────────
+
+def _db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_metrics_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS account_metrics_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_name TEXT NOT NULL,
+            checked_at TEXT NOT NULL,
+            followers INTEGER DEFAULT 0,
+            following INTEGER DEFAULT 0,
+            posts_count INTEGER DEFAULT 0,
+            total_likes INTEGER DEFAULT 0,
+            total_comments INTEGER DEFAULT 0,
+            total_views INTEGER DEFAULT 0,
+            active_stories_count INTEGER DEFAULT 0,
+            per_post_json TEXT DEFAULT '',
+            parser_profile TEXT DEFAULT '',
+            error TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ads_power_config (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_metrics_account_checked
+        ON account_metrics_snapshots(account_name, checked_at)
+    """)
+    conn.commit()
+
+
+def get_config(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM ads_power_config WHERE key=?", (key,)).fetchone()
+    return str(row["value"]) if row else default
+
+
+def set_config(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("""
+        INSERT INTO ads_power_config (key, value, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')
+    """, (key, value))
+    conn.commit()
+
+
+# ─── Ads Power Browser Control ────────────────────────────────────────────────
+
+def start_ads_browser(profile_id: str, timeout: int = 30) -> dict[str, Any]:
+    """Start Ads Power browser and return CDP endpoint."""
+    url = f"{ADS_POWER_API_URL}/api/v1/browser/start?user_id={profile_id}&headless=0"
+    log(f"Starting Ads Power browser for profile {profile_id}")
+    try:
+        req = Request(url)
+        resp = urlopen(req, timeout=timeout)
+        data = json.loads(resp.read())
+        if data.get("code") != 0:
+            return {"ok": False, "error": f"Ads Power error: {data.get('msg', 'unknown')}"}
+        ws_url = data.get("data", {}).get("ws", {}).get("selenium", "") or data.get("data", {}).get("ws", {}).get("puppeteer", "")
+        if not ws_url:
+            # Try direct CDP endpoint
+            debug_port = data.get("data", {}).get("debug_port", 0)
+            if debug_port:
+                ws_url = f"http://127.0.0.1:{debug_port}"
+        if not ws_url:
+            return {"ok": False, "error": "No CDP endpoint from Ads Power"}
+        log(f"Ads Power browser started: {ws_url}")
+        return {"ok": True, "ws_url": ws_url, "debug_port": debug_port if 'debug_port' in dir() else 0}
+    except URLError as e:
+        return {"ok": False, "error": f"Cannot reach Ads Power API: {e}"}
+    except Exception as e:
+        return {"ok": False, "error": f"Start error: {e}"}
+
+
+def stop_ads_browser(profile_id: str, timeout: int = 15) -> None:
+    """Stop Ads Power browser."""
+    url = f"{ADS_POWER_API_URL}/api/v1/browser/stop?user_id={profile_id}"
+    try:
+        urlopen(Request(url), timeout=timeout)
+        log(f"Ads Power browser stopped for profile {profile_id}")
+    except Exception as e:
+        log(f"Failed to stop Ads Power browser: {e}", "WARNING")
+
+
+# ─── Playwright Connection ────────────────────────────────────────────────────
+
+def connect_browser(ws_url: str):
+    """Connect to running browser via CDP. Returns (browser, context, page)."""
+    try:
+        from playwright.sync_api import sync_playwright
+        p = sync_playwright().start()
+        # ws_url from Ads Power is a WebSocket URL like ws://127.0.0.1:XXXX
+        browser = p.chromium.connect_over_cdp(ws_url)
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.pages[0] if context.pages else context.new_page()
+        return p, browser, context, page
+    except ImportError:
+        raise RuntimeError("Playwright not installed")
+    except Exception as e:
+        raise RuntimeError(f"Cannot connect to browser: {e}")
+
+
+def disconnect_browser(p, browser) -> None:
+    """Disconnect from browser (does not close Ads Power browser)."""
+    try:
+        browser.close()
+    except Exception:
+        pass
+    try:
+        p.stop()
+    except Exception:
+        pass
+
+
+# ─── Instagram Metrics Fetching ──────────────────────────────────────────────
+
+def fetch_profile_metrics(page, username: str) -> dict[str, Any]:
+    """Fetch account metrics via Instagram private API.
+    
+    Returns: {followers, following, posts_count, user_id, is_private, full_name}
+    """
+    try:
+        result = page.evaluate(
+            """
+            async (username) => {
+                const headers = {
+                    'X-IG-App-ID': '936619743392459',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json',
+                };
+                const resp = await fetch(
+                    '/api/v1/users/web_profile_info/?username=' + encodeURIComponent(username),
+                    { credentials: 'include', headers }
+                );
+                const data = await resp.json();
+                const user = (data && data.data && data.data.user) || {};
+                return {
+                    ok: resp.ok,
+                    status: resp.status,
+                    user_id: user.id || '',
+                    followers: user.edge_followed_by ? user.edge_followed_by.count : 0,
+                    following: user.edge_follow ? user.edge_follow.count : 0,
+                    posts_count: user.edge_owner_to_timeline_media ? user.edge_owner_to_timeline_media.count : 0,
+                    is_private: user.is_private || false,
+                    full_name: user.full_name || '',
+                    profile_pic: user.profile_pic_url || '',
+                };
+            }
+            """,
+            username,
+        )
+        return result or {"ok": False, "error": "empty response"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def fetch_post_metrics(page, user_id: str, count: int = 12) -> dict[str, Any]:
+    """Fetch latest posts with views, likes, comments.
+    
+    Returns: {total_likes, total_comments, total_views, posts: [...]}
+    """
+    if not user_id:
+        return {"ok": False, "error": "no user_id"}
+    try:
+        result = page.evaluate(
+            """
+            async (params) => {
+                const headers = {
+                    'X-IG-App-ID': '936619743392459',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json',
+                };
+                const resp = await fetch(
+                    '/api/v1/feed/user/' + params.user_id + '/?count=' + String(params.count),
+                    { credentials: 'include', headers }
+                );
+                const data = await resp.json();
+                const items = (data && data.items) || [];
+                const posts = items.map(item => {
+                    const caption = item.caption || {};
+                    const likes = item.like_count || 0;
+                    const comments = item.comment_count || 0;
+                    const views = (item.play_count || (item.video_view_count || 0));
+                    const pk = item.pk || item.id || '';
+                    const taken_at = item.taken_at || 0;
+                    const media_type = item.media_type || 0;
+                    return { pk, likes, comments, views, taken_at, media_type };
+                });
+                return {
+                    ok: resp.ok,
+                    status: resp.status,
+                    posts: posts,
+                    total_likes: posts.reduce((s, p) => s + p.likes, 0),
+                    total_comments: posts.reduce((s, p) => s + p.comments, 0),
+                    total_views: posts.reduce((s, p) => s + p.views, 0),
+                };
+            }
+            """,
+            {"user_id": str(user_id), "count": int(count)},
+        )
+        return result or {"ok": False, "error": "empty response"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def fetch_reels_metrics(page, user_id: str) -> dict[str, Any]:
+    """Fetch active stories/reels count for account."""
+    if not user_id:
+        return {"ok": False, "error": "no user_id", "active_stories_count": 0}
+    try:
+        result = page.evaluate(
+            """
+            async (userId) => {
+                const headers = {
+                    'X-IG-App-ID': '936619743392459',
+                    'X-Requested-With': 'XMLHttpRequest',
+                };
+                try {
+                    const resp = await fetch(
+                        '/api/v1/feed/user/' + userId + '/?count=50&max_id=null&exclude_comment=true&only_feed_first=true',
+                        { credentials: 'include', headers }
+                    );
+                    const data = await resp.json();
+                    const items = (data && data.items) || [];
+                    const now = Math.floor(Date.now() / 1000);
+                    const recent = items.filter(i => (now - (i.taken_at || 0)) < 86400 * 7);
+                    const reels = recent.filter(i => i.media_type === 2);
+                    return {
+                        ok: true,
+                        active_stories_count: reels.length,
+                        recent_posts: recent.length,
+                    };
+                } catch(e) {
+                    return { ok: false, error: String(e), active_stories_count: 0 };
+                }
+            }
+            """,
+            str(user_id),
+        )
+        return result or {"ok": False, "error": "empty", "active_stories_count": 0}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "active_stories_count": 0}
+
+
+# ─── Snapshot Storage ─────────────────────────────────────────────────────────
+
+def save_snapshot(
+    account_name: str,
+    metrics: dict[str, Any],
+    parser_profile: str = "",
+    error: str = "",
+) -> None:
+    conn = _db_conn()
+    try:
+        ensure_metrics_schema(conn)
+        now_iso = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            """
+            INSERT INTO account_metrics_snapshots
+                (account_name, checked_at, followers, following, posts_count,
+                 total_likes, total_comments, total_views, active_stories_count,
+                 per_post_json, parser_profile, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_name, now_iso,
+                int(metrics.get("followers", 0)),
+                int(metrics.get("following", 0)),
+                int(metrics.get("posts_count", 0)),
+                int(metrics.get("total_likes", 0)),
+                int(metrics.get("total_comments", 0)),
+                int(metrics.get("total_views", 0)),
+                int(metrics.get("active_stories_count", 0)),
+                json.dumps(metrics.get("posts", []), ensure_ascii=False)[:5000],
+                parser_profile,
+                error,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ─── Main Checker Loop ───────────────────────────────────────────────────────
+
+def get_target_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Get all logged_in accounts to check."""
+    rows = conn.execute(
+        """
+        SELECT name, web_upload_login_status, web_privacy_status,
+               web_upload_scale_niche
+        FROM accounts
+        WHERE web_upload_login_status = 'logged_in'
+        AND enabled = 1
+        ORDER BY name
+        LIMIT ?
+        """,
+        (MAX_TARGETS_PER_CYCLE,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def run_once() -> int:
+    """One check cycle. Returns number of accounts successfully checked."""
+    conn = _db_conn()
+    try:
+        ensure_metrics_schema(conn)
+
+        # Get parser profiles from config or env
+        profiles = ADS_POWER_PARSER_PROFILES
+        if not profiles:
+            profiles_raw = get_config(conn, "parser_profiles", "")
+            profiles = [p.strip() for p in profiles_raw.split(",") if p.strip()]
+
+        if not profiles:
+            log("No parser profiles configured. Set ads_power_config.parser_profiles or ADS_POWER_PARSER_PROFILES env.", "WARNING")
+            return 0
+
+        targets = get_target_accounts(conn)
+        if not targets:
+            log("No target accounts to check.")
+            return 0
+
+        log(f"Checking {len(targets)} accounts using {len(profiles)} parser profile(s)")
+
+        checked = 0
+        for profile_id in profiles:
+            if checked >= len(targets):
+                break
+
+            # Start Ads Power browser
+            start_result = start_ads_browser(profile_id)
+            if not start_result.get("ok"):
+                log(f"Failed to start browser for profile {profile_id}: {start_result.get('error')}", "ERROR")
+                continue
+
+            ws_url = start_result.get("ws_url", "")
+            try:
+                p, browser, context, page = connect_browser(ws_url)
+            except Exception as e:
+                log(f"Cannot connect to browser: {e}", "ERROR")
+                stop_ads_browser(profile_id)
+                continue
+
+            try:
+                # Navigate to Instagram first (for cookies/session)
+                try:
+                    page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=15000)
+                    time.sleep(2)
+                except Exception:
+                    pass
+
+                for target in targets:
+                    username = target["name"]
+                    try:
+                        log(f"Checking @{username}...")
+
+                        # 1. Profile metrics
+                        profile_data = fetch_profile_metrics(page, username)
+                        if not profile_data.get("ok"):
+                            error = profile_data.get("error", "profile fetch failed")
+                            log(f"  @{username}: profile failed: {error}", "WARNING")
+                            save_snapshot(username, {}, profile_id, error)
+                            continue
+
+                        user_id = profile_data.get("user_id", "")
+
+                        # 2. Post metrics (likes, comments, views)
+                        post_data = fetch_post_metrics(page, user_id, count=12)
+
+                        # 3. Reels/stories count
+                        reels_data = fetch_reels_metrics(page, user_id)
+
+                        # Combine
+                        metrics = {
+                            "followers": profile_data.get("followers", 0),
+                            "following": profile_data.get("following", 0),
+                            "posts_count": profile_data.get("posts_count", 0),
+                            "total_likes": post_data.get("total_likes", 0),
+                            "total_comments": post_data.get("total_comments", 0),
+                            "total_views": post_data.get("total_views", 0),
+                            "active_stories_count": reels_data.get("active_stories_count", 0),
+                            "posts": post_data.get("posts", []),
+                        }
+
+                        save_snapshot(username, metrics, profile_id)
+                        checked += 1
+                        log(f"  @{username}: ✅ followers={metrics['followers']}, views={metrics['total_views']}, likes={metrics['total_likes']}")
+
+                        # Small random delay between accounts
+                        time.sleep(random.uniform(2.0, 5.0))
+
+                    except Exception as e:
+                        log(f"  @{username}: ERROR: {e}", "ERROR")
+                        save_snapshot(username, {}, profile_id, str(e))
+
+            finally:
+                disconnect_browser(p, browser)
+                stop_ads_browser(profile_id)
+
+        log(f"Cycle complete: {checked}/{len(targets)} accounts checked")
+        return checked
+
+    except Exception as e:
+        log(f"Cycle error: {e}\n{traceback.format_exc()}", "ERROR")
+        return 0
+    finally:
+        conn.close()
+
+
+def _checker_loop() -> None:
+    """Background loop with randomization."""
+    log("Metrics checker started")
+    while True:
+        try:
+            if CHECKER_ENABLED:
+                run_once()
+            else:
+                log("Checker disabled, skipping cycle")
+        except Exception as e:
+            log(f"Loop error: {e}", "ERROR")
+
+        # Random sleep 55-75 minutes
+        sleep_min = random.uniform(BASE_INTERVAL_MIN, BASE_INTERVAL_MAX)
+        sleep_sec = sleep_min * 60
+        log(f"Sleeping {sleep_min:.1f} minutes until next cycle")
+        time.sleep(sleep_sec)
+
+
+# ─── Data Access for Dashboard ───────────────────────────────────────────────
+
+def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
+    """Get overview metrics for all accounts."""
+    ensure_metrics_schema(conn)
+    cutoff = datetime.now().strftime("%Y-%m-%d %H:%M:%S", )  # now
+    # Get latest snapshot per account
+    rows = conn.execute("""
+        SELECT s.* FROM account_metrics_snapshots s
+        INNER JOIN (
+            SELECT account_name, MAX(checked_at) as max_checked
+            FROM account_metrics_snapshots
+            GROUP BY account_name
+        ) latest ON s.account_name = latest.account_name AND s.checked_at = latest.max_checked
+        ORDER BY s.account_name
+    """).fetchall()
+
+    # Get snapshot from ~24h ago for delta
+    old_rows = conn.execute("""
+        SELECT s.* FROM account_metrics_snapshots s
+        INNER JOIN (
+            SELECT account_name, MAX(checked_at) as max_checked
+            FROM account_metrics_snapshots
+            WHERE checked_at <= datetime('now', '-{} hours')
+            GROUP BY account_name
+        ) old ON s.account_name = old.account_name AND s.checked_at = old.max_checked
+    """.format(hours), ()).fetchall()
+    old_map = {r["account_name"]: dict(r) for r in old_rows}
+
+    accounts = []
+    total_followers = 0
+    total_views = 0
+    total_likes = 0
+    total_comments = 0
+    delta_followers = 0
+    delta_views = 0
+    delta_likes = 0
+    delta_comments = 0
+
+    for r in rows:
+        d = dict(r)
+        old = old_map.get(d["account_name"], {})
+        df = int(d["followers"] or 0) - int(old.get("followers", 0) or 0)
+        dv = int(d["total_views"] or 0) - int(old.get("total_views", 0) or 0)
+        dl = int(d["total_likes"] or 0) - int(old.get("total_likes", 0) or 0)
+        dc = int(d["total_comments"] or 0) - int(old.get("total_comments", 0) or 0)
+
+        accounts.append({
+            "name": d["account_name"],
+            "followers": d["followers"],
+            "following": d["following"],
+            "posts_count": d["posts_count"],
+            "total_likes": d["total_likes"],
+            "total_comments": d["total_comments"],
+            "total_views": d["total_views"],
+            "active_stories_count": d["active_stories_count"],
+            "checked_at": d["checked_at"],
+            "error": d["error"],
+            "delta": {
+                "followers": df,
+                "views": dv,
+                "likes": dl,
+                "comments": dc,
+            },
+        })
+
+        total_followers += int(d["followers"] or 0)
+        total_views += int(d["total_views"] or 0)
+        total_likes += int(d["total_likes"] or 0)
+        total_comments += int(d["total_comments"] or 0)
+        delta_followers += df
+        delta_views += dv
+        delta_likes += dl
+        delta_comments += dc
+
+    return {
+        "total": {
+            "followers": total_followers,
+            "views": total_views,
+            "likes": total_likes,
+            "comments": total_comments,
+        },
+        "delta_24h": {
+            "followers": delta_followers,
+            "views": delta_views,
+            "likes": delta_likes,
+            "comments": delta_comments,
+        },
+        "accounts": accounts,
+        "hours": hours,
+    }
+
+
+def get_account_history(conn: sqlite3.Connection, account_name: str, hours: int = 168) -> list[dict[str, Any]]:
+    """Get time-series history for one account (default 7 days)."""
+    ensure_metrics_schema(conn)
+    rows = conn.execute("""
+        SELECT * FROM account_metrics_snapshots
+        WHERE account_name = ?
+        AND checked_at >= datetime('now', '-{} hours')
+        ORDER BY checked_at ASC
+    """.format(hours), (account_name,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ─── Entry Point ──────────────────────────────────────────────────────────────
+
+def start_checker_thread() -> threading.Thread:
+    """Start checker in background thread."""
+    t = threading.Thread(target=_checker_loop, daemon=True, name="metrics-checker")
+    t.start()
+    return t
+
+
+if __name__ == "__main__":
+    # Run one cycle for testing
+    checked = run_once()
+    print(f"Checked {checked} accounts")

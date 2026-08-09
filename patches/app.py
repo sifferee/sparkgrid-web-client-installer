@@ -844,6 +844,7 @@ _VERIFIER_STOP = threading.Event()
 _VERIFIER_THREAD: threading.Thread | None = None
 _BACKGROUND_STOP = threading.Event()
 _BACKGROUND_THREAD: threading.Thread | None = None
+_METRICS_THREAD: threading.Thread | None = None
 
 
 def _recover_background_state() -> None:
@@ -1010,7 +1011,7 @@ def _verifier_loop() -> None:
 
 @app.on_event("startup")
 def _start_publication_verifier() -> None:
-    global _VERIFIER_THREAD, _BACKGROUND_THREAD
+    global _VERIFIER_THREAD, _BACKGROUND_THREAD, _METRICS_THREAD
     ensure_schema()
     cleanup_run_diagnostics(trigger="startup")
     _recover_background_state()
@@ -1022,6 +1023,12 @@ def _start_publication_verifier() -> None:
         _BACKGROUND_STOP.clear()
         _BACKGROUND_THREAD = threading.Thread(target=_background_dispatcher_loop, name="automation-analytics-loop", daemon=True)
         _BACKGROUND_THREAD.start()
+    # Start Ads Power metrics checker
+    try:
+        import ads_power_checker
+        _METRICS_THREAD = ads_power_checker.start_checker_thread()
+    except Exception as exc:
+        print(f"[startup] metrics checker failed to start: {exc}")
 
 @app.on_event("shutdown")
 def _stop_publication_verifier() -> None:
@@ -5181,6 +5188,83 @@ async def read_log(category: str, lines: int = 100) -> dict[str, Any]:
             }
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+
+
+# ─── Ads Power Metrics Dashboard ─────────────────────────────────────────────
+
+@app.get("/api/ig-web-upload/metrics/overview")
+def metrics_overview(hours: int = 24) -> dict[str, Any]:
+    """Overview metrics for all accounts with delta."""
+    try:
+        import ads_power_checker
+        conn = db_conn()
+        try:
+            data = ads_power_checker.get_overview(conn, hours=hours)
+            return {"ok": True, **data}
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/ig-web-upload/metrics/{account_name}")
+def metrics_account(account_name: str, hours: int = 168) -> dict[str, Any]:
+    """Time-series history for one account."""
+    try:
+        import ads_power_checker
+        conn = db_conn()
+        try:
+            history = ads_power_checker.get_account_history(conn, account_name, hours=hours)
+            return {"ok": True, "account": account_name, "history": history}
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/ig-web-upload/metrics/config")
+async def metrics_config(request: Request) -> JSONResponse:
+    """Set Ads Power config (parser profiles, api url, enabled)."""
+    body = await request.json()
+    conn = db_conn()
+    try:
+        import ads_power_checker
+        ads_power_checker.ensure_metrics_schema(conn)
+        if "parser_profiles" in body:
+            ads_power_checker.set_config(conn, "parser_profiles", str(body["parser_profiles"]))
+        if "ads_power_api_url" in body:
+            ads_power_checker.set_config(conn, "ads_power_api_url", str(body["ads_power_api_url"]))
+        if "enabled" in body:
+            ads_power_checker.set_config(conn, "enabled", str(body["enabled"]))
+        return {"ok": True}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)})
+    finally:
+        conn.close()
+
+
+@app.post("/api/ig-web-upload/metrics/run")
+def metrics_run_now() -> dict[str, Any]:
+    """Trigger immediate metrics check cycle."""
+    try:
+        import threading
+        import ads_power_checker
+        t = threading.Thread(target=ads_power_checker.run_once, daemon=True, name="metrics-run-now")
+        t.start()
+        return {"ok": True, "message": "metrics check started"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/dashboard")
+def dashboard() -> FileResponse:
+    """Metrics dashboard page."""
+    dashboard_path = ROOT / "ui" / "dashboard.html"
+    if dashboard_path.exists():
+        return FileResponse(str(dashboard_path), headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        })
+    return JSONResponse({"ok": False, "error": "dashboard.html not found"}, status_code=404)
 
 
 if __name__ == "__main__":

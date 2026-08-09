@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SparkGrid — Metrics Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg: #0a0a0f;
+  --card: #15151f;
+  --border: #2a2a3a;
+  --text: #e4e4ed;
+  --muted: #8b8b9f;
+  --accent: #6c5ce7;
+  --green: #00b894;
+  --red: #ff6b6b;
+  --blue: #0984e3;
+  --orange: #e17055;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+  min-height: 100vh;
+}
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 30px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+.header h1 { font-size: 22px; font-weight: 600; }
+.header a { color: var(--accent); text-decoration: none; font-size: 14px; }
+.header a:hover { text-decoration: underline; }
+.refresh-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: opacity 0.2s;
+}
+.refresh-btn:hover { opacity: 0.85; }
+.container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+/* Overview cards */
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 30px;
+}
+.overview-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  text-align: center;
+}
+.overview-card .label { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.overview-card .value { font-size: 32px; font-weight: 700; margin: 8px 0; }
+.overview-card .delta { font-size: 13px; }
+.overview-card .delta.positive { color: var(--green); }
+.overview-card .delta.negative { color: var(--red); }
+.overview-card .delta.zero { color: var(--muted); }
+
+/* Account cards */
+.accounts-section { margin-top: 20px; }
+.accounts-section h2 { font-size: 18px; margin-bottom: 16px; }
+.accounts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  gap: 16px;
+}
+.account-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+.account-card:hover { border-color: var(--accent); }
+.account-card .acc-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.account-card .acc-name { font-size: 16px; font-weight: 600; }
+.account-card .acc-time { font-size: 11px; color: var(--muted); }
+.account-card .acc-error { font-size: 11px; color: var(--red); }
+.acc-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.acc-stat { text-align: center; }
+.acc-stat .stat-val { font-size: 16px; font-weight: 600; }
+.acc-stat .stat-label { font-size: 10px; color: var(--muted); text-transform: uppercase; }
+.acc-stat .stat-delta { font-size: 10px; }
+.acc-stat .stat-delta.positive { color: var(--green); }
+.acc-stat .stat-delta.negative { color: var(--red); }
+.acc-stat .stat-delta.zero { color: var(--muted); }
+.sparkline { height: 40px; margin-top: 8px; }
+
+/* Modal */
+.modal-overlay {
+  display: none;
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.7);
+  z-index: 1000;
+  justify-content: center;
+  align-items: center;
+}
+.modal-overlay.active { display: flex; }
+.modal {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 24px;
+  width: 90%;
+  max-width: 800px;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+.modal-header h2 { font-size: 20px; }
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 24px;
+  cursor: pointer;
+}
+.chart-container { height: 300px; margin-bottom: 16px; }
+
+/* Config */
+.config-section {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 24px;
+}
+.config-section h3 { font-size: 15px; margin-bottom: 12px; color: var(--muted); }
+.config-row { display: flex; gap: 12px; margin-bottom: 10px; align-items: center; }
+.config-row label { font-size: 13px; min-width: 140px; color: var(--muted); }
+.config-row input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.config-row button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+/* Loading */
+.loading { text-align: center; padding: 40px; color: var(--muted); }
+.empty { text-align: center; padding: 40px; color: var(--muted); font-size: 14px; }
+
+/* Status indicator */
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+.status-dot.ok { background: var(--green); }
+.status-dot.error { background: var(--red); }
+.status-dot.pending { background: var(--orange); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>📊 Metrics Dashboard</h1>
+    <span style="font-size:12px;color:var(--muted)">SparkGrid Analytics</span>
+  </div>
+  <div style="display:flex;gap:12px;align-items:center">
+    <a href="/">← Back to SparkGrid</a>
+    <button class="refresh-btn" onclick="loadOverview()">Refresh</button>
+    <button class="refresh-btn" onclick="runCheckNow()" style="background:var(--orange)">Check Now</button>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- Config section -->
+  <div class="config-section">
+    <h3>⚙️ Ads Power Configuration</h3>
+    <div class="config-row">
+      <label>Parser Profile IDs:</label>
+      <input type="text" id="parser_profiles" placeholder="profile1,profile2" />
+    </div>
+    <div class="config-row">
+      <label>Ads Power API URL:</label>
+      <input type="text" id="ads_power_api_url" placeholder="http://localhost:50325" value="http://localhost:50325" />
+    </div>
+    <div class="config-row">
+      <label></label>
+      <button onclick="saveConfig()">Save Config</button>
+    </div>
+  </div>
+
+  <!-- Overview -->
+  <div id="overview-section">
+    <div class="overview-grid" id="overview-cards">
+      <div class="loading">Loading overview...</div>
+    </div>
+  </div>
+
+  <!-- Accounts -->
+  <div class="accounts-section">
+    <h2>Account Metrics</h2>
+    <div class="accounts-grid" id="accounts-grid">
+      <div class="loading">Loading accounts...</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Modal for account detail -->
+<div class="modal-overlay" id="modal" onclick="closeModal(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <h2 id="modal-title">Account</h2>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="chart-container">
+      <canvas id="chart-followers"></canvas>
+    </div>
+    <div class="chart-container">
+      <canvas id="chart-views"></canvas>
+    </div>
+    <div class="chart-container">
+      <canvas id="chart-likes"></canvas>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let charts = {};
+
+async function fetchJSON(url) {
+  const resp = await fetch(url);
+  return resp.json();
+}
+
+function formatNum(n) {
+  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n/1000).toFixed(1) + 'K';
+  return String(n);
+}
+
+function formatDelta(d) {
+  if (d > 0) return '+' + formatNum(d);
+  if (d < 0) return formatNum(d);
+  return '0';
+}
+
+function deltaClass(d) {
+  if (d > 0) return 'positive';
+  if (d < 0) return 'negative';
+  return 'zero';
+}
+
+async function loadOverview() {
+  try {
+    const data = await fetchJSON(`${API}/api/ig-web-upload/metrics/overview?hours=24`);
+    if (!data.ok) {
+      document.getElementById('overview-cards').innerHTML = '<div class="empty">No data yet. Configure parser profiles and run a check.</div>';
+      document.getElementById('accounts-grid').innerHTML = '<div class="empty">No account data.</div>';
+      return;
+    }
+
+    // Overview cards
+    const t = data.total;
+    const d = data.delta_24h;
+    const cards = [
+      {label: 'Followers', value: t.followers, delta: d.followers},
+      {label: 'Views', value: t.views, delta: d.views},
+      {label: 'Likes', value: t.likes, delta: d.likes},
+      {label: 'Comments', value: t.comments, delta: d.comments},
+    ];
+    document.getElementById('overview-cards').innerHTML = cards.map(c => `
+      <div class="overview-card">
+        <div class="label">${c.label}</div>
+        <div class="value">${formatNum(c.value)}</div>
+        <div class="delta ${deltaClass(c.delta)}">${formatDelta(c.delta)} (24h)</div>
+      </div>
+    `).join('');
+
+    // Account cards
+    if (!data.accounts || data.accounts.length === 0) {
+      document.getElementById('accounts-grid').innerHTML = '<div class="empty">No accounts checked yet.</div>';
+      return;
+    }
+
+    document.getElementById('accounts-grid').innerHTML = data.accounts.map(a => {
+      const dl = a.delta || {};
+      const errBadge = a.error ? `<div class="acc-error">⚠️ ${a.error.slice(0,40)}</div>` : '';
+      const statusClass = a.error ? 'error' : 'ok';
+      return `
+        <div class="account-card" onclick="openModal('${a.name}')">
+          <div class="acc-header">
+            <div>
+              <span class="status-dot ${statusClass}"></span>
+              <span class="acc-name">${a.name}</span>
+            </div>
+            <div class="acc-time">${a.checked_at || '—'}</div>
+          </div>
+          ${errBadge}
+          <div class="acc-stats">
+            <div class="acc-stat">
+              <div class="stat-val">${formatNum(a.followers)}</div>
+              <div class="stat-label">Followers</div>
+              <div class="stat-delta ${deltaClass(dl.followers||0)}">${formatDelta(dl.followers||0)}</div>
+            </div>
+            <div class="acc-stat">
+              <div class="stat-val">${formatNum(a.total_views)}</div>
+              <div class="stat-label">Views</div>
+              <div class="stat-delta ${deltaClass(dl.views||0)}">${formatDelta(dl.views||0)}</div>
+            </div>
+            <div class="acc-stat">
+              <div class="stat-val">${formatNum(a.total_likes)}</div>
+              <div class="stat-label">Likes</div>
+              <div class="stat-delta ${deltaClass(dl.likes||0)}">${formatDelta(dl.likes||0)}</div>
+            </div>
+            <div class="acc-stat">
+              <div class="stat-val">${formatNum(a.total_comments)}</div>
+              <div class="stat-label">Comments</div>
+              <div class="stat-delta ${deltaClass(dl.comments||0)}">${formatDelta(dl.comments||0)}</div>
+            </div>
+          </div>
+          <div class="acc-stats" style="margin-top:4px">
+            <div class="acc-stat">
+              <div class="stat-val" style="font-size:13px;color:var(--orange)">${a.active_stories_count||0}</div>
+              <div class="stat-label">Recent Reels</div>
+            </div>
+            <div class="acc-stat">
+              <div class="stat-val" style="font-size:13px;color:var(--blue)">${a.posts_count||0}</div>
+              <div class="stat-label">Total Posts</div>
+            </div>
+            <div class="acc-stat">
+              <div class="stat-val" style="font-size:13px;color:var(--muted)">${a.following||0}</div>
+              <div class="stat-label">Following</div>
+            </div>
+          </div>
+          <canvas class="sparkline" id="spark-${a.name.replace(/[^a-zA-Z0-9]/g,'')}" height="40"></canvas>
+        </div>
+      `;
+    }).join('');
+
+    // Draw sparklines
+    for (const a of data.accounts) {
+      drawSparkline(a.name);
+    }
+
+  } catch (e) {
+    document.getElementById('overview-cards').innerHTML = `<div class="empty">Error: ${e.message}</div>`;
+  }
+}
+
+async function drawSparkline(accountName) {
+  try {
+    const data = await fetchJSON(`${API}/api/ig-web-upload/metrics/${accountName}?hours=168`);
+    if (!data.ok || !data.history || data.history.length === 0) return;
+    const canvasId = `spark-${accountName.replace(/[^a-zA-Z0-9]/g,'')}`;
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+
+    const labels = data.history.map(h => h.checked_at.slice(11, 16));
+    const followers = data.history.map(h => h.followers || 0);
+
+    new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          data: followers,
+          borderColor: '#6c5ce7',
+          backgroundColor: 'rgba(108,92,231,0.1)',
+          borderWidth: 1.5,
+          fill: true,
+          pointRadius: 0,
+          tension: 0.3,
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false }, tooltip: { enabled: false } },
+        scales: { x: { display: false }, y: { display: false } },
+        animation: false,
+      }
+    });
+  } catch (e) {}
+}
+
+async function openModal(accountName) {
+  document.getElementById('modal-title').textContent = '@' + accountName;
+  document.getElementById('modal').classList.add('active');
+
+  // Destroy old charts
+  Object.values(charts).forEach(c => c.destroy());
+  charts = {};
+
+  try {
+    const data = await fetchJSON(`${API}/api/ig-web-upload/metrics/${accountName}?hours=168`);
+    if (!data.ok || !data.history || data.history.length === 0) return;
+
+    const labels = data.history.map(h => h.checked_at.slice(5, 16));
+    const followers = data.history.map(h => h.followers || 0);
+    const views = data.history.map(h => h.total_views || 0);
+    const likes = data.history.map(h => h.total_likes || 0);
+
+    charts.followers = new Chart(document.getElementById('chart-followers'), {
+      type: 'line',
+      data: { labels, datasets: [{ label: 'Followers', data: followers, borderColor: '#6c5ce7', backgroundColor: 'rgba(108,92,231,0.1)', fill: true, tension: 0.3 }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+    });
+
+    charts.views = new Chart(document.getElementById('chart-views'), {
+      type: 'line',
+      data: { labels, datasets: [{ label: 'Views', data: views, borderColor: '#0984e3', backgroundColor: 'rgba(9,132,227,0.1)', fill: true, tension: 0.3 }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+    });
+
+    charts.likes = new Chart(document.getElementById('chart-likes'), {
+      type: 'line',
+      data: { labels, datasets: [{ label: 'Likes', data: likes, borderColor: '#00b894', backgroundColor: 'rgba(0,184,148,0.1)', fill: true, tension: 0.3 }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+    });
+  } catch (e) {
+    console.error('Modal error:', e);
+  }
+}
+
+function closeModal(e) {
+  if (e && e.target !== document.getElementById('modal') && e.type === 'click') return;
+  document.getElementById('modal').classList.remove('active');
+  Object.values(charts).forEach(c => c.destroy());
+  charts = {};
+}
+
+async function saveConfig() {
+  const profiles = document.getElementById('parser_profiles').value;
+  const apiUrl = document.getElementById('ads_power_api_url').value;
+  try {
+    const resp = await fetch(`${API}/api/ig-web-upload/metrics/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parser_profiles: profiles, ads_power_api_url: apiUrl })
+    });
+    const data = await resp.json();
+    if (data.ok) alert('Config saved!');
+    else alert('Error: ' + data.error);
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
+}
+
+async function runCheckNow() {
+  try {
+    const resp = await fetch(`${API}/api/ig-web-upload/metrics/run`, { method: 'POST' });
+    const data = await resp.json();
+    if (data.ok) {
+      alert('Check started! Wait ~2 min and refresh.');
+      setTimeout(loadOverview, 120000);
+    } else {
+      alert('Error: ' + data.error);
+    }
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
+}
+
+// Load config on start
+async function loadConfig() {
+  try {
+    const data = await fetchJSON(`${API}/api/ig-web-upload/metrics/overview`);
+    // Config is stored in DB, we read it from the overview endpoint indirectly
+  } catch (e) {}
+}
+
+// Init
+loadOverview();
+loadConfig();
+setInterval(loadOverview, 300000); // auto-refresh every 5 min
+</script>
+
+</body>
+</html>
