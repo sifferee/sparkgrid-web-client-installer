@@ -3,518 +3,231 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SparkGrid — Metrics Dashboard</title>
+<title>SparkGrid — Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
-:root {
-  --bg: #0a0a0f;
-  --card: #15151f;
-  --border: #2a2a3a;
-  --text: #e4e4ed;
-  --muted: #8b8b9f;
-  --accent: #6c5ce7;
-  --green: #00b894;
-  --red: #ff6b6b;
-  --blue: #0984e3;
-  --orange: #e17055;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
-  min-height: 100vh;
-}
-.header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 20px 30px;
-  border-bottom: 1px solid var(--border);
-  background: var(--card);
-}
-.header h1 { font-size: 22px; font-weight: 600; }
-.header a { color: var(--accent); text-decoration: none; font-size: 14px; }
-.header a:hover { text-decoration: underline; }
-.refresh-btn {
-  background: var(--accent);
-  color: #fff;
-  border: none;
-  padding: 8px 16px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 13px;
-  transition: opacity 0.2s;
-}
-.refresh-btn:hover { opacity: 0.85; }
-.container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+:root{--bg:#0a0a0f;--card:#12121a;--card2:#0f0f17;--border:#1e1e2e;--border2:#2a2a3a;--txt:#e4e4ed;--txt2:#8b8b9f;--txt3:#5a5a6e;--accent:#6c5ce7;--green:#00b894;--red:#ff6b6b;--blue:#0984e3;--orange:#e17055;--pink:#fd79a8;--yellow:#fdcb6e}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:-apple-system,'Segoe UI',Roboto,sans-serif;font-size:14px;overflow-x:hidden}
+a{color:var(--accent);text-decoration:none}
+button{cursor:pointer;font-family:inherit}
 
-/* Overview cards */
-.overview-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 16px;
-  margin-bottom: 30px;
-}
-.overview-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 20px;
-  text-align: center;
-}
-.overview-card .label { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
-.overview-card .value { font-size: 32px; font-weight: 700; margin: 8px 0; }
-.overview-card .delta { font-size: 13px; }
-.overview-card .delta.positive { color: var(--green); }
-.overview-card .delta.negative { color: var(--red); }
-.overview-card .delta.zero { color: var(--muted); }
+/* Header */
+.hdr{position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:12px 20px;background:rgba(10,10,15,.92);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.hdr-l{display:flex;align-items:center;gap:10px}
+.hdr-logo{font-size:18px;font-weight:700;background:linear-gradient(135deg,var(--accent),var(--pink));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hdr-sub{font-size:11px;color:var(--txt3)}
+.hdr-r{display:flex;gap:8px;align-items:center}
+.btn-sm{background:var(--card);border:1px solid var(--border2);color:var(--txt);padding:6px 14px;border-radius:8px;font-size:12px;transition:.15s}
+.btn-sm:hover{border-color:var(--accent);background:rgba(108,92,231,.1)}
+.btn-prim{background:var(--accent);border:none;color:#fff;padding:6px 14px;border-radius:8px;font-size:12px}
+.btn-prim:hover{opacity:.85}
+.btn-warn{background:var(--orange);border:none;color:#fff;padding:6px 14px;border-radius:8px;font-size:12px}
 
-/* Account cards */
-.accounts-section { margin-top: 20px; }
-.accounts-section h2 { font-size: 18px; margin-bottom: 16px; }
-.accounts-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-  gap: 16px;
-}
-.account-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px;
-  cursor: pointer;
-  transition: border-color 0.2s;
-}
-.account-card:hover { border-color: var(--accent); }
-.account-card .acc-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 12px;
-}
-.account-card .acc-name { font-size: 16px; font-weight: 600; }
-.account-card .acc-time { font-size: 11px; color: var(--muted); }
-.account-card .acc-error { font-size: 11px; color: var(--red); }
-.acc-stats {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 8px;
-  margin-bottom: 8px;
-}
-.acc-stat { text-align: center; }
-.acc-stat .stat-val { font-size: 16px; font-weight: 600; }
-.acc-stat .stat-label { font-size: 10px; color: var(--muted); text-transform: uppercase; }
-.acc-stat .stat-delta { font-size: 10px; }
-.acc-stat .stat-delta.positive { color: var(--green); }
-.acc-stat .stat-delta.negative { color: var(--red); }
-.acc-stat .stat-delta.zero { color: var(--muted); }
-.sparkline { height: 40px; margin-top: 8px; }
+.wrap{max-width:1500px;margin:0 auto;padding:16px}
+
+/* KPI Row */
+.kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.kpi{background:linear-gradient(145deg,var(--card),var(--card2));border:1px solid var(--border);border-radius:14px;padding:16px;position:relative;overflow:hidden}
+.kpi::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--pink),var(--blue))}
+.kpi .lbl{font-size:10px;color:var(--txt3);text-transform:uppercase;letter-spacing:.8px;font-weight:600}
+.kpi .val{font-size:26px;font-weight:700;margin:4px 0;line-height:1}
+.kpi .dlt{font-size:11px;font-weight:600;display:inline-flex;align-items:center;gap:4px}
+.dlt.up{color:var(--green)}.dlt.down{color:var(--red)}.dlt.flat{color:var(--txt3)}
+
+/* Accounts Table */
+.sec{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+.sec-hdr{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border)}
+.sec-hdr h2{font-size:14px;font-weight:600}
+.sec-hdr .cnt{font-size:11px;color:var(--txt3)}
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{font-size:10px;color:var(--txt3);text-transform:uppercase;letter-spacing:.5px;font-weight:600;padding:8px 12px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap}
+.tbl th.r{text-align:right}
+.tbl td{padding:8px 12px;font-size:13px;border-bottom:1px solid var(--border);white-space:nowrap}
+.tbl td.r{text-align:right}
+.tbl tr{transition:.1s;cursor:pointer}
+.tbl tr:hover td{background:rgba(108,92,231,.06)}
+.tbl tr:last-child td{border-bottom:none}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px}
+.dot.ok{background:var(--green)}.dot.err{background:var(--red)}.dot.new{background:var(--orange)}
+.acc-name{font-weight:600}
+.stat-val{font-weight:600;font-size:13px}
+.delta{font-size:11px;font-weight:600}
+.delta.up{color:var(--green)}.delta.down{color:var(--red)}.delta.flat{color:var(--txt3)}
+.spark{width:60px;height:20px;display:inline-block;vertical-align:middle}
 
 /* Modal */
-.modal-overlay {
-  display: none;
-  position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
-  background: rgba(0,0,0,0.7);
-  z-index: 1000;
-  justify-content: center;
-  align-items: center;
-}
-.modal-overlay.active { display: flex; }
-.modal {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 24px;
-  width: 90%;
-  max-width: 800px;
-  max-height: 85vh;
-  overflow-y: auto;
-}
-.modal-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 20px;
-}
-.modal-header h2 { font-size: 20px; }
-.modal-close {
-  background: none;
-  border: none;
-  color: var(--muted);
-  font-size: 24px;
-  cursor: pointer;
-}
-.chart-container { height: 300px; margin-bottom: 16px; }
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;justify-content:center;align-items:center;backdrop-filter:blur(4px)}
+.modal-bg.on{display:flex}
+.modal{background:var(--card);border:1px solid var(--border2);border-radius:18px;padding:20px;width:90%;max-width:750px;max-height:80vh;overflow-y:auto}
+.modal-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.modal-hdr h2{font-size:18px;font-weight:700}
+.modal-x{background:none;border:none;color:var(--txt3);font-size:22px}
+.chart-box{height:220px;margin-bottom:12px;position:relative}
+.chart-box h3{font-size:11px;color:var(--txt3);text-transform:uppercase;margin-bottom:4px}
 
 /* Config */
-.config-section {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 20px;
-  margin-bottom: 24px;
-}
-.config-section h3 { font-size: 15px; margin-bottom: 12px; color: var(--muted); }
-.config-row { display: flex; gap: 12px; margin-bottom: 10px; align-items: center; }
-.config-row label { font-size: 13px; min-width: 140px; color: var(--muted); }
-.config-row input {
-  flex: 1;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  color: var(--text);
-  padding: 8px 12px;
-  border-radius: 8px;
-  font-size: 13px;
-}
-.config-row button {
-  background: var(--accent);
-  color: #fff;
-  border: none;
-  padding: 8px 16px;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 13px;
-}
+.cfg{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;margin-bottom:16px}
+.cfg h3{font-size:12px;color:var(--txt2);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
+.cfg-row{display:flex;gap:10px;align-items:center;margin-bottom:8px}
+.cfg-row label{font-size:12px;min-width:130px;color:var(--txt2)}
+.cfg-row input{flex:1;background:var(--bg);border:1px solid var(--border2);color:var(--txt);padding:7px 10px;border-radius:8px;font-size:12px}
+.cfg-row button{background:var(--accent);color:#fff;border:none;padding:7px 16px;border-radius:8px;font-size:12px}
 
-/* Loading */
-.loading { text-align: center; padding: 40px; color: var(--muted); }
-.empty { text-align: center; padding: 40px; color: var(--muted); font-size: 14px; }
-
-/* Status indicator */
-.status-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  margin-right: 6px;
-}
-.status-dot.ok { background: var(--green); }
-.status-dot.error { background: var(--red); }
-.status-dot.pending { background: var(--orange); }
+.empty{padding:40px;text-align:center;color:var(--txt3);font-size:13px}
+@media(max-width:900px){.kpi-row{grid-template-columns:repeat(2,1fr)}.tbl{font-size:11px}.tbl th,.tbl td{padding:6px 8px}}
 </style>
 </head>
 <body>
 
-<div class="header">
-  <div>
-    <h1>📊 Metrics Dashboard</h1>
-    <span style="font-size:12px;color:var(--muted)">SparkGrid Analytics</span>
+<div class="hdr">
+  <div class="hdr-l">
+    <span class="hdr-logo">📊 SparkGrid</span>
+    <span class="hdr-sub">Metrics Dashboard</span>
   </div>
-  <div style="display:flex;gap:12px;align-items:center">
-    <a href="/">← Back to SparkGrid</a>
-    <button class="refresh-btn" onclick="loadOverview()">Refresh</button>
-    <button class="refresh-btn" onclick="runCheckNow()" style="background:var(--orange)">Check Now</button>
+  <div class="hdr-r">
+    <a href="/" class="btn-sm">← Back</a>
+    <button class="btn-sm" onclick="loadData()">Refresh</button>
+    <button class="btn-warn" onclick="runCheck()">Check Now</button>
   </div>
 </div>
 
-<div class="container">
-
-  <!-- Config section -->
-  <div class="config-section">
-    <h3>⚙️ Ads Power Configuration</h3>
-    <div class="config-row">
-      <label>Parser Profile IDs:</label>
-      <input type="text" id="parser_profiles" placeholder="profile1,profile2" />
-    </div>
-    <div class="config-row">
-      <label>Ads Power API URL:</label>
-      <input type="text" id="ads_power_api_url" placeholder="http://localhost:50325" value="http://localhost:50325" />
-    </div>
-    <div class="config-row">
-      <label></label>
-      <button onclick="saveConfig()">Save Config</button>
-    </div>
+<div class="wrap">
+  <!-- Config -->
+  <div class="cfg" id="cfgBox" style="display:none">
+    <h3>⚙️ Ads Power Config</h3>
+    <div class="cfg-row"><label>Parser Profile IDs:</label><input id="cfgProfiles" placeholder="id1,id2"></div>
+    <div class="cfg-row"><label>API URL:</label><input id="cfgUrl" value="http://local.adspower.net:50325"></div>
+    <div class="cfg-row"><label>API Key:</label><input id="cfgKey" type="password"></div>
+    <div class="cfg-row"><label></label><button onclick="saveCfg()">Save</button></div>
   </div>
 
-  <!-- Overview -->
-  <div id="overview-section">
-    <div class="overview-grid" id="overview-cards">
-      <div class="loading">Loading overview...</div>
-    </div>
-  </div>
+  <!-- KPIs -->
+  <div class="kpi-row" id="kpis"><div class="empty">Loading...</div></div>
 
   <!-- Accounts -->
-  <div class="accounts-section">
-    <h2>Account Metrics</h2>
-    <div class="accounts-grid" id="accounts-grid">
-      <div class="loading">Loading accounts...</div>
+  <div class="sec">
+    <div class="sec-hdr">
+      <h2>Account Metrics</h2>
+      <span class="cnt" id="accCount"></span>
     </div>
+    <table class="tbl" id="tbl">
+      <thead><tr>
+        <th></th><th>Account</th><th class="r">Followers</th><th class="r">Views</th>
+        <th class="r">Likes</th><th class="r">Comments</th><th class="r">Posts</th>
+        <th class="r">Reels</th><th>Last Check</th><th></th>
+      </tr></thead>
+      <tbody id="tb"></tbody>
+    </table>
   </div>
-
 </div>
 
-<!-- Modal for account detail -->
-<div class="modal-overlay" id="modal" onclick="closeModal(event)">
+<!-- Modal -->
+<div class="modal-bg" id="modalBg" onclick="closeModal(event)">
   <div class="modal" onclick="event.stopPropagation()">
-    <div class="modal-header">
-      <h2 id="modal-title">Account</h2>
-      <button class="modal-close" onclick="closeModal()">×</button>
-    </div>
-    <div class="chart-container">
-      <canvas id="chart-followers"></canvas>
-    </div>
-    <div class="chart-container">
-      <canvas id="chart-views"></canvas>
-    </div>
-    <div class="chart-container">
-      <canvas id="chart-likes"></canvas>
-    </div>
+    <div class="modal-hdr"><h2 id="mTitle"></h2><button class="modal-x" onclick="closeModal()">×</button></div>
+    <div class="chart-box"><h3>Followers</h3><canvas id="cFollowers"></canvas></div>
+    <div class="chart-box"><h3>Views</h3><canvas id="cViews"></canvas></div>
+    <div class="chart-box"><h3>Likes</h3><canvas id="cLikes"></canvas></div>
   </div>
 </div>
 
 <script>
-const API = '';
-let charts = {};
+let CH={};
+function fmt(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return''+n}
+function dlt(d){if(d>0)return'+'+fmt(d);if(d<0)return fmt(d);return'0'}
+function dc(d){return d>0?'up':d<0?'down':'flat'}
 
-async function fetchJSON(url) {
-  const resp = await fetch(url);
-  return resp.json();
-}
+async function loadData(){
+  try{
+    const r=await fetch('/api/ig-web-upload/metrics/overview?hours=24');
+    const d=await r.json();
+    if(!d.ok){document.getElementById('kpis').innerHTML='<div class="empty">No data yet. Click "Check Now".</div>';document.getElementById('tb').innerHTML='';return}
 
-function formatNum(n) {
-  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
-  if (n >= 1000) return (n/1000).toFixed(1) + 'K';
-  return String(n);
-}
-
-function formatDelta(d) {
-  if (d > 0) return '+' + formatNum(d);
-  if (d < 0) return formatNum(d);
-  return '0';
-}
-
-function deltaClass(d) {
-  if (d > 0) return 'positive';
-  if (d < 0) return 'negative';
-  return 'zero';
-}
-
-async function loadOverview() {
-  try {
-    const data = await fetchJSON(`${API}/api/ig-web-upload/metrics/overview?hours=24`);
-    if (!data.ok) {
-      document.getElementById('overview-cards').innerHTML = '<div class="empty">No data yet. Configure parser profiles and run a check.</div>';
-      document.getElementById('accounts-grid').innerHTML = '<div class="empty">No account data.</div>';
-      return;
-    }
-
-    // Overview cards
-    const t = data.total;
-    const d = data.delta_24h;
-    const cards = [
-      {label: 'Followers', value: t.followers, delta: d.followers},
-      {label: 'Views', value: t.views, delta: d.views},
-      {label: 'Likes', value: t.likes, delta: d.likes},
-      {label: 'Comments', value: t.comments, delta: d.comments},
+    // KPIs
+    const t=d.total,dl=d.delta_24h;
+    const kpis=[
+      {l:'Followers',v:t.followers,d:dl.followers,c:'#6c5ce7'},
+      {l:'Views',v:t.views,d:dl.views,c:'#0984e3'},
+      {l:'Likes',v:t.likes,d:dl.likes,c:'#00b894'},
+      {l:'Comments',v:t.comments,d:dl.comments,c:'#fdcb6e'},
     ];
-    document.getElementById('overview-cards').innerHTML = cards.map(c => `
-      <div class="overview-card">
-        <div class="label">${c.label}</div>
-        <div class="value">${formatNum(c.value)}</div>
-        <div class="delta ${deltaClass(c.delta)}">${formatDelta(c.delta)} (24h)</div>
-      </div>
-    `).join('');
+    document.getElementById('kpis').innerHTML=kpis.map(k=>`
+      <div class="kpi">
+        <div class="lbl">${k.l}</div>
+        <div class="val" style="color:${k.c}">${fmt(k.v)}</div>
+        <div class="dlt ${dc(k.d)}">${k.d>0?'▲':k.d<0?'▼':'●'} ${dlt(k.d)} (24h)</div>
+      </div>`).join('');
 
-    // Account cards
-    if (!data.accounts || data.accounts.length === 0) {
-      document.getElementById('accounts-grid').innerHTML = '<div class="empty">No accounts checked yet.</div>';
-      return;
-    }
-
-    document.getElementById('accounts-grid').innerHTML = data.accounts.map(a => {
-      const dl = a.delta || {};
-      const errBadge = a.error ? `<div class="acc-error">⚠️ ${a.error.slice(0,40)}</div>` : '';
-      const statusClass = a.error ? 'error' : 'ok';
-      return `
-        <div class="account-card" onclick="openModal('${a.name}')">
-          <div class="acc-header">
-            <div>
-              <span class="status-dot ${statusClass}"></span>
-              <span class="acc-name">${a.name}</span>
-            </div>
-            <div class="acc-time">${a.checked_at || '—'}</div>
-          </div>
-          ${errBadge}
-          <div class="acc-stats">
-            <div class="acc-stat">
-              <div class="stat-val">${formatNum(a.followers)}</div>
-              <div class="stat-label">Followers</div>
-              <div class="stat-delta ${deltaClass(dl.followers||0)}">${formatDelta(dl.followers||0)}</div>
-            </div>
-            <div class="acc-stat">
-              <div class="stat-val">${formatNum(a.total_views)}</div>
-              <div class="stat-label">Views</div>
-              <div class="stat-delta ${deltaClass(dl.views||0)}">${formatDelta(dl.views||0)}</div>
-            </div>
-            <div class="acc-stat">
-              <div class="stat-val">${formatNum(a.total_likes)}</div>
-              <div class="stat-label">Likes</div>
-              <div class="stat-delta ${deltaClass(dl.likes||0)}">${formatDelta(dl.likes||0)}</div>
-            </div>
-            <div class="acc-stat">
-              <div class="stat-val">${formatNum(a.total_comments)}</div>
-              <div class="stat-label">Comments</div>
-              <div class="stat-delta ${deltaClass(dl.comments||0)}">${formatDelta(dl.comments||0)}</div>
-            </div>
-          </div>
-          <div class="acc-stats" style="margin-top:4px">
-            <div class="acc-stat">
-              <div class="stat-val" style="font-size:13px;color:var(--orange)">${a.active_stories_count||0}</div>
-              <div class="stat-label">Recent Reels</div>
-            </div>
-            <div class="acc-stat">
-              <div class="stat-val" style="font-size:13px;color:var(--blue)">${a.posts_count||0}</div>
-              <div class="stat-label">Total Posts</div>
-            </div>
-            <div class="acc-stat">
-              <div class="stat-val" style="font-size:13px;color:var(--muted)">${a.following||0}</div>
-              <div class="stat-label">Following</div>
-            </div>
-          </div>
-          <canvas class="sparkline" id="spark-${a.name.replace(/[^a-zA-Z0-9]/g,'')}" height="40"></canvas>
-        </div>
-      `;
+    // Accounts table
+    const accs=d.accounts||[];
+    document.getElementById('accCount').textContent=accs.length+' accounts';
+    document.getElementById('tb').innerHTML=accs.map(a=>{
+      const dl=a.delta||{};
+      const st=a.error?'err':'ok';
+      const err=a.error?`<span style="font-size:10px;color:var(--red)">⚠ ${a.error.slice(0,30)}</span>`:'';
+      const fid=a.name.replace(/[^a-zA-Z0-9]/g,'');
+      return `<tr onclick="openModal('${a.name}')">
+        <td><span class="dot ${st}"></span></td>
+        <td><span class="acc-name">${a.name}</span><br>${err}</td>
+        <td class="r"><span class="stat-val">${fmt(a.followers)}</span><br><span class="delta ${dc(dl.followers||0)}">${dlt(dl.followers||0)}</span></td>
+        <td class="r"><span class="stat-val">${fmt(a.total_views)}</span><br><span class="delta ${dc(dl.views||0)}">${dlt(dl.views||0)}</span></td>
+        <td class="r"><span class="stat-val">${fmt(a.total_likes)}</span><br><span class="delta ${dc(dl.likes||0)}">${dlt(dl.likes||0)}</span></td>
+        <td class="r">${fmt(a.total_comments)}</td>
+        <td class="r">${fmt(a.posts_count)}</td>
+        <td class="r" style="color:var(--orange)">${a.active_stories_count||0}</td>
+        <td style="font-size:10px;color:var(--txt3)">${a.checked_at?a.checked_at.slice(11,16):'—'}</td>
+        <td><canvas class="spark" id="s${fid}" width="60" height="20"></canvas></td>
+      </tr>`;
     }).join('');
 
     // Draw sparklines
-    for (const a of data.accounts) {
-      drawSparkline(a.name);
-    }
-
-  } catch (e) {
-    document.getElementById('overview-cards').innerHTML = `<div class="empty">Error: ${e.message}</div>`;
-  }
+    for(const a of accs){drawSpark(a.name)}
+  }catch(e){document.getElementById('kpis').innerHTML='<div class="empty">Error: '+e.message+'</div>'}
 }
 
-async function drawSparkline(accountName) {
-  try {
-    const data = await fetchJSON(`${API}/api/ig-web-upload/metrics/${accountName}?hours=168`);
-    if (!data.ok || !data.history || data.history.length === 0) return;
-    const canvasId = `spark-${accountName.replace(/[^a-zA-Z0-9]/g,'')}`;
-    const canvas = document.getElementById(canvasId);
-    if (!canvas) return;
-
-    const labels = data.history.map(h => h.checked_at.slice(11, 16));
-    const followers = data.history.map(h => h.followers || 0);
-
-    new Chart(canvas, {
-      type: 'line',
-      data: {
-        labels,
-        datasets: [{
-          data: followers,
-          borderColor: '#6c5ce7',
-          backgroundColor: 'rgba(108,92,231,0.1)',
-          borderWidth: 1.5,
-          fill: true,
-          pointRadius: 0,
-          tension: 0.3,
-        }]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: { legend: { display: false }, tooltip: { enabled: false } },
-        scales: { x: { display: false }, y: { display: false } },
-        animation: false,
-      }
-    });
-  } catch (e) {}
+async function drawSpark(name){
+  try{
+    const r=await fetch(`/api/ig-web-upload/metrics/${name}?hours=168`);
+    const d=await r.json();
+    if(!d.ok||!d.history||d.history.length<2)return;
+    const fid='s'+name.replace(/[^a-zA-Z0-9]/g,'');
+    const cv=document.getElementById(fid);
+    if(!cv)return;
+    new Chart(cv,{type:'line',data:{labels:d.history.map(h=>h.checked_at.slice(11,16)),datasets:[{data:d.history.map(h=>h.followers||0),borderColor:'#6c5ce7',borderWidth:1,fill:false,pointRadius:0,tension:.3}]},options:{responsive:false,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false}},animation:false,height:20}})
+  }catch(e){}
 }
 
-async function openModal(accountName) {
-  document.getElementById('modal-title').textContent = '@' + accountName;
-  document.getElementById('modal').classList.add('active');
-
-  // Destroy old charts
-  Object.values(charts).forEach(c => c.destroy());
-  charts = {};
-
-  try {
-    const data = await fetchJSON(`${API}/api/ig-web-upload/metrics/${accountName}?hours=168`);
-    if (!data.ok || !data.history || data.history.length === 0) return;
-
-    const labels = data.history.map(h => h.checked_at.slice(5, 16));
-    const followers = data.history.map(h => h.followers || 0);
-    const views = data.history.map(h => h.total_views || 0);
-    const likes = data.history.map(h => h.total_likes || 0);
-
-    charts.followers = new Chart(document.getElementById('chart-followers'), {
-      type: 'line',
-      data: { labels, datasets: [{ label: 'Followers', data: followers, borderColor: '#6c5ce7', backgroundColor: 'rgba(108,92,231,0.1)', fill: true, tension: 0.3 }] },
-      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
-    });
-
-    charts.views = new Chart(document.getElementById('chart-views'), {
-      type: 'line',
-      data: { labels, datasets: [{ label: 'Views', data: views, borderColor: '#0984e3', backgroundColor: 'rgba(9,132,227,0.1)', fill: true, tension: 0.3 }] },
-      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
-    });
-
-    charts.likes = new Chart(document.getElementById('chart-likes'), {
-      type: 'line',
-      data: { labels, datasets: [{ label: 'Likes', data: likes, borderColor: '#00b894', backgroundColor: 'rgba(0,184,148,0.1)', fill: true, tension: 0.3 }] },
-      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
-    });
-  } catch (e) {
-    console.error('Modal error:', e);
-  }
+async function openModal(name){
+  document.getElementById('mTitle').textContent='@'+name;
+  document.getElementById('modalBg').classList.add('on');
+  Object.values(CH).forEach(c=>c.destroy());CH={};
+  try{
+    const r=await fetch(`/api/ig-web-upload/metrics/${name}?hours=168`);
+    const d=await r.json();
+    if(!d.ok||!d.history||d.history.length<2)return;
+    const lb=d.history.map(h=>h.checked_at.slice(5,16));
+    CH.f=new Chart(document.getElementById('cFollowers'),{type:'line',data:{labels:lb,datasets:[{data:d.history.map(h=>h.followers||0),borderColor:'#6c5ce7',backgroundColor:'rgba(108,92,231,.08)',fill:true,tension:.3,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}}}})
+    CH.v=new Chart(document.getElementById('cViews'),{type:'line',data:{labels:lb,datasets:[{data:d.history.map(h=>h.total_views||0),borderColor:'#0984e3',backgroundColor:'rgba(9,132,227,.08)',fill:true,tension:.3,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}}}})
+    CH.l=new Chart(document.getElementById('cLikes'),{type:'line',data:{labels:lb,datasets:[{data:d.history.map(h=>h.total_likes||0),borderColor:'#00b894',backgroundColor:'rgba(0,184,148,.08)',fill:true,tension:.3,pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}}}})
+  }catch(e){}
 }
 
-function closeModal(e) {
-  if (e && e.target !== document.getElementById('modal') && e.type === 'click') return;
-  document.getElementById('modal').classList.remove('active');
-  Object.values(charts).forEach(c => c.destroy());
-  charts = {};
+function closeModal(e){if(e&&e.target!==document.getElementById('modalBg')&&e.type==='click')return;document.getElementById('modalBg').classList.remove('on');Object.values(CH).forEach(c=>c.destroy());CH={}}
+
+async function runCheck(){try{await fetch('/api/ig-web-upload/metrics/run',{method:'POST'});setTimeout(loadData,90000)}catch(e){}}
+
+// Show config if no data
+async function checkCfg(){
+  try{
+    const r=await fetch('/api/ig-web-upload/metrics/overview');
+    const d=await r.json();
+    if(!d.ok||!d.accounts||d.accounts.length===0){document.getElementById('cfgBox').style.display='block'}
+  }catch(e){}
 }
 
-async function saveConfig() {
-  const profiles = document.getElementById('parser_profiles').value;
-  const apiUrl = document.getElementById('ads_power_api_url').value;
-  try {
-    const resp = await fetch(`${API}/api/ig-web-upload/metrics/config`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ parser_profiles: profiles, ads_power_api_url: apiUrl })
-    });
-    const data = await resp.json();
-    if (data.ok) alert('Config saved!');
-    else alert('Error: ' + data.error);
-  } catch (e) {
-    alert('Error: ' + e.message);
-  }
-}
-
-async function runCheckNow() {
-  try {
-    const resp = await fetch(`${API}/api/ig-web-upload/metrics/run`, { method: 'POST' });
-    const data = await resp.json();
-    if (data.ok) {
-      alert('Check started! Wait ~2 min and refresh.');
-      setTimeout(loadOverview, 120000);
-    } else {
-      alert('Error: ' + data.error);
-    }
-  } catch (e) {
-    alert('Error: ' + e.message);
-  }
-}
-
-// Load config on start
-async function loadConfig() {
-  try {
-    const data = await fetchJSON(`${API}/api/ig-web-upload/metrics/overview`);
-    // Config is stored in DB, we read it from the overview endpoint indirectly
-  } catch (e) {}
-}
-
-// Init
-loadOverview();
-loadConfig();
-setInterval(loadOverview, 300000); // auto-refresh every 5 min
+loadData();checkCfg();
+setInterval(loadData,300000);
 </script>
-
 </body>
 </html>
