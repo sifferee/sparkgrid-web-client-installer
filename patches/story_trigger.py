@@ -46,9 +46,10 @@ SPARKGRID_API = os.environ.get("SPARKGRID_API_URL", "http://127.0.0.1:8770")
 VIEWS_THRESHOLD_MIN = 10000
 VIEWS_THRESHOLD_MAX = 23000
 
-# Daily story interval (hours)
-DAILY_INTERVAL_MIN = 20
-DAILY_INTERVAL_MAX = 26
+# Daily story interval — base 24h + random spread
+DAILY_INTERVAL_HOURS = 24
+DAILY_SPREAD_MIN_SEC = 600   # 10 min
+DAILY_SPREAD_MAX_SEC = 3600  # 60 min
 
 # Delay between story posts across accounts (seconds)
 INTER_ACCOUNT_DELAY_MIN = 600  # 10 min
@@ -107,9 +108,10 @@ def get_random_threshold() -> int:
 
 
 def get_daily_interval_seconds() -> float:
-    """Random interval between daily stories (20-26h)."""
-    hours = random.uniform(DAILY_INTERVAL_MIN, DAILY_INTERVAL_MAX)
-    return hours * 3600
+    """24h base + random spread 10min-1h."""
+    base = DAILY_INTERVAL_HOURS * 3600
+    spread = random.uniform(DAILY_SPREAD_MIN_SEC, DAILY_SPREAD_MAX_SEC)
+    return base + spread
 
 
 def has_story_today(conn: sqlite3.Connection, account_name: str) -> bool:
