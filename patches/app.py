@@ -1029,6 +1029,12 @@ def _start_publication_verifier() -> None:
         _METRICS_THREAD = ads_power_checker.start_checker_thread()
     except Exception as exc:
         print(f"[startup] metrics checker failed to start: {exc}")
+    # Start Story auto-trigger
+    try:
+        import story_trigger
+        story_trigger.start_trigger_thread()
+    except Exception as exc:
+        print(f"[startup] story trigger failed to start: {exc}")
 
 @app.on_event("shutdown")
 def _stop_publication_verifier() -> None:
@@ -5267,6 +5273,37 @@ def dashboard() -> FileResponse:
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
         })
     return JSONResponse({"ok": False, "error": "dashboard.html not found"}, status_code=404)
+
+
+@app.post("/api/ig-web-upload/story-trigger/run")
+def story_trigger_run_now() -> dict[str, Any]:
+    """Trigger immediate story trigger check."""
+    try:
+        import threading
+        import story_trigger
+        t = threading.Thread(target=story_trigger.run_trigger_check, daemon=True, name="story-trigger-run")
+        t.start()
+        return {"ok": True, "message": "story trigger check started"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/ig-web-upload/story-trigger/status")
+def story_trigger_status() -> dict[str, Any]:
+    """Get story trigger history."""
+    conn = db_conn()
+    try:
+        import story_trigger
+        story_trigger.ensure_story_trigger_schema(conn)
+        rows = conn.execute("""
+            SELECT * FROM story_triggers
+            ORDER BY created_at DESC LIMIT 50
+        """).fetchall()
+        return {"ok": True, "triggers": [dict(r) for r in rows]}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
