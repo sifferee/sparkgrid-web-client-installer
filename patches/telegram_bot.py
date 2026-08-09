@@ -96,17 +96,17 @@ async def api_post(session, path, body=None):
 
 # ─── Commands ──────────────────────────────────────────────────────────────────
 
-WELCOME = """🤖 *SparkGrid Bot*
+WELCOME = """🤖 *SparkGrid Бот*
 
-Commands:
-/status — account overview
-/metrics — metrics summary (followers, views, likes)
-/upload — start reel upload
-/stories — post stories
-/login — auto login accounts
-/check — run metrics checker now
-/session — check session validity (logged in vs expired)
-/stop — stop all processes"""
+Команды:
+/status — список аккаунтов
+/metrics — метрика (подписчики, просмотры, лайки)
+/upload — запуск залива рилсов
+/stories — залив историй
+/login — авто-логин аккаунтов
+/check — запустить проверку метрик
+/session — проверить сессии (активные vs протухшие)
+/stop — остановить все процессы"""
 
 async def cmd_start(update: Update, ctx):
     await update.message.reply_text(WELCOME, parse_mode="Markdown")
@@ -121,7 +121,7 @@ async def cmd_status(update: Update, ctx):
     if not accounts:
         await update.message.reply_text("Нет аккаунтов")
         return
-    lines = ["*Accounts:*"]
+    lines = ["*Аккаунты:*"]
     for a in accounts:
         login = a.get("web_upload_login_status", "?")
         priv = a.get("web_privacy_status", "?")
@@ -138,21 +138,21 @@ async def cmd_metrics(update: Update, ctx):
     t = data.get("total", {})
     dl = data.get("delta_24h", {})
     msg = (
-        f"📊 *Total*\n"
-        f"Followers: {fmt(t.get('followers',0))} ({fmt_delta(dl.get('followers',0))})\n"
-        f"Views: {fmt(t.get('views',0))} ({fmt_delta(dl.get('views',0))})\n"
-        f"Likes: {fmt(t.get('likes',0))} ({fmt_delta(dl.get('likes',0))})\n"
-        f"Comments: {fmt(t.get('comments',0))} ({fmt_delta(dl.get('comments',0))})\n"
+        f"📊 *Итого*\n"
+        f"Подписчики: {fmt(t.get('followers',0))} ({fmt_delta(dl.get('followers',0))})\n"
+        f"Просмотры: {fmt(t.get('views',0))} ({fmt_delta(dl.get('views',0))})\n"
+        f"Лайки: {fmt(t.get('likes',0))} ({fmt_delta(dl.get('likes',0))})\n"
+        f"Комментарии: {fmt(t.get('comments',0))} ({fmt_delta(dl.get('comments',0))})\n"
     )
     accounts = data.get("accounts", [])
     if accounts:
-        msg += "\n*Per account:*"
+        msg += "\n*По аккаунтам:*"
         for a in accounts[:15]:
             name = a.get("name", "?")
             fol = a.get("followers", 0)
             views = a.get("total_views", 0)
             likes = a.get("total_likes", 0)
-            msg += f"\n@{name}: {fmt(fol)} foll | {fmt(views)} views | {fmt(likes)} likes"
+            msg += f"\n@{name}: {fmt(fol)} подп | {fmt(views)} просм | {fmt(likes)} лайков"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def cmd_upload(update: Update, ctx):
@@ -170,7 +170,7 @@ async def cmd_upload(update: Update, ctx):
     keyboard.append([InlineKeyboardButton("🚀 Все ready", callback_data="upload_all")])
     for a in accounts:
         keyboard.append([InlineKeyboardButton(f"@{a['name']}", callback_data=f"upload:{a['name']}")])
-    keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
     await update.message.reply_text(
         "Выбери аккаунты для залива:",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -191,9 +191,9 @@ async def cmd_stories(update: Update, ctx):
     keyboard.append([InlineKeyboardButton("📸 Все", callback_data="stories_all")])
     for a in accounts:
         keyboard.append([InlineKeyboardButton(f"@{a['name']}", callback_data=f"stories:{a['name']}")])
-    keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
     await update.message.reply_text(
-        "Выбери аккаунты для Stories:",
+        "Выбери аккаунты для историй:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -212,7 +212,7 @@ async def cmd_login(update: Update, ctx):
     keyboard.append([InlineKeyboardButton("🔐 Все", callback_data="login_all")])
     for a in accounts:
         keyboard.append([InlineKeyboardButton(f"@{a['name']}", callback_data=f"login:{a['name']}")])
-    keyboard.append([InlineKeyboardButton("Cancel", callback_data="cancel")])
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
     await update.message.reply_text(
         "Выбери аккаунты для авто-логина:",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -222,9 +222,9 @@ async def cmd_check(update: Update, ctx):
     async with aiohttp.ClientSession() as session:
         data = await api_post(session, "/api/ig-web-upload/metrics/run")
     if data.get("ok"):
-        await update.message.reply_text("✅ Чек метрик запущен. Результаты через ~2 мин.")
+        await update.message.reply_text("✅ Проверка метрик запущена. Результаты через ~2 мин.")
     else:
-        await update.message.reply_text(f"❌ {data.get('error', 'error')}")
+        await update.message.reply_text(f"❌ {data.get('error', 'ошибка')}")
 
 async def cmd_session(update: Update, ctx):
     """Check session validity — which accounts are still logged in vs expired."""
@@ -251,18 +251,18 @@ async def cmd_session(update: Update, ctx):
             expired.append(f"❌ @{name} — {status}")
         else:
             other.append(f"⚠️ @{name} — {status}")
-    msg = "*Session Check*\n"
+    msg = "*Проверка сессий*\n"
     if active:
-        msg += f"\n🟢 Active ({len(active)}):\n" + "\n".join(active[:10]) + "\n"
+        msg += f"\n🟢 Активные ({len(active)}):\n" + "\n".join(active[:10]) + "\n"
     if expired:
-        msg += f"\n🔴 Expired/Blocked ({len(expired)}):\n" + "\n".join(expired[:10]) + "\n"
+        msg += f"\n🔴 Протухшие/Заблокированные ({len(expired)}):\n" + "\n".join(expired[:10]) + "\n"
     if other:
-        msg += f"\n🟡 Other ({len(other)}):\n" + "\n".join(other[:5]) + "\n"
+        msg += f"\n🟡 Другие ({len(other)}):\n" + "\n".join(other[:5]) + "\n"
     # Add inline keyboard for re-login of expired accounts
     if expired:
         expired_names = [a["name"] for a in accounts if a.get("web_upload_login_status") in ("incorrect_credentials", "consent_failed", "manual_required", "suspended", "browser_internal_error")]
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🔐 Re-login {len(expired_names)} expired", callback_data="login_expired")],
+            [InlineKeyboardButton(f"🔐 Перезалогинить {len(expired_names)} протухших", callback_data="login_expired")],
         ])
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=keyboard)
     else:
@@ -274,7 +274,7 @@ async def cmd_stop(update: Update, ctx):
     if data.get("ok"):
         await update.message.reply_text("🛑 Все процессы остановлены")
     else:
-        await update.message.reply_text(f"❌ {data.get('error', 'error')}")
+        await update.message.reply_text(f"❌ {data.get('error', 'ошибка')}")
 
 # ─── Callback Handler ─────────────────────────────────────────────────────────
 
@@ -297,12 +297,11 @@ async def callback_handler(update: Update, ctx):
                 "post_warmup_min": 1, "post_warmup_max": 3, "cooldown_hours": 4,
             })
         elif data == "upload_all":
-            await query.edit_message_text("🚀 Залив всех ready аккаунтов...")
-            # Get account list first
+            await query.edit_message_text("🚀 Залив всех готовых аккаунтов...")
             overview = await api_get(session, "/api/ig-web-upload/overview")
             names = [a["name"] for a in overview.get("accounts", []) if a.get("web_upload_login_status") == "logged_in"]
             if not names:
-                await query.edit_message_text("Нет ready аккаунтов")
+                await query.edit_message_text("Нет готовых аккаунтов")
                 return
             result = await api_post(session, "/api/ig-web-upload/start", {
                 "accounts": names, "engine": "clean_web", "browser_parallel": 5,
@@ -311,10 +310,10 @@ async def callback_handler(update: Update, ctx):
             })
         elif data.startswith("stories:"):
             name = data.split(":", 1)[1]
-            await query.edit_message_text(f"📸 Story @{name}...")
+            await query.edit_message_text(f"📸 История @{name}...")
             result = await api_post(session, "/api/ig-web-upload/post-story", {"accounts": [name]})
         elif data == "stories_all":
-            await query.edit_message_text("📸 Stories на всех...")
+            await query.edit_message_text("📸 Истории на всех...")
             overview = await api_get(session, "/api/ig-web-upload/overview")
             names = [a["name"] for a in overview.get("accounts", []) if a.get("web_upload_login_status") == "logged_in"]
             result = await api_post(session, "/api/ig-web-upload/post-story", {"accounts": names})
@@ -328,11 +327,11 @@ async def callback_handler(update: Update, ctx):
             names = [a["name"] for a in overview.get("accounts", [])]
             result = await api_post(session, "/api/ig-web-upload/workflow", {"task": "auto_login", "accounts": names})
         elif data == "login_expired":
-            await query.edit_message_text("🔐 Re-login expired аккаунтов...")
+            await query.edit_message_text("🔐 Перезалогинить протухших...")
             overview = await api_get(session, "/api/ig-web-upload/overview")
             names = [a["name"] for a in overview.get("accounts", []) if a.get("web_upload_login_status") in ("incorrect_credentials", "consent_failed", "manual_required", "suspended", "browser_internal_error", "unknown", "")]
             if not names:
-                await query.message.reply_text("Нет expired аккаунтов")
+                await query.message.reply_text("Нет протухших аккаунтов")
                 return
             result = await api_post(session, "/api/ig-web-upload/workflow", {"task": "auto_login", "accounts": names})
         else:
@@ -342,7 +341,7 @@ async def callback_handler(update: Update, ctx):
         run_id = result.get("run_id", "")
         await query.message.reply_text(f"✅ Запущено! run_id={run_id}")
     else:
-        await query.message.reply_text(f"❌ {result.get('error', 'error')}")
+        await query.message.reply_text(f"❌ {result.get('error', 'ошибка')}")
 
 # ─── Background: Story Trigger Notifications ──────────────────────────────────
 
@@ -364,7 +363,7 @@ async def background_check_triggers(ctx: ContextTypes.DEFAULT_TYPE):
             if t.get("story_posted_at") and t.get("trigger_views", 0) > 0:
                 name = t.get("account_name", "?")
                 views = t.get("trigger_views", 0)
-                msg = f"🔔 @{name}: Reel набрал {fmt(views)} просмотров — Story залита автоматически!"
+                msg = f"🔔 @{name}: Рилс набрал {fmt(views)} просмотров — История залита автоматически!"
                 try:
                     await ctx.bot.send_message(chat_id=CHAT_ID, text=msg)
                 except Exception:
@@ -384,9 +383,9 @@ async def background_hourly_summary(ctx: ContextTypes.DEFAULT_TYPE):
         dl = data.get("delta_24h", {})
         msg = (
             f"📊 *Часовая сводка*\n"
-            f"Followers: {fmt(t.get('followers',0))} ({fmt_delta(dl.get('followers',0))})\n"
-            f"Views: {fmt(t.get('views',0))} ({fmt_delta(dl.get('views',0))})\n"
-            f"Likes: {fmt(t.get('likes',0))} ({fmt_delta(dl.get('likes',0))})"
+            f"Подписчики: {fmt(t.get('followers',0))} ({fmt_delta(dl.get('followers',0))})\n"
+            f"Просмотры: {fmt(t.get('views',0))} ({fmt_delta(dl.get('views',0))})\n"
+            f"Лайки: {fmt(t.get('likes',0))} ({fmt_delta(dl.get('likes',0))})"
         )
         await ctx.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
     except Exception as e:
@@ -414,8 +413,24 @@ def main():
         job_queue.run_repeating(background_check_triggers, interval=600, first=30)
         job_queue.run_repeating(background_hourly_summary, interval=3600, first=60)
 
-    logger.info("Bot starting...")
+    logger.info("Бот запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
+
+def run_forever():
+    """Run bot with auto-restart on crash. Never dies."""
+    while True:
+        try:
+            logger.info("Запуск бота...")
+            main()
+        except KeyboardInterrupt:
+            logger.info("Остановка по запросу")
+            break
+        except Exception as e:
+            logger.error(f"Бот упал: {e}. Перезапуск через 10 сек...")
+            import time
+            time.sleep(10)
+
+
 if __name__ == "__main__":
-    main()
+    run_forever()
