@@ -7671,6 +7671,30 @@ def do_post_story(account: dict, args, run_id: str):
                 stage_callback=persist_story_stage,
             )
 
+            # Retry on transport failure with backoff — rupload_transport
+            # failures are often transient (network hiccup, proxy rotation).
+            # Retry up to 2 times with 15-30s pause, human-like.
+            retry_count = 0
+            while not result.get("ok") and retry_count < 2:
+                failed_step = str(result.get("step") or "")
+                if "rupload" not in failed_step and "transport" not in failed_step:
+                    break  # Not a transport error, don't retry
+                retry_count += 1
+                backoff = random.uniform(15, 30)
+                log(f"{name}: Story transport failed ({failed_step}), retry {retry_count}/2 in {backoff:.0f}s", "WARNING")
+                dump.capture(page, f"story_retry_{retry_count}", f"transport failure: {failed_step}; retrying in {backoff:.0f}s", force_snapshot=True)
+                time.sleep(backoff)
+                result = post_story_with_link(
+                    page=page,
+                    image_path=str(image_path),
+                    link_url=link_url,
+                    x=sticker_x,
+                    y=sticker_y,
+                    dump=dump,
+                    sticker_text=sticker_text,
+                    stage_callback=persist_story_stage,
+                )
+
             if result.get("ok"):
                 if highlight_name:
                     pending = (

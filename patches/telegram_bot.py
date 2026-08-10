@@ -913,34 +913,34 @@ async def background_hourly_summary(ctx: ContextTypes.DEFAULT_TYPE):
 
 # Track which run_ids we've already reported
 _reported_runs: set[str] = set()
+# Buffer for batching notifications — collects events, sends one combined message
+_pending_notifications: list[str] = []
+_last_notification_flush: float = 0
 
 async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
-    """Check every 30s if an upload/story process just finished. Send results."""
+    """Check every 30s for finished jobs. Batch notifications into one message."""
+    global _pending_notifications, _last_notification_flush
+    import time as _time
     try:
         async with aiohttp.ClientSession() as session:
             data = await api_get(session, "/api/ig-web-upload/overview")
         if not data.get("ok"):
             return
 
-        # Check process status — if it was running and now stopped, report
-        proc = data.get("process", {})
         jobs = data.get("jobs", [])
-        receipts = data.get("task_receipts", [])
+        new_events: list[str] = []
 
-        # Find recently finished jobs (not yet reported)
         for job in jobs[:20]:
             status = str(job.get("status") or "")
             run_id = str(job.get("run_id") or "")
             if not run_id or run_id in _reported_runs:
                 continue
-            # Only report terminal statuses
             if status not in ("success", "failed", "partial_success", "manual_required",
                               "stopped", "cooldown", "uploaded_unverified",
                               "submitted_unverified", "empty_selection"):
                 continue
 
             _reported_runs.add(run_id)
-            # Keep set from growing forever
             if len(_reported_runs) > 200:
                 _reported_runs.clear()
                 _reported_runs.add(run_id)
@@ -951,34 +951,52 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
             current_step = str(job.get("current_step") or "")
             is_story = "story" in current_step.lower() or "story" in str(job.get("label") or "").lower()
 
+            # Don't report "posted: 0" as success — it means nothing was uploaded
+            if status == "success" and posted == 0 and not is_story:
+                # This is a warmup-only or no-content run, skip notification
+                continue
+
             if status == "success":
-                emoji = "✅"
-                msg = f"{emoji} Залив завершён: @{account}\n"
                 if is_story:
-                    msg = f"{emoji} История залита: @{account}"
+                    line = f"✅ История: @{account}"
                 else:
-                    msg = f"{emoji} Рилсы залиты: @{account} (posted: {posted})"
+                    line = f"✅ Рилсы: @{account} ({posted} залито)"
             elif status == "partial_success":
-                emoji = "⚠️"
                 if is_story:
-                    msg = f"{emoji} История частично: @{account}"
+                    line = f"⚠️ История (частично): @{account}"
                 else:
-                    msg = f"{emoji} Частичный залив: @{account} (posted: {posted})\nПричина: {error[:100]}"
+                    line = f"⚠️ Рилсы (частично): @{account} — {posted}/{error[:60]}"
             elif status == "failed":
-                emoji = "❌"
-                msg = f"{emoji} Залив не удался: @{account}\nОшибка: {error[:120]}"
+                line = f"❌ @{account}: {error[:80]}"
             elif status == "manual_required":
-                emoji = "🟡"
-                msg = f"{emoji} Требует ручного вмешательства: @{account}\nПричина: {error[:120]}"
-            elif status == "empty_selection":
-                emoji = "⚠️"
-                msg = f"{emoji} Нет аккаунтов для залива: {error[:80]}"
+                line = f"🟡 @{account}: {error[:80]}"
             elif status == "stopped":
-                emoji = "🛑"
-                msg = f"{emoji} Остановлено: @{account}"
+                line = f"🛑 @{account}"
+            elif status == "empty_selection":
+                continue  # Not useful for user
             else:
-                emoji = "❓"
-                msg = f"{emoji} {status}: @{account}\n{error[:80]}"
+                line = f"❓ {status}: @{account}"
+
+            new_events.append(line)
+
+        # Add to pending buffer
+        _pending_notifications.extend(new_events)
+
+        # Flush: send batched message if 2 min passed OR 5+ events queued
+        now = _time.time()
+        should_flush = (
+            _pending_notifications and (
+                now - _last_notification_flush >= 120 or
+                len(_pending_notifications) >= 5
+            )
+        )
+
+        if should_flush:
+            msg = "\n".join(_pending_notifications[:20])
+            if len(_pending_notifications) > 20:
+                msg += f"\n... и ещё {len(_pending_notifications) - 20}"
+            _pending_notifications.clear()
+            _last_notification_flush = now
 
             for chat_id in authorized_chat_ids():
                 try:
@@ -1023,25 +1041,27 @@ def main():
 
     logger.info(f"Бот запущен. Авторизованных пользователей: {len(AUTHORIZED_USERS)}")
 
-    # Set native Telegram command menu (≡ button, always visible)
-    from telegram import BotCommand
-    try:
-        app.bot.set_my_commands([
-            BotCommand("status", "📋 Аккаунты"),
-            BotCommand("metrics", "📊 Метрики"),
-            BotCommand("upload", "🚀 Залить рилсы"),
-            BotCommand("stories", "📸 Истории"),
-            BotCommand("login", "🔐 Логин"),
-            BotCommand("session", "🔍 Проверить сессии"),
-            BotCommand("check", "📈 Собрать метрики"),
-            BotCommand("delete_banned", "🗑 Удалить забаненные"),
-            BotCommand("stop", "🛑 Стоп всё"),
-            BotCommand("users", "👥 Пользователи бота"),
-        ])
-        logger.info("Native Telegram menu set")
-    except Exception as e:
-        logger.warning(f"Failed to set native menu: {e}")
+    # Set native Telegram command menu via post_init (async, correct way)
+    async def _post_init(app: Application) -> None:
+        from telegram import BotCommand
+        try:
+            await app.bot.set_my_commands([
+                BotCommand("status", "📋 Аккаунты"),
+                BotCommand("metrics", "📊 Метрики"),
+                BotCommand("upload", "🚀 Залить рилсы"),
+                BotCommand("stories", "📸 Истории"),
+                BotCommand("login", "🔐 Логин"),
+                BotCommand("session", "🔍 Проверить сессии"),
+                BotCommand("check", "📈 Собрать метрики"),
+                BotCommand("delete_banned", "🗑 Удалить забаненные"),
+                BotCommand("stop", "🛑 Стоп всё"),
+                BotCommand("users", "👥 Пользователи бота"),
+            ])
+            logger.info("Native Telegram menu set")
+        except Exception as e:
+            logger.warning(f"Failed to set native menu: {e}")
 
+    app.post_init = _post_init
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
