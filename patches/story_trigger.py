@@ -226,10 +226,16 @@ def record_trigger_pending(
 
 
 def trigger_story_post(account_name: str) -> dict[str, Any]:
-    """Call SparkGrid API to post a Story for account."""
+    """Call SparkGrid API to post a Story for account.
+
+    The post-story endpoint reads form data (request.form()), not JSON.
+    We must send accounts as a form field, not a JSON body.
+    """
     url = f"{SPARKGRID_API}/api/ig-web-upload/post-story"
     try:
-        req = Request(url, method="POST", headers={"Content-Type": "application/json"})
+        from urllib.parse import urlencode
+        form_data = urlencode({"accounts": account_name}).encode("utf-8")
+        req = Request(url, data=form_data, method="POST", headers={"Content-Type": "application/x-www-form-urlencoded"})
         resp = urlopen(req, timeout=120)
         data = json.loads(resp.read())
         return data
@@ -305,8 +311,8 @@ def run_trigger_check() -> int:
 
             # Post the story
             result = trigger_story_post(name)
-            if result.get("ok"):
-                job_id = int(result.get("job_id", 0) or 0)
+            if result.get("ok") and result.get("started", True) is not False:
+                job_id = int(result.get("story_job_id", 0) or result.get("run_id", 0) or 0)
                 # Record trigger
                 if last_story:
                     # Daily trigger
@@ -330,7 +336,7 @@ def run_trigger_check() -> int:
                 log(f"Waiting {delay:.0f}s before next account")
                 time.sleep(delay)
             else:
-                error = str(result.get("error", "unknown"))
+                error = str(result.get("error") or result.get("reason") or result.get("message") or "unknown")
                 log(f"@{name}: ❌ Story post failed: {error}", "ERROR")
                 record_trigger(conn, name, "", 0, threshold, 0, error)
 

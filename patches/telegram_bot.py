@@ -5,13 +5,15 @@ Client to SparkGrid API — manages uploads, stories, login, metrics.
 Does NOT touch server code, browsers, or DB directly. Only HTTP API calls.
 
 Commands:
-  /start     — welcome
+  /start     — welcome + main menu (inline buttons)
   /status    — account overview
   /metrics    — metrics dashboard summary
   /upload    — start reel upload (inline keyboard)
   /stories   — post stories (inline keyboard)
   /login     — auto login (inline keyboard)
   /check     — run metrics checker now
+  /session   — check sessions (check_login on all)
+  /delete_banned — delete banned accounts
   /stop      — stop all processes
 
 Passive: checks for new story triggers every 10 min, sends hourly summary.
@@ -57,7 +59,6 @@ logger = logging.getLogger("sparkgrid-bot")
 log_dir = os.path.join(os.environ.get("SPARKGRID_DATA_DIR", "."), "logs")
 try:
     os.makedirs(log_dir, exist_ok=True)
-    logging.FileHandler(os.path.join(log_dir, "telegram_bot.log"), encoding="utf-8").setLevel(logging.INFO)
     logger.addHandler(logging.FileHandler(os.path.join(log_dir, "telegram_bot.log"), encoding="utf-8"))
 except Exception:
     pass
@@ -101,7 +102,20 @@ def fmt_delta(d):
     if d < 0: return fmt(d)
     return "0"
 
+def is_account_usable(a: dict) -> bool:
+    """Check if account is logged_in AND not suspended (even hidden in error field)."""
+    login = a.get("web_upload_login_status", "")
+    if login != "logged_in":
+        return False
+    # Also check error field for hidden suspend/ban keywords
+    error = str(a.get("web_upload_last_error") or "").lower()
+    if any(w in error for w in ("suspend", "banned", "disabled", "restrict", "checkpoint", "challenge")):
+        return False
+    return True
+
 # ─── API Client ───────────────────────────────────────────────────────────────
+# post-story endpoint reads form data, not JSON.
+# Other endpoints (start, workflow, stop, metrics/run, delete-banned) accept JSON.
 
 async def api_get(session, path):
     try:
@@ -110,7 +124,8 @@ async def api_get(session, path):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-async def api_post(session, path, body=None):
+async def api_post_json(session, path, body=None):
+    """POST JSON body. Used by /start, /workflow, /stop, /metrics/run, /delete-banned."""
     try:
         async with session.post(
             f"{API_URL}{path}",
@@ -121,23 +136,63 @@ async def api_post(session, path, body=None):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ─── Commands ──────────────────────────────────────────────────────────────────
+async def api_post_form(session, path, form_fields=None):
+    """POST form data. Used by /post-story endpoint which reads request.form()."""
+    try:
+        data = aiohttp.FormData()
+        for key, value in (form_fields or {}).items():
+            if isinstance(value, list):
+                value = ",".join(str(v) for v in value)
+            data.add_field(key, str(value))
+        async with session.post(
+            f"{API_URL}{path}",
+            data=data,
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as resp:
+            return await resp.json()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# Keep backward-compat alias
+async def api_post(session, path, body=None):
+    return await api_post_json(session, path, body)
+
+# ─── Main Menu ─────────────────────────────────────────────────────────────────
+
+def main_menu_keyboard():
+    """Inline keyboard for /start command — replaces typed commands."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Метрики", callback_data="cmd:metrics"),
+         InlineKeyboardButton("📋 Статус", callback_data="cmd:status")],
+        [InlineKeyboardButton("🚀 Залить рилсы", callback_data="cmd:upload"),
+         InlineKeyboardButton("📸 Истории", callback_data="cmd:stories")],
+        [InlineKeyboardButton("🔍 Проверить сессии", callback_data="cmd:session"),
+         InlineKeyboardButton("🔐 Логин", callback_data="cmd:login")],
+        [InlineKeyboardButton("📈 Собрать метрики", callback_data="cmd:check"),
+         InlineKeyboardButton("🗑 Удалить забаненные", callback_data="cmd:delete_banned")],
+        [InlineKeyboardButton("🛑 Стоп всё", callback_data="cmd:stop")],
+    ])
 
 WELCOME = """🤖 *SparkGrid Бот*
 
-Команды:
+Выбери действие из меню ниже 👇
+
+Или команды:
 /status — список аккаунтов
-/metrics — метрика (подписчики, просмотры, лайки)
-/upload — запуск залива рилсов
-/stories — залив историй
-/login — авто-логин аккаунтов
-/check — запустить проверку метрик
-/session — проверить сессии (активные vs протухшие)
-/stop — остановить все процессы"""
+/metrics — метрика
+/upload — залив рилсов
+/stories — истории
+/login — авто-логин
+/session — проверка сессий
+/check — сбор метрик
+/delete_banned — удалить забаненные
+/stop — стоп"""
+
+# ─── Commands ──────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "start")
-    await update.message.reply_text(WELCOME, parse_mode="Markdown")
+    await update.message.reply_text(WELCOME, parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
 async def cmd_status(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "status")
@@ -145,28 +200,32 @@ async def cmd_status(update: Update, ctx):
         data = await api_get(session, "/api/ig-web-upload/overview")
     if not data.get("ok"):
         log_action(update.effective_user.id, update.effective_user.username, "status", error="SparkGrid недоступен")
-        await update.message.reply_text("❌ SparkGrid недоступен")
+        await _reply(update, "❌ SparkGrid недоступен")
         return
     accounts = data.get("accounts", [])
     if not accounts:
-        await update.message.reply_text("Нет аккаунтов")
+        await _reply(update, "Нет аккаунтов")
         return
     lines = ["*Аккаунты:*"]
     for a in accounts:
         login = a.get("web_upload_login_status", "?")
         priv = a.get("web_privacy_status", "?")
-        emoji = "✅" if login == "logged_in" else "❌" if login in ("suspended", "failed") else "⚠️"
+        usable = is_account_usable(a)
+        emoji = "✅" if usable else "❌" if login in ("suspended", "failed") else "⚠️"
         lines.append(f"{emoji} @{a['name']} | {login} | {priv}")
     log_action(update.effective_user.id, update.effective_user.username, "status", result=f"{len(accounts)} accounts")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await _reply(update, "\n".join(lines), parse_mode="Markdown")
 
 async def cmd_metrics(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "metrics")
+    await _send_metrics(update)
+
+async def _send_metrics(update_or_query):
     async with aiohttp.ClientSession() as session:
         data = await api_get(session, "/api/ig-web-upload/metrics/overview?hours=24")
     if not data.get("ok"):
-        log_action(update.effective_user.id, update.effective_user.username, "metrics", error="нет данных")
-        await update.message.reply_text("❌ Нет данных метрики. Запусти /check")
+        log_action(0, "?", "metrics", error="нет данных")
+        await _reply(update_or_query, "❌ Нет данных метрики. Запусти /check")
         return
     t = data.get("total", {})
     dl = data.get("delta_24h", {})
@@ -186,94 +245,119 @@ async def cmd_metrics(update: Update, ctx):
             views = a.get("total_views", 0)
             likes = a.get("total_likes", 0)
             msg += f"\n@{name}: {fmt(fol)} подп | {fmt(views)} просм | {fmt(likes)} лайков"
-    log_action(update.effective_user.id, update.effective_user.username, "metrics", result=f"followers={t.get('followers',0)}")
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    log_action(0, "?", "metrics", result=f"followers={t.get('followers',0)}")
+    await _reply(update_or_query, msg, parse_mode="Markdown")
 
 async def cmd_upload(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "upload_menu")
+    await _show_upload_menu(update)
+
+async def _show_upload_menu(update_or_query):
     async with aiohttp.ClientSession() as session:
         data = await api_get(session, "/api/ig-web-upload/overview")
     if not data.get("ok"):
-        await update.message.reply_text("❌ SparkGrid недоступен")
+        await _reply(update_or_query, "❌ SparkGrid недоступен")
         return
-    accounts = [a for a in data.get("accounts", []) if a.get("web_upload_login_status") == "logged_in"]
+    accounts = [a for a in data.get("accounts", []) if is_account_usable(a)]
     if not accounts:
-        await update.message.reply_text("Нет готовых аккаунтов (logged_in)")
+        await _reply(update_or_query, "Нет готовых аккаунтов (logged_in)")
         return
     keyboard = []
     keyboard.append([InlineKeyboardButton("🚀 Все ready", callback_data="upload_all")])
     for a in accounts:
         keyboard.append([InlineKeyboardButton(f"@{a['name']}", callback_data=f"upload:{a['name']}")])
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
-    await update.message.reply_text(
-        "Выбери аккаунты для залива:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="cmd:start")])
+    await _reply(update_or_query, "Выбери аккаунты для залива:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_stories(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "stories_menu")
+    await _show_stories_menu(update)
+
+async def _show_stories_menu(update_or_query):
     async with aiohttp.ClientSession() as session:
         data = await api_get(session, "/api/ig-web-upload/overview")
     if not data.get("ok"):
-        await update.message.reply_text("❌ SparkGrid недоступен")
+        await _reply(update_or_query, "❌ SparkGrid недоступен")
         return
-    accounts = [a for a in data.get("accounts", []) if a.get("web_upload_login_status") == "logged_in"]
+    accounts = [a for a in data.get("accounts", []) if is_account_usable(a)]
     if not accounts:
-        await update.message.reply_text("Нет готовых аккаунтов")
+        await _reply(update_or_query, "Нет готовых аккаунтов")
         return
     keyboard = []
     keyboard.append([InlineKeyboardButton("📸 Все", callback_data="stories_all")])
     for a in accounts:
         keyboard.append([InlineKeyboardButton(f"@{a['name']}", callback_data=f"stories:{a['name']}")])
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
-    await update.message.reply_text(
-        "Выбери аккаунты для историй:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="cmd:start")])
+    await _reply(update_or_query, "Выбери аккаунты для историй:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_login(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "login_menu")
     async with aiohttp.ClientSession() as session:
         data = await api_get(session, "/api/ig-web-upload/overview")
     if not data.get("ok"):
-        await update.message.reply_text("❌ SparkGrid недоступен")
+        await _reply(update, "❌ SparkGrid недоступен")
         return
     accounts = data.get("accounts", [])
     if not accounts:
-        await update.message.reply_text("Нет аккаунтов")
+        await _reply(update, "Нет аккаунтов")
         return
     keyboard = []
     keyboard.append([InlineKeyboardButton("🔐 Все", callback_data="login_all")])
     for a in accounts:
         keyboard.append([InlineKeyboardButton(f"@{a['name']}", callback_data=f"login:{a['name']}")])
-    keyboard.append([InlineKeyboardButton("Отмена", callback_data="cancel")])
-    await update.message.reply_text(
-        "Выбери аккаунты для авто-логина:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="cmd:start")])
+    await _reply(update, "Выбери аккаунты для авто-логина:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_check(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "check_metrics")
     async with aiohttp.ClientSession() as session:
-        data = await api_post(session, "/api/ig-web-upload/metrics/run")
+        data = await api_post_json(session, "/api/ig-web-upload/metrics/run")
     if data.get("ok"):
-        await update.message.reply_text("✅ Проверка метрик запущена. Результаты через ~2 мин.")
+        await _reply(update, "✅ Проверка метрик запущена. Результаты через ~2 мин.")
     else:
         log_action(update.effective_user.id, update.effective_user.username, "check_metrics", error=str(data.get("error")))
-        await update.message.reply_text(f"❌ {data.get('error', 'ошибка')}")
+        await _reply(update, f"❌ {data.get('error', 'ошибка')}")
 
 async def cmd_session(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "session_check")
+    await _run_session_check(update)
+
+async def _run_session_check(update_or_query):
+    async with aiohttp.ClientSession() as session:
+        overview = await api_get(session, "/api/ig-web-upload/overview")
+    if not overview.get("ok"):
+        await _reply(update_or_query, "❌ SparkGrid недоступен")
+        return
+    accounts = overview.get("accounts", [])
+    if not accounts:
+        await _reply(update_or_query, "Нет аккаунтов")
+        return
+
+    await _reply(update_or_query, f"🔍 Проверяю сессии для {len(accounts)} аккаунтов...")
+
+    async with aiohttp.ClientSession() as session:
+        result = await api_post_json(session, "/api/ig-web-upload/workflow", {"task": "check_login", "accounts": [a["name"] for a in accounts]})
+
+    if not result.get("ok"):
+        await _reply(update_or_query, f"❌ Ошибка запуска: {result.get('error', 'ошибка')}")
+        return
+
+    # Wait for workflow to complete (check every 15s, max 5 min)
+    await asyncio.sleep(15)
+    for _ in range(19):
+        async with aiohttp.ClientSession() as session:
+            health = await api_get(session, "/api/health")
+        if health.get("ok") and not health.get("process", {}).get("running", False):
+            break
+        await asyncio.sleep(15)
+
     async with aiohttp.ClientSession() as session:
         data = await api_get(session, "/api/ig-web-upload/overview")
     if not data.get("ok"):
-        log_action(update.effective_user.id, update.effective_user.username, "session_check", error="SparkGrid недоступен")
-        await update.message.reply_text("❌ SparkGrid недоступен")
+        await _reply(update_or_query, "❌ Не удалось получить результаты")
         return
     accounts = data.get("accounts", [])
-    if not accounts:
-        await update.message.reply_text("Нет аккаунтов")
-        return
+
     active = []
     expired = []
     other = []
@@ -281,39 +365,78 @@ async def cmd_session(update: Update, ctx):
         status = a.get("web_upload_login_status", "unknown")
         name = a.get("name", "?")
         last_login = a.get("web_upload_last_login_at", "")
-        if status == "logged_in":
+        if status == "logged_in" and is_account_usable(a):
             active.append(f"✅ @{name} (last: {last_login[:16] if last_login else '—'})")
-        elif status in ("incorrect_credentials", "consent_failed", "manual_required", "suspended", "browser_internal_error"):
+        elif status in ("suspended", "incorrect_credentials", "consent_failed", "manual_required", "browser_internal_error"):
             expired.append(f"❌ @{name} — {status}")
         else:
             other.append(f"⚠️ @{name} — {status}")
-    msg = "*Проверка сессий*\n"
+    msg = "*Результат проверки сессий*\n"
     if active:
-        msg += f"\n🟢 Активные ({len(active)}):\n" + "\n".join(active[:10]) + "\n"
+        msg += f"\n🟢 Активные ({len(active)}):\n" + "\n".join(active[:15]) + "\n"
     if expired:
-        msg += f"\n🔴 Протухшие/Заблокированные ({len(expired)}):\n" + "\n".join(expired[:10]) + "\n"
+        msg += f"\n🔴 Протухшие/Заблокированные ({len(expired)}):\n" + "\n".join(expired[:15]) + "\n"
     if other:
         msg += f"\n🟡 Другие ({len(other)}):\n" + "\n".join(other[:5]) + "\n"
+
+    keyboard = []
     if expired:
-        expired_names = [a["name"] for a in accounts if a.get("web_upload_login_status") in ("incorrect_credentials", "consent_failed", "manual_required", "suspended", "browser_internal_error")]
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🔐 Перезалогинить {len(expired_names)} протухших", callback_data="login_expired")],
-        ])
-        log_action(update.effective_user.id, update.effective_user.username, "session_check", result=f"active={len(active)} expired={len(expired)}")
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=keyboard)
-    else:
-        log_action(update.effective_user.id, update.effective_user.username, "session_check", result=f"active={len(active)} expired=0")
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        expired_names = [a["name"] for a in accounts if a.get("web_upload_login_status") in ("suspended", "incorrect_credentials", "consent_failed", "manual_required", "browser_internal_error")]
+        keyboard.append([InlineKeyboardButton(f"🔐 Перезалогинить {len(expired_names)} протухших", callback_data="login_expired")])
+        suspended_names = [a["name"] for a in accounts if a.get("web_upload_login_status") in ("suspended",)]
+        if suspended_names:
+            keyboard.append([InlineKeyboardButton(f"🗑 Удалить {len(suspended_names)} забаненных", callback_data="confirm_delete_banned")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="cmd:start")])
+    await _reply(update_or_query, msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    log_action(0, "?", "session_check", result=f"active={len(active)} expired={len(expired)}")
 
 async def cmd_stop(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "stop")
     async with aiohttp.ClientSession() as session:
-        data = await api_post(session, "/api/ig-web-upload/stop")
+        data = await api_post_json(session, "/api/ig-web-upload/stop")
     if data.get("ok"):
-        await update.message.reply_text("🛑 Все процессы остановлены")
+        await _reply(update, "🛑 Все процессы остановлены")
     else:
         log_action(update.effective_user.id, update.effective_user.username, "stop", error=str(data.get("error")))
-        await update.message.reply_text(f"❌ {data.get('error', 'ошибка')}")
+        await _reply(update, f"❌ {data.get('error', 'ошибка')}")
+
+async def cmd_delete_banned(update: Update, ctx):
+    """Delete all suspended/banned accounts."""
+    log_action(update.effective_user.id, update.effective_user.username, "delete_banned")
+    await _show_delete_banned(update)
+
+async def _show_delete_banned(update_or_query):
+    async with aiohttp.ClientSession() as session:
+        data = await api_get(session, "/api/ig-web-upload/accounts/banned")
+    if not data.get("ok"):
+        await _reply(update_or_query, "❌ SparkGrid недоступен")
+        return
+    # API returns {"accounts": ["name1", "name2"]} — list[str], not list[dict]
+    banned = data.get("accounts", [])
+    if not banned:
+        await _reply(update_or_query, "✅ Нет забаненных аккаунтов")
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🗑 Удалить {len(banned)} забаненных", callback_data="confirm_delete_banned")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="cmd:start")],
+    ])
+    names = "\n".join([f"❌ @{n}" for n in banned[:15]])
+    await _reply(update_or_query, f"Найдено {len(banned)} забаненных аккаунтов:\n\n{names}", reply_markup=keyboard)
+
+# ─── Unified reply helper ──────────────────────────────────────────────────────
+
+async def _reply(update_or_query, text, **kwargs):
+    """Reply via message (command) or edit+send (callback query)."""
+    if hasattr(update_or_query, "edit_message_text"):
+        try:
+            await update_or_query.edit_message_text(text, **kwargs)
+            return
+        except Exception:
+            pass  # message not modified or too long → fall through to send new
+    if hasattr(update_or_query, "message") and update_or_query.message:
+        await update_or_query.message.reply_text(text, **kwargs)
+    elif hasattr(update_or_query, "reply_text"):
+        await update_or_query.reply_text(text, **kwargs)
 
 # ─── Callback Handler ─────────────────────────────────────────────────────────
 
@@ -329,11 +452,56 @@ async def callback_handler(update: Update, ctx):
         await query.edit_message_text("Отменено")
         return
 
+    # ─── Menu navigation (cmd:* callbacks) ───
+    if data == "cmd:start":
+        await query.edit_message_text(WELCOME, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        return
+    if data == "cmd:status":
+        await cmd_status(update, ctx)
+        return
+    if data == "cmd:metrics":
+        await _send_metrics(query)
+        return
+    if data == "cmd:upload":
+        await _show_upload_menu(query)
+        return
+    if data == "cmd:stories":
+        await _show_stories_menu(query)
+        return
+    if data == "cmd:session":
+        await _run_session_check(query)
+        return
+    if data == "cmd:login":
+        await cmd_login(update, ctx)
+        return
+    if data == "cmd:check":
+        log_action(user_id, username, "check_metrics")
+        async with aiohttp.ClientSession() as session:
+            result = await api_post_json(session, "/api/ig-web-upload/metrics/run")
+        if result.get("ok"):
+            await query.message.reply_text("✅ Проверка метрик запущена. Результаты через ~2 мин.")
+        else:
+            await query.message.reply_text(f"❌ {result.get('error', 'ошибка')}")
+        return
+    if data == "cmd:delete_banned":
+        await _show_delete_banned(query)
+        return
+    if data == "cmd:stop":
+        log_action(user_id, username, "stop")
+        async with aiohttp.ClientSession() as session:
+            result = await api_post_json(session, "/api/ig-web-upload/stop")
+        if result.get("ok"):
+            await query.message.reply_text("🛑 Все процессы остановлены")
+        else:
+            await query.message.reply_text(f"❌ {result.get('error', 'ошибка')}")
+        return
+
+    # ─── Action callbacks ───
     async with aiohttp.ClientSession() as session:
         if data.startswith("upload:"):
             name = data.split(":", 1)[1]
             await query.edit_message_text(f"🚀 Залив @{name}...")
-            result = await api_post(session, "/api/ig-web-upload/start", {
+            result = await api_post_json(session, "/api/ig-web-upload/start", {
                 "accounts": [name], "engine": "clean_web", "browser_parallel": 1,
                 "target": 3, "pre_warmup_min": 1, "pre_warmup_max": 2,
                 "post_warmup_min": 1, "post_warmup_max": 3, "cooldown_hours": 4,
@@ -341,11 +509,11 @@ async def callback_handler(update: Update, ctx):
         elif data == "upload_all":
             await query.edit_message_text("🚀 Залив всех готовых аккаунтов...")
             overview = await api_get(session, "/api/ig-web-upload/overview")
-            names = [a["name"] for a in overview.get("accounts", []) if a.get("web_upload_login_status") == "logged_in"]
+            names = [a["name"] for a in overview.get("accounts", []) if is_account_usable(a)]
             if not names:
                 await query.edit_message_text("Нет готовых аккаунтов")
                 return
-            result = await api_post(session, "/api/ig-web-upload/start", {
+            result = await api_post_json(session, "/api/ig-web-upload/start", {
                 "accounts": names, "engine": "clean_web", "browser_parallel": 5,
                 "target": 3, "pre_warmup_min": 1, "pre_warmup_max": 2,
                 "post_warmup_min": 1, "post_warmup_max": 3, "cooldown_hours": 4,
@@ -353,21 +521,23 @@ async def callback_handler(update: Update, ctx):
         elif data.startswith("stories:"):
             name = data.split(":", 1)[1]
             await query.edit_message_text(f"📸 История @{name}...")
-            result = await api_post(session, "/api/ig-web-upload/post-story", {"accounts": [name]})
+            # post-story endpoint reads form data, not JSON
+            result = await api_post_form(session, "/api/ig-web-upload/post-story", {"accounts": name})
         elif data == "stories_all":
             await query.edit_message_text("📸 Истории на всех...")
             overview = await api_get(session, "/api/ig-web-upload/overview")
-            names = [a["name"] for a in overview.get("accounts", []) if a.get("web_upload_login_status") == "logged_in"]
-            result = await api_post(session, "/api/ig-web-upload/post-story", {"accounts": names})
+            names = [a["name"] for a in overview.get("accounts", []) if is_account_usable(a)]
+            # post-story endpoint reads form data; pass as comma-separated string
+            result = await api_post_form(session, "/api/ig-web-upload/post-story", {"accounts": ",".join(names)})
         elif data.startswith("login:"):
             name = data.split(":", 1)[1]
             await query.edit_message_text(f"🔐 Логин @{name}...")
-            result = await api_post(session, "/api/ig-web-upload/workflow", {"task": "auto_login", "accounts": [name]})
+            result = await api_post_json(session, "/api/ig-web-upload/workflow", {"task": "auto_login", "accounts": [name]})
         elif data == "login_all":
             await query.edit_message_text("🔐 Логин всех...")
             overview = await api_get(session, "/api/ig-web-upload/overview")
             names = [a["name"] for a in overview.get("accounts", [])]
-            result = await api_post(session, "/api/ig-web-upload/workflow", {"task": "auto_login", "accounts": names})
+            result = await api_post_json(session, "/api/ig-web-upload/workflow", {"task": "auto_login", "accounts": names})
         elif data == "login_expired":
             await query.edit_message_text("🔐 Перезалогинить протухших...")
             overview = await api_get(session, "/api/ig-web-upload/overview")
@@ -375,17 +545,40 @@ async def callback_handler(update: Update, ctx):
             if not names:
                 await query.message.reply_text("Нет протухших аккаунтов")
                 return
-            result = await api_post(session, "/api/ig-web-upload/workflow", {"task": "auto_login", "accounts": names})
+            result = await api_post_json(session, "/api/ig-web-upload/workflow", {"task": "auto_login", "accounts": names})
+        elif data == "delete_banned":
+            await _show_delete_banned(query)
+            return
+        elif data == "confirm_delete_banned":
+            await query.edit_message_text("🗑 Удаляю забаненные аккаунты...")
+            result = await api_post_json(session, "/api/ig-web-upload/accounts/delete-banned")
+            if result.get("ok"):
+                deleted = result.get("deleted", 0)
+                proxies = result.get("proxies_deleted", 0)
+                msg = f"✅ Удалено {deleted} аккаунтов"
+                if proxies:
+                    msg += f", {proxies} прокси"
+                await query.message.reply_text(msg, reply_markup=main_menu_keyboard())
+            else:
+                await query.message.reply_text(f"❌ {result.get('error', 'ошибка')}")
+            log_action(user_id, username, "delete_banned", result=str(result))
+            return
         else:
             return
 
-    if result.get("ok"):
+    # Handle result for upload/stories/login callbacks
+    if result.get("ok") and result.get("started", True) is not False:
         run_id = result.get("run_id", "")
         log_action(user_id, username, data, detail=f"accounts={result.get('accounts','')}", result=f"run_id={run_id}")
-        await query.message.reply_text(f"✅ Запущено! run_id={run_id}")
+        await query.message.reply_text(f"✅ Запущено! run_id={run_id}", reply_markup=main_menu_keyboard())
+    elif result.get("ok") and result.get("started", True) is False:
+        # empty_selection or similar — ok=True but started=False
+        reason = result.get("reason") or result.get("message") or "не запущено"
+        log_action(user_id, username, data, error=reason)
+        await query.message.reply_text(f"⚠️ {reason}", reply_markup=main_menu_keyboard())
     else:
         log_action(user_id, username, data, error=str(result.get("error")))
-        await query.message.reply_text(f"❌ {result.get('error', 'ошибка')}")
+        await query.message.reply_text(f"❌ {result.get('error', 'ошибка')}", reply_markup=main_menu_keyboard())
 
 # ─── Background: Story Trigger Notifications ──────────────────────────────────
 
@@ -448,14 +641,18 @@ def main():
     app.add_handler(CommandHandler("login", cmd_login))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("session", cmd_session))
+    app.add_handler(CommandHandler("delete_banned", cmd_delete_banned))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Background jobs
+    # Background jobs — require python-telegram-bot[job-queue]
     job_queue = app.job_queue
     if job_queue:
         job_queue.run_repeating(background_check_triggers, interval=600, first=30)
         job_queue.run_repeating(background_hourly_summary, interval=3600, first=60)
+        logger.info("Background jobs: triggers every 10min, hourly summary")
+    else:
+        logger.warning("No JobQueue! Install: pip install \"python-telegram-bot[job-queue]\"")
 
     logger.info("Бот запущен")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
