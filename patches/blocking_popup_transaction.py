@@ -79,7 +79,7 @@ _INSPECT_SCRIPT = r"""() => { // IG_BLOCKING_POPUP_INSPECT
     return true;
   };
   const controlsOf=container=>[...container.querySelectorAll(
-    "button,input[type='button'],input[type='submit'],[role='button'],[role='radio'],label"
+    "button,input[type='button'],input[type='submit'],[role='button'],[role='radio'],label,div[tabindex],a[href]"
   )].filter(visible);
   const editable=el=>visible(el)&&!el.disabled&&!el.readOnly&&
     el.getAttribute('aria-disabled')!=='true'&&
@@ -305,7 +305,7 @@ _ACTION_SCRIPT = r"""payload => { // IG_BLOCKING_POPUP_ACTION
       Math.min(innerHeight,Math.max(0,r.bottom)-Math.max(0,r.top));
     const modal=el.getAttribute('aria-modal')==='true'||el.getAttribute('role')==='dialog';
     const controls=[...el.querySelectorAll(
-      "button,input[type='button'],input[type='submit'],[role='button'],[role='radio'],label"
+      "button,input[type='button'],input[type='submit'],[role='button'],[role='radio'],label,div[tabindex],a[href]"
     )].filter(visible);
     const z=Number.parseInt(s.zIndex,10);
     return {el,controls,score:(Number.isFinite(z)?z:0)*1e9+
@@ -314,7 +314,7 @@ _ACTION_SCRIPT = r"""payload => { // IG_BLOCKING_POPUP_ACTION
   if(!candidates.length){
     const root=document.querySelector('main')||document.body;
     const controls=[...root.querySelectorAll(
-      "button,input[type='button'],input[type='submit'],[role='button'],[role='radio'],label"
+      "button,input[type='button'],input[type='submit'],[role='button'],[role='radio'],label,div[tabindex],a[href]"
     )].filter(visible);
     const labels=controls.map(el=>norm(el.getAttribute('aria-label')||
       el.getAttribute('value')||el.innerText||el.textContent));
