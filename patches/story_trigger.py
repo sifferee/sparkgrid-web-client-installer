@@ -42,18 +42,20 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 SPARKGRID_API = os.environ.get("SPARKGRID_API_URL", "http://127.0.0.1:8770")
 
-# Threshold range for triggering — lower to catch reels earlier
-VIEWS_THRESHOLD_MIN = 5000
-VIEWS_THRESHOLD_MAX = 12000
+# Threshold range for triggering — first reel must hit 10-23K views
+VIEWS_THRESHOLD_MIN = 10000
+VIEWS_THRESHOLD_MAX = 23000
 
-# Daily story interval — base 20h + random spread (was 24h)
-DAILY_INTERVAL_HOURS = 20
+# Daily story interval — 24h base + 10-60 min random spread
+# Instagram detects exact 24h patterns; the spread prevents that
+DAILY_INTERVAL_HOURS = 24
 DAILY_SPREAD_MIN_SEC = 600   # 10 min
 DAILY_SPREAD_MAX_SEC = 3600  # 60 min
 
-# Delay between story posts across accounts (seconds) — was 10-60 min
-INTER_ACCOUNT_DELAY_MIN = 180   # 3 min
-INTER_ACCOUNT_DELAY_MAX = 600  # 10 min
+# Delay between story posts across accounts (seconds)
+# Human-like spacing so Instagram doesn't see simultaneous posting
+INTER_ACCOUNT_DELAY_MIN = 600  # 10 min
+INTER_ACCOUNT_DELAY_MAX = 3600  # 60 min
 
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -359,8 +361,8 @@ def start_trigger_thread() -> "threading.Thread":
                 run_trigger_check()
             except Exception as e:
                 log(f"Loop error: {e}", "ERROR")
-            # Check every 5 minutes — was 10 min, too slow for 5K threshold
-            time.sleep(300)
+            # Check every 15 minutes
+            time.sleep(900)
 
     t = threading.Thread(target=_loop, daemon=True, name="story-trigger")
     t.start()
