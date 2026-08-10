@@ -173,7 +173,7 @@ def main_menu_keyboard():
         [InlineKeyboardButton("🛑 Стоп всё", callback_data="cmd:stop")],
     ])
 
-WELCOME = """🤖 *SparkGrid Бот*
+WELCOME = """🤖 SparkGrid Бот
 
 Выбери действие из меню ниже 👇
 
@@ -192,7 +192,7 @@ WELCOME = """🤖 *SparkGrid Бот*
 
 async def cmd_start(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "start")
-    await update.message.reply_text(WELCOME, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+    await update.message.reply_text(WELCOME, reply_markup=main_menu_keyboard())
 
 async def cmd_status(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "status")
@@ -214,7 +214,7 @@ async def cmd_status(update: Update, ctx):
         emoji = "✅" if usable else "❌" if login in ("suspended", "failed") else "⚠️"
         lines.append(f"{emoji} @{a['name']} | {login} | {priv}")
     log_action(update.effective_user.id, update.effective_user.username, "status", result=f"{len(accounts)} accounts")
-    await _reply(update, "\n".join(lines), parse_mode="Markdown")
+    await _reply(update, "\n".join(lines))
 
 async def cmd_metrics(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "metrics")
@@ -246,7 +246,7 @@ async def _send_metrics(update_or_query):
             likes = a.get("total_likes", 0)
             msg += f"\n@{name}: {fmt(fol)} подп | {fmt(views)} просм | {fmt(likes)} лайков"
     log_action(0, "?", "metrics", result=f"followers={t.get('followers',0)}")
-    await _reply(update_or_query, msg, parse_mode="Markdown")
+    await _reply(update_or_query, msg)
 
 async def cmd_upload(update: Update, ctx):
     log_action(update.effective_user.id, update.effective_user.username, "upload_menu")
@@ -387,7 +387,7 @@ async def _run_session_check(update_or_query):
         if suspended_names:
             keyboard.append([InlineKeyboardButton(f"🗑 Удалить {len(suspended_names)} забаненных", callback_data="confirm_delete_banned")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="cmd:start")])
-    await _reply(update_or_query, msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await _reply(update_or_query, msg, reply_markup=InlineKeyboardMarkup(keyboard))
     log_action(0, "?", "session_check", result=f"active={len(active)} expired={len(expired)}")
 
 async def cmd_stop(update: Update, ctx):
@@ -454,7 +454,7 @@ async def callback_handler(update: Update, ctx):
 
     # ─── Menu navigation (cmd:* callbacks) ───
     if data == "cmd:start":
-        await query.edit_message_text(WELCOME, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(WELCOME, reply_markup=main_menu_keyboard())
         return
     if data == "cmd:status":
         await cmd_status(update, ctx)
@@ -624,7 +624,7 @@ async def background_hourly_summary(ctx: ContextTypes.DEFAULT_TYPE):
             f"Просмотры: {fmt(t.get('views',0))} ({fmt_delta(dl.get('views',0))})\n"
             f"Лайки: {fmt(t.get('likes',0))} ({fmt_delta(dl.get('likes',0))})"
         )
-        await ctx.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+        await ctx.bot.send_message(chat_id=CHAT_ID, text=msg)
     except Exception as e:
         logger.warning(f"hourly summary error: {e}")
 
