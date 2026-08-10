@@ -273,6 +273,10 @@ def run_trigger_check() -> int:
             log("No story-ready accounts found.")
             return 0
 
+        # Shuffle account order every cycle — prevents fixed sequential pattern
+        import random as _rng
+        _rng.shuffle(accounts)
+
         log(f"Checking {len(accounts)} accounts for story triggers")
 
         for acc in accounts:
@@ -362,8 +366,8 @@ def start_trigger_thread() -> "threading.Thread":
                 run_trigger_check()
             except Exception as e:
                 log(f"Loop error: {e}", "ERROR")
-            # Check every 15 minutes
-            time.sleep(900)
+            # Random interval 5-43 min — prevents fixed check pattern
+            time.sleep(random.randint(300, 2580))
 
     t = threading.Thread(target=_loop, daemon=True, name="story-trigger")
     t.start()

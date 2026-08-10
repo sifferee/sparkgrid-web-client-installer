@@ -771,7 +771,7 @@ async def callback_handler(update: Update, ctx):
             result = await api_post_json(session, "/api/ig-web-upload/start", {
                 "accounts": [name], "engine": "clean_web", "browser_parallel": 1,
                 "target": 3, "pre_warmup_min": 1, "pre_warmup_max": 2,
-                "post_warmup_min": 1, "post_warmup_max": 3, "cooldown_hours": 4,
+                "post_warmup_min": 1, "post_warmup_max": 3, "cooldown_hours": 8,
             })
         elif data == "upload_all":
             await query.edit_message_text("🚀 Залив всех готовых аккаунтов...")
@@ -783,7 +783,7 @@ async def callback_handler(update: Update, ctx):
             result = await api_post_json(session, "/api/ig-web-upload/start", {
                 "accounts": names, "engine": "clean_web", "browser_parallel": 5,
                 "target": 3, "pre_warmup_min": 1, "pre_warmup_max": 2,
-                "post_warmup_min": 1, "post_warmup_max": 3, "cooldown_hours": 4,
+                "post_warmup_min": 1, "post_warmup_max": 3, "cooldown_hours": 8,
             })
         elif data.startswith("stories:"):
             name = data.split(":", 1)[1]
