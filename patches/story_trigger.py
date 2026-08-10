@@ -52,10 +52,10 @@ DAILY_INTERVAL_HOURS = 24
 DAILY_SPREAD_MIN_SEC = 600   # 10 min
 DAILY_SPREAD_MAX_SEC = 3600  # 60 min
 
-# Delay between story posts across accounts (seconds)
-# Human-like spacing so Instagram doesn't see simultaneous posting
-INTER_ACCOUNT_DELAY_MIN = 600  # 10 min
-INTER_ACCOUNT_DELAY_MAX = 3600  # 60 min
+# Delay between story posts across accounts — disabled
+# Each account runs through its own browser/proxy, no correlation visible to Instagram
+INTER_ACCOUNT_DELAY_MIN = 0
+INTER_ACCOUNT_DELAY_MAX = 0
 
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -333,10 +333,11 @@ def run_trigger_check() -> int:
                 posted += 1
                 log(f"@{name}: ✅ Story posted (job_id={job_id})")
 
-                # Random delay before next account
-                delay = random.uniform(INTER_ACCOUNT_DELAY_MIN, INTER_ACCOUNT_DELAY_MAX)
-                log(f"Waiting {delay:.0f}s before next account")
-                time.sleep(delay)
+                # No delay between accounts — each has own proxy/browser
+                if INTER_ACCOUNT_DELAY_MAX > 0:
+                    delay = random.uniform(INTER_ACCOUNT_DELAY_MIN, INTER_ACCOUNT_DELAY_MAX)
+                    log(f"Waiting {delay:.0f}s before next account")
+                    time.sleep(delay)
             else:
                 error = str(result.get("error") or result.get("reason") or result.get("message") or "unknown")
                 log(f"@{name}: ❌ Story post failed: {error}", "ERROR")
