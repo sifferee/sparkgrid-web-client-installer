@@ -244,7 +244,7 @@ def main_menu_keyboard():
 
 WELCOME = """🤖 SparkGrid Бот
 
-Выбери действие из меню ниже 👇
+Меню всегда доступно по кнопке меню (≡) слева от поля ввода.
 
 Или команды:
 /status — список аккаунтов
@@ -302,15 +302,37 @@ async def cmd_status(update: Update, ctx):
     if not accounts:
         await _reply(update, "Нет аккаунтов")
         return
-    lines = ["*Аккаунты:*"]
-    for a in accounts:
-        login = a.get("web_upload_login_status", "?")
-        priv = a.get("web_privacy_status", "?")
-        usable = is_account_usable(a)
-        emoji = "✅" if usable else "❌" if login in ("suspended", "failed") else "⚠️"
-        lines.append(f"{emoji} @{a['name']} | {login} | {priv}")
+
+    active = [a for a in accounts if is_account_usable(a)]
+    suspended = [a for a in accounts if a.get("web_upload_login_status") == "suspended"]
+    other = [a for a in accounts if a not in active and a not in suspended]
+
+    msg = f"📋 Аккаунты: {len(accounts)} всего\n"
+    msg += f"✅ Активные: {len(active)}\n"
+    if suspended:
+        msg += f"❌ Забаненные: {len(suspended)}\n"
+    if other:
+        msg += f"⚠️ Проблемные: {len(other)}\n"
+
+    # Show active accounts (max 10 if few, compact if many)
+    if len(active) <= 10:
+        msg += "\n"
+        for a in active:
+            priv = a.get("web_privacy_status", "?")
+            msg += f"✅ @{a['name']} | {priv}\n"
+    else:
+        # Compact: just names
+        msg += "\n✅ " + ", ".join(f"@{a['name']}" for a in active[:15])
+        if len(active) > 15:
+            msg += f" +{len(active)-15} ещё"
+
+    if suspended and len(suspended) <= 5:
+        msg += "\n\n"
+        for a in suspended:
+            msg += f"❌ @{a['name']}\n"
+
     log_action(update.effective_user.id, update.effective_user.username, "status", result=f"{len(accounts)} accounts")
-    await _reply(update, "\n".join(lines))
+    await _reply(update, msg)
 
 async def cmd_metrics(update: Update, ctx):
     if not await _check_auth(update):
@@ -325,25 +347,62 @@ async def _send_metrics(update_or_query):
         log_action(0, "?", "metrics", error="нет данных")
         await _reply(update_or_query, "❌ Нет данных метрики. Запусти /check")
         return
+
     t = data.get("total", {})
     dl = data.get("delta_24h", {})
-    msg = (
-        f"📊 *Итого*\n"
-        f"Подписчики: {fmt(t.get('followers',0))} ({fmt_delta(dl.get('followers',0))})\n"
-        f"Просмотры: {fmt(t.get('views',0))} ({fmt_delta(dl.get('views',0))})\n"
-        f"Лайки: {fmt(t.get('likes',0))} ({fmt_delta(dl.get('likes',0))})\n"
-        f"Комментарии: {fmt(t.get('comments',0))} ({fmt_delta(dl.get('comments',0))})\n"
-    )
     accounts = data.get("accounts", [])
-    if accounts:
-        msg += "\n*По аккаунтам:*"
-        for a in accounts[:15]:
+
+    def _arrow(delta):
+        """Format delta with arrow emoji — only show if non-zero."""
+        if delta > 0:
+            return f" ▲{fmt(delta)}"
+        elif delta < 0:
+            return f" ▼{abs(delta)}"
+        return ""
+
+    # ── Summary block (always shown, compact) ──
+    msg = "📊 Метрики за 24ч\n"
+    msg += f"Подписчики: {fmt(t.get('followers',0))}{_arrow(dl.get('followers',0))}\n"
+    msg += f"Просмотры: {fmt(t.get('views',0))}{_arrow(dl.get('views',0))}\n"
+    msg += f"Лайки: {fmt(t.get('likes',0))}{_arrow(dl.get('likes',0))}\n"
+    msg += f"Комментарии: {fmt(t.get('comments',0))}{_arrow(dl.get('comments',0))}\n"
+
+    if not accounts:
+        await _reply(update_or_query, msg)
+        return
+
+    # ── Top performers (max 5, sorted by followers) ──
+    with_data = [a for a in accounts if int(a.get("followers", 0) or 0) > 0 or int(a.get("total_views", 0) or 0) > 0]
+    no_data = [a for a in accounts if int(a.get("followers", 0) or 0) == 0 and int(a.get("total_views", 0) or 0) == 0]
+
+    if with_data:
+        # Sort by followers desc, take top 5
+        top = sorted(with_data, key=lambda a: int(a.get("followers", 0) or 0), reverse=True)[:5]
+        msg += f"\n🏆 Топ-{len(top)} по подписчикам:"
+        for a in top:
             name = a.get("name", "?")
-            fol = a.get("followers", 0)
-            views = a.get("total_views", 0)
-            likes = a.get("total_likes", 0)
-            msg += f"\n@{name}: {fmt(fol)} подп | {fmt(views)} просм | {fmt(likes)} лайков"
-    log_action(0, "?", "metrics", result=f"followers={t.get('followers',0)}")
+            fol = int(a.get("followers", 0) or 0)
+            views = int(a.get("total_views", 0) or 0)
+            delta = a.get("delta", {})
+            d_fol = _arrow(delta.get("followers", 0))
+            msg += f"\n  {fmt(fol)} подп | {fmt(views)} просм @{name}{d_fol}"
+
+    # ── Accounts with no metrics (one line) ──
+    if no_data:
+        if len(no_data) <= 3:
+            names = ", ".join(f"@{a.get('name','?')}" for a in no_data)
+            msg += f"\n\n⚠️ Нет метрик: {names}"
+        else:
+            msg += f"\n\n⚠️ {len(no_data)} аккаунтов без метрик"
+
+    # ── Failed accounts (restricted/banned) ──
+    failed = [a for a in accounts if a.get("error")]
+    if failed and len(failed) <= 3:
+        for a in failed:
+            if a not in no_data:
+                msg += f"\n🚫 @{a.get('name','?')}: {str(a.get('error',''))[:40]}"
+
+    log_action(0, "?", "metrics", result=f"followers={t.get('followers',0)} accounts={len(accounts)}")
     await _reply(update_or_query, msg)
 
 async def cmd_upload(update: Update, ctx):
@@ -827,11 +886,19 @@ async def background_hourly_summary(ctx: ContextTypes.DEFAULT_TYPE):
             return
         t = data.get("total", {})
         dl = data.get("delta_24h", {})
+
+        def _arrow(delta):
+            if delta > 0:
+                return f" ▲{fmt(delta)}"
+            elif delta < 0:
+                return f" ▼{abs(delta)}"
+            return ""
+
         msg = (
             f"📊 Часовая сводка\n"
-            f"Подписчики: {fmt(t.get('followers',0))} ({fmt_delta(dl.get('followers',0))})\n"
-            f"Просмотры: {fmt(t.get('views',0))} ({fmt_delta(dl.get('views',0))})\n"
-            f"Лайки: {fmt(t.get('likes',0))} ({fmt_delta(dl.get('likes',0))})"
+            f"Подписчики: {fmt(t.get('followers',0))}{_arrow(dl.get('followers',0))}\n"
+            f"Просмотры: {fmt(t.get('views',0))}{_arrow(dl.get('views',0))}\n"
+            f"Лайки: {fmt(t.get('likes',0))}{_arrow(dl.get('likes',0))}"
         )
         for chat_id in authorized_chat_ids():
             try:
@@ -955,6 +1022,26 @@ def main():
         logger.warning("No JobQueue! Install: pip install \"python-telegram-bot[job-queue]\"")
 
     logger.info(f"Бот запущен. Авторизованных пользователей: {len(AUTHORIZED_USERS)}")
+
+    # Set native Telegram command menu (≡ button, always visible)
+    from telegram import BotCommand
+    try:
+        app.bot.set_my_commands([
+            BotCommand("status", "📋 Аккаунты"),
+            BotCommand("metrics", "📊 Метрики"),
+            BotCommand("upload", "🚀 Залить рилсы"),
+            BotCommand("stories", "📸 Истории"),
+            BotCommand("login", "🔐 Логин"),
+            BotCommand("session", "🔍 Проверить сессии"),
+            BotCommand("check", "📈 Собрать метрики"),
+            BotCommand("delete_banned", "🗑 Удалить забаненные"),
+            BotCommand("stop", "🛑 Стоп всё"),
+            BotCommand("users", "👥 Пользователи бота"),
+        ])
+        logger.info("Native Telegram menu set")
+    except Exception as e:
+        logger.warning(f"Failed to set native menu: {e}")
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

@@ -379,6 +379,17 @@ def save_snapshot(
     parser_profile: str = "",
     error: str = "",
 ) -> None:
+    # If all key metrics are zero, this is likely a collection failure
+    # (Ads Power session lost, Instagram blocked, account restricted) — not a
+    # real data point.  Skip saving so the previous valid snapshot remains and
+    # delta calculations don't produce false massive drops.
+    fol = int(metrics.get("followers", 0))
+    views = int(metrics.get("total_views", 0))
+    likes = int(metrics.get("total_likes", 0))
+    if fol == 0 and views == 0 and likes == 0 and not error:
+        log(f"  @{account_name}: all metrics zero — skipping snapshot (likely collection failure)", "WARNING")
+        return
+
     conn = _db_conn()
     try:
         ensure_metrics_schema(conn)
@@ -393,12 +404,12 @@ def save_snapshot(
             """,
             (
                 account_name, now_iso,
-                int(metrics.get("followers", 0)),
+                fol,
                 int(metrics.get("following", 0)),
                 int(metrics.get("posts_count", 0)),
-                int(metrics.get("total_likes", 0)),
+                likes,
                 int(metrics.get("total_comments", 0)),
-                int(metrics.get("total_views", 0)),
+                views,
                 int(metrics.get("active_stories_count", 0)),
                 json.dumps(metrics.get("posts", []), ensure_ascii=False)[:5000],
                 parser_profile,
@@ -638,10 +649,22 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
     for r in rows:
         d = dict(r)
         old = old_map.get(d["account_name"], {})
-        df = int(d["followers"] or 0) - int(old.get("followers", 0) or 0)
-        dv = int(d["total_views"] or 0) - int(old.get("total_views", 0) or 0)
-        dl = int(d["total_likes"] or 0) - int(old.get("total_likes", 0) or 0)
-        dc = int(d["total_comments"] or 0) - int(old.get("total_comments", 0) or 0)
+        cur_fol = int(d["followers"] or 0)
+        cur_views = int(d["total_views"] or 0)
+        cur_likes = int(d["total_likes"] or 0)
+        cur_comments = int(d["total_comments"] or 0)
+        old_fol = int(old.get("followers", 0) or 0)
+        old_views = int(old.get("total_views", 0) or 0)
+        old_likes = int(old.get("total_likes", 0) or 0)
+        old_comments = int(old.get("total_comments", 0) or 0)
+
+        # Delta: only compute when BOTH values are non-zero.
+        # If current or previous is zero, the data is unreliable (collection
+        # failure) — showing a fake -82K drop would be misleading.
+        df = cur_fol - old_fol if (cur_fol > 0 and old_fol > 0) else 0
+        dv = cur_views - old_views if (cur_views > 0 and old_views > 0) else 0
+        dl = cur_likes - old_likes if (cur_likes > 0 and old_likes > 0) else 0
+        dc = cur_comments - old_comments if (cur_comments > 0 and old_comments > 0) else 0
 
         accounts.append({
             "name": d["account_name"],
@@ -662,10 +685,10 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
             },
         })
 
-        total_followers += int(d["followers"] or 0)
-        total_views += int(d["total_views"] or 0)
-        total_likes += int(d["total_likes"] or 0)
-        total_comments += int(d["total_comments"] or 0)
+        total_followers += cur_fol
+        total_views += cur_views
+        total_likes += cur_likes
+        total_comments += cur_comments
         delta_followers += df
         delta_views += dv
         delta_likes += dl
