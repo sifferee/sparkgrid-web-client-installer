@@ -15,15 +15,20 @@ Commands:
   /session   — check sessions (check_login on all)
   /delete_banned — delete banned accounts
   /stop      — stop all processes
+  /add_user  — (admin) add user by chat_id: /add_user 123456789
+  /remove_user — (admin) remove user by chat_id
+  /users     — (admin) list authorized users
 
 Passive: checks for new story triggers every 10 min, sends hourly summary.
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -37,12 +42,76 @@ from telegram.ext import (
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID") or 0)
 API_URL = os.environ.get("SPARKGRID_API_URL", "http://127.0.0.1:8770")
 
 if not BOT_TOKEN:
     print("ERROR: set TELEGRAM_BOT_TOKEN env var")
     sys.exit(1)
+
+# ─── User Authorization ───────────────────────────────────────────────────────
+
+DATA_DIR = Path(os.environ.get("SPARKGRID_DATA_DIR") or ".")
+USERS_FILE = DATA_DIR / "telegram_users.json"
+
+
+def load_users() -> dict:
+    """Load authorized users from JSON. Returns {str(chat_id): {username, role, added_at}}."""
+    try:
+        if USERS_FILE.exists():
+            return json.loads(USERS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"Failed to load users file: {e}")
+    # First run — seed with admin from env
+    if CHAT_ID:
+        admin = {str(CHAT_ID): {"username": "admin", "role": "admin", "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}}
+        save_users(admin)
+        return admin
+    return {}
+
+
+def save_users(users: dict) -> None:
+    """Save authorized users to JSON."""
+    try:
+        USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to save users file: {e}")
+
+
+AUTHORIZED_USERS: dict = load_users()
+
+
+def is_authorized(user_id: int) -> bool:
+    return str(user_id) in AUTHORIZED_USERS
+
+
+def is_admin(user_id: int) -> bool:
+    entry = AUTHORIZED_USERS.get(str(user_id), {})
+    return entry.get("role") == "admin"
+
+
+def authorized_chat_ids() -> list[int]:
+    """Return all authorized chat IDs (for broadcasting)."""
+    return [int(k) for k in AUTHORIZED_USERS if k.isdigit()]
+
+
+def add_user(chat_id: int, username: str, role: str = "user") -> None:
+    AUTHORIZED_USERS[str(chat_id)] = {
+        "username": username,
+        "role": role,
+        "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_users(AUTHORIZED_USERS)
+
+
+def remove_user(chat_id: int) -> bool:
+    key = str(chat_id)
+    if key in AUTHORIZED_USERS and AUTHORIZED_USERS[key].get("role") != "admin":
+        del AUTHORIZED_USERS[key]
+        save_users(AUTHORIZED_USERS)
+        return True
+    return False
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -190,11 +259,38 @@ WELCOME = """🤖 SparkGrid Бот
 
 # ─── Commands ──────────────────────────────────────────────────────────────────
 
+async def _check_auth(update: Update) -> bool:
+    """Check if user is authorized. If not, send access request to admins."""
+    user = update.effective_user
+    if user and is_authorized(user.id):
+        return True
+    # Unauthorized — notify admins
+    if user:
+        msg = f"🔒 Запрос доступа:\n@{user.username or '?'} ({user.id})\nИмя: {user.first_name or '?'}"
+        for admin_id in authorized_chat_ids():
+            if is_admin(admin_id):
+                try:
+                    keyboard = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Одобрить", callback_data=f"approve:{user.id}:{user.username or user.first_name or '?'}"),
+                        InlineKeyboardButton("❌ Отклонить", callback_data=f"deny:{user.id}"),
+                    ]])
+                    await update.get_bot().send_message(chat_id=admin_id, text=msg, reply_markup=keyboard)
+                except Exception:
+                    pass
+    if update.message:
+        await update.message.reply_text("🔒 У вас нет доступа. Запрос отправлен администратору.")
+    return False
+
+
 async def cmd_start(update: Update, ctx):
+    if not await _check_auth(update):
+        return
     log_action(update.effective_user.id, update.effective_user.username, "start")
     await update.message.reply_text(WELCOME, reply_markup=main_menu_keyboard())
 
 async def cmd_status(update: Update, ctx):
+    if not await _check_auth(update):
+        return
     log_action(update.effective_user.id, update.effective_user.username, "status")
     async with aiohttp.ClientSession() as session:
         data = await api_get(session, "/api/ig-web-upload/overview")
@@ -217,6 +313,8 @@ async def cmd_status(update: Update, ctx):
     await _reply(update, "\n".join(lines))
 
 async def cmd_metrics(update: Update, ctx):
+    if not await _check_auth(update):
+        return
     log_action(update.effective_user.id, update.effective_user.username, "metrics")
     await _send_metrics(update)
 
@@ -249,6 +347,8 @@ async def _send_metrics(update_or_query):
     await _reply(update_or_query, msg)
 
 async def cmd_upload(update: Update, ctx):
+    if not await _check_auth(update):
+        return
     log_action(update.effective_user.id, update.effective_user.username, "upload_menu")
     await _show_upload_menu(update)
 
@@ -270,6 +370,8 @@ async def _show_upload_menu(update_or_query):
     await _reply(update_or_query, "Выбери аккаунты для залива:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_stories(update: Update, ctx):
+    if not await _check_auth(update):
+        return
     log_action(update.effective_user.id, update.effective_user.username, "stories_menu")
     await _show_stories_menu(update)
 
@@ -291,6 +393,8 @@ async def _show_stories_menu(update_or_query):
     await _reply(update_or_query, "Выбери аккаунты для историй:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_login(update: Update, ctx):
+    if not await _check_auth(update):
+        return
     log_action(update.effective_user.id, update.effective_user.username, "login_menu")
     async with aiohttp.ClientSession() as session:
         data = await api_get(session, "/api/ig-web-upload/overview")
@@ -309,6 +413,8 @@ async def cmd_login(update: Update, ctx):
     await _reply(update, "Выбери аккаунты для авто-логина:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_check(update: Update, ctx):
+    if not await _check_auth(update):
+        return
     log_action(update.effective_user.id, update.effective_user.username, "check_metrics")
     async with aiohttp.ClientSession() as session:
         data = await api_post_json(session, "/api/ig-web-upload/metrics/run")
@@ -319,6 +425,8 @@ async def cmd_check(update: Update, ctx):
         await _reply(update, f"❌ {data.get('error', 'ошибка')}")
 
 async def cmd_session(update: Update, ctx):
+    if not await _check_auth(update):
+        return
     log_action(update.effective_user.id, update.effective_user.username, "session_check")
     await _run_session_check(update)
 
@@ -391,6 +499,8 @@ async def _run_session_check(update_or_query):
     log_action(0, "?", "session_check", result=f"active={len(active)} expired={len(expired)}")
 
 async def cmd_stop(update: Update, ctx):
+    if not await _check_auth(update):
+        return
     log_action(update.effective_user.id, update.effective_user.username, "stop")
     async with aiohttp.ClientSession() as session:
         data = await api_post_json(session, "/api/ig-web-upload/stop")
@@ -402,6 +512,8 @@ async def cmd_stop(update: Update, ctx):
 
 async def cmd_delete_banned(update: Update, ctx):
     """Delete all suspended/banned accounts."""
+    if not await _check_auth(update):
+        return
     log_action(update.effective_user.id, update.effective_user.username, "delete_banned")
     await _show_delete_banned(update)
 
@@ -438,6 +550,67 @@ async def _reply(update_or_query, text, **kwargs):
     elif hasattr(update_or_query, "reply_text"):
         await update_or_query.reply_text(text, **kwargs)
 
+# ─── Admin Commands ────────────────────────────────────────────────────────────
+
+async def cmd_add_user(update: Update, ctx):
+    """Admin: /add_user <chat_id> [username] — add user to whitelist."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Только администратор может добавлять пользователей")
+        return
+    args = ctx.args
+    if not args:
+        await update.message.reply_text("Использование: /add_user <chat_id> [username]\nНапример: /add_user 123456789 daris")
+        return
+    try:
+        new_chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ chat_id должен быть числом")
+        return
+    username = args[1] if len(args) > 1 else "user"
+    add_user(new_chat_id, username, role="user")
+    log_action(update.effective_user.id, update.effective_user.username, "add_user", detail=f"new_user={new_chat_id}({username})")
+    await update.message.reply_text(f"✅ Пользователь @{username} ({new_chat_id}) добавлен")
+
+
+async def cmd_remove_user(update: Update, ctx):
+    """Admin: /remove_user <chat_id> — remove user from whitelist."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Только администратор может удалять пользователей")
+        return
+    args = ctx.args
+    if not args:
+        await update.message.reply_text("Использование: /remove_user <chat_id>")
+        return
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ chat_id должен быть числом")
+        return
+    if is_admin(target_id):
+        await update.message.reply_text("⛔ Нельзя удалить администратора")
+        return
+    if remove_user(target_id):
+        log_action(update.effective_user.id, update.effective_user.username, "remove_user", detail=f"removed={target_id}")
+        await update.message.reply_text(f"✅ Пользователь {target_id} удалён")
+    else:
+        await update.message.reply_text("❌ Пользователь не найден")
+
+
+async def cmd_users(update: Update, ctx):
+    """Admin: list all authorized users."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Только администратор")
+        return
+    if not AUTHORIZED_USERS:
+        await update.message.reply_text("Нет авторизованных пользователей")
+        return
+    lines = ["👥 Авторизованные пользователи:"]
+    for chat_id, info in AUTHORIZED_USERS.items():
+        role_emoji = "👑" if info.get("role") == "admin" else "👤"
+        lines.append(f"{role_emoji} @{info.get('username','?')} ({chat_id}) — {info.get('role','user')}")
+    await update.message.reply_text("\n".join(lines))
+
+
 # ─── Callback Handler ─────────────────────────────────────────────────────────
 
 async def callback_handler(update: Update, ctx):
@@ -446,6 +619,41 @@ async def callback_handler(update: Update, ctx):
     data = query.data
     user_id = update.effective_user.id if update.effective_user else 0
     username = update.effective_user.username if update.effective_user else "?"
+
+    # ─── Access approval/denial (admin only) ───
+    if data.startswith("approve:"):
+        if not is_admin(user_id):
+            await query.edit_message_text("⛔ Только администратор может одобрять")
+            return
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await query.edit_message_text("❌ Неверный формат")
+            return
+        approved_id = int(parts[1])
+        approved_name = parts[2]
+        add_user(approved_id, approved_name, role="user")
+        log_action(user_id, username, "approve_user", detail=f"approved={approved_id}({approved_name})")
+        await query.edit_message_text(f"✅ Одобрен: @{approved_name} ({approved_id})")
+        # Notify the approved user
+        try:
+            await ctx.bot.send_message(chat_id=approved_id, text="✅ Доступ одобрен! Напиши /start чтобы начать.")
+        except Exception:
+            pass
+        return
+
+    if data.startswith("deny:"):
+        if not is_admin(user_id):
+            await query.edit_message_text("⛔ Только администратор")
+            return
+        denied_id = int(data.split(":")[1])
+        log_action(user_id, username, "deny_user", detail=f"denied={denied_id}")
+        await query.edit_message_text(f"❌ Отклонён: {denied_id}")
+        return
+
+    # ─── Auth check for all other callbacks ───
+    if not is_authorized(user_id):
+        await query.edit_message_text("🔒 Нет доступа")
+        return
 
     if data == "cancel":
         log_action(user_id, username, "cancel")
@@ -585,7 +793,7 @@ async def callback_handler(update: Update, ctx):
 last_seen_trigger_id = 0
 
 async def background_check_triggers(ctx: ContextTypes.DEFAULT_TYPE):
-    """Check for new story triggers every 10 min."""
+    """Check for new story triggers every 10 min. Notify all authorized users."""
     global last_seen_trigger_id
     try:
         async with aiohttp.ClientSession() as session:
@@ -601,16 +809,17 @@ async def background_check_triggers(ctx: ContextTypes.DEFAULT_TYPE):
                 name = t.get("account_name", "?")
                 views = t.get("trigger_views", 0)
                 msg = f"🔔 @{name}: Рилс набрал {fmt(views)} просмотров — История залита автоматически!"
-                try:
-                    await ctx.bot.send_message(chat_id=CHAT_ID, text=msg)
-                except Exception:
-                    pass
+                for chat_id in authorized_chat_ids():
+                    try:
+                        await ctx.bot.send_message(chat_id=chat_id, text=msg)
+                    except Exception:
+                        pass
             last_seen_trigger_id = max(last_seen_trigger_id, tid)
     except Exception as e:
         logger.warning(f"trigger check error: {e}")
 
 async def background_hourly_summary(ctx: ContextTypes.DEFAULT_TYPE):
-    """Send hourly metrics summary."""
+    """Send hourly metrics summary to all authorized users."""
     try:
         async with aiohttp.ClientSession() as session:
             data = await api_get(session, "/api/ig-web-upload/metrics/overview?hours=24")
@@ -619,12 +828,16 @@ async def background_hourly_summary(ctx: ContextTypes.DEFAULT_TYPE):
         t = data.get("total", {})
         dl = data.get("delta_24h", {})
         msg = (
-            f"📊 *Часовая сводка*\n"
+            f"📊 Часовая сводка\n"
             f"Подписчики: {fmt(t.get('followers',0))} ({fmt_delta(dl.get('followers',0))})\n"
             f"Просмотры: {fmt(t.get('views',0))} ({fmt_delta(dl.get('views',0))})\n"
             f"Лайки: {fmt(t.get('likes',0))} ({fmt_delta(dl.get('likes',0))})"
         )
-        await ctx.bot.send_message(chat_id=CHAT_ID, text=msg)
+        for chat_id in authorized_chat_ids():
+            try:
+                await ctx.bot.send_message(chat_id=chat_id, text=msg)
+            except Exception:
+                pass
     except Exception as e:
         logger.warning(f"hourly summary error: {e}")
 
@@ -643,6 +856,10 @@ def main():
     app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(CommandHandler("delete_banned", cmd_delete_banned))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    # Admin commands
+    app.add_handler(CommandHandler("add_user", cmd_add_user))
+    app.add_handler(CommandHandler("remove_user", cmd_remove_user))
+    app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     # Background jobs — require python-telegram-bot[job-queue]
@@ -650,11 +867,11 @@ def main():
     if job_queue:
         job_queue.run_repeating(background_check_triggers, interval=600, first=30)
         job_queue.run_repeating(background_hourly_summary, interval=3600, first=60)
-        logger.info("Background jobs: triggers every 10min, hourly summary")
+        logger.info(f"Background jobs: triggers every 10min, hourly summary. Users: {len(AUTHORIZED_USERS)}")
     else:
         logger.warning("No JobQueue! Install: pip install \"python-telegram-bot[job-queue]\"")
 
-    logger.info("Бот запущен")
+    logger.info(f"Бот запущен. Авторизованных пользователей: {len(AUTHORIZED_USERS)}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
