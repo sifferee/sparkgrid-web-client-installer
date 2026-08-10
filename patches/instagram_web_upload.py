@@ -3499,6 +3499,7 @@ def _legacy_upload_video_web_linear(page, dump: LiveDump, video_path: str, capti
             return {"ok": False, "status": "MANUAL_REQUIRED", "error": "Share/Post was not ready after 4 checks"}
 
         accepted_without_identity = False
+        share_fail_retries = 0  # post-Share "Try again" attempts
         for n in range(90):
             # A transient helper page must not replace the submitted composer.
             page = ensure_single_browser_page(page, dump)
@@ -3533,7 +3534,23 @@ def _legacy_upload_video_web_linear(page, dump: LiveDump, video_path: str, capti
                     "_success_observer": success_observer,
                 }
             if state.get("state") == "SHARE_FAILED":
-                dump.capture(page, "upload_share_failed_dialog", json.dumps(state, ensure_ascii=False)[:1200], force_snapshot=True)
+                # Post-share "couldn't be shared" dialog — try clicking "Try again"
+                # up to 3 times before giving up.  The pre-share retry loop at
+                # line ~3366 only covers the crop/caption stage; this covers the
+                # post-Share failure dialog.
+                retry_clicked = click_dialog_label_js(
+                    page, ["Try again", "Retry", "Повторить", "Tekrar dene"],
+                    prefer_last=False,
+                )
+                if retry_clicked and share_fail_retries < 3:
+                    share_fail_retries += 1
+                    dump.capture(page, f"upload_post_share_retry_{share_fail_retries}",
+                                 f"SHARE_FAILED after Share; clicking Try again (attempt {share_fail_retries}/3)",
+                                 force_snapshot=True)
+                    jitter(3, 5)  # human-like pause before Instagram re-processes
+                    continue
+                dump.capture(page, "upload_share_failed_dialog",
+                             json.dumps(state, ensure_ascii=False)[:1200], force_snapshot=True)
                 return submitted_unverified_result(observation)
             if observation.get("request_state") == "rejected":
                 dump.capture(page, "upload_publish_rejected", json.dumps({

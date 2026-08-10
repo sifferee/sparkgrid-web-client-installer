@@ -841,6 +841,88 @@ async def background_hourly_summary(ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning(f"hourly summary error: {e}")
 
+
+# ─── Background: Upload/Story Completion Notifications ────────────────────────
+
+# Track which run_ids we've already reported
+_reported_runs: set[str] = set()
+
+async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
+    """Check every 30s if an upload/story process just finished. Send results."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            data = await api_get(session, "/api/ig-web-upload/overview")
+        if not data.get("ok"):
+            return
+
+        # Check process status — if it was running and now stopped, report
+        proc = data.get("process", {})
+        jobs = data.get("jobs", [])
+        receipts = data.get("task_receipts", [])
+
+        # Find recently finished jobs (not yet reported)
+        for job in jobs[:20]:
+            status = str(job.get("status") or "")
+            run_id = str(job.get("run_id") or "")
+            if not run_id or run_id in _reported_runs:
+                continue
+            # Only report terminal statuses
+            if status not in ("success", "failed", "partial_success", "manual_required",
+                              "stopped", "cooldown", "uploaded_unverified",
+                              "submitted_unverified", "empty_selection"):
+                continue
+
+            _reported_runs.add(run_id)
+            # Keep set from growing forever
+            if len(_reported_runs) > 200:
+                _reported_runs.clear()
+                _reported_runs.add(run_id)
+
+            account = str(job.get("account_name") or "?")
+            posted = int(job.get("posted_count") or 0)
+            error = str(job.get("last_error") or "")
+            current_step = str(job.get("current_step") or "")
+            is_story = "story" in current_step.lower() or "story" in str(job.get("label") or "").lower()
+
+            if status == "success":
+                emoji = "✅"
+                msg = f"{emoji} Залив завершён: @{account}\n"
+                if is_story:
+                    msg = f"{emoji} История залита: @{account}"
+                else:
+                    msg = f"{emoji} Рилсы залиты: @{account} (posted: {posted})"
+            elif status == "partial_success":
+                emoji = "⚠️"
+                if is_story:
+                    msg = f"{emoji} История частично: @{account}"
+                else:
+                    msg = f"{emoji} Частичный залив: @{account} (posted: {posted})\nПричина: {error[:100]}"
+            elif status == "failed":
+                emoji = "❌"
+                msg = f"{emoji} Залив не удался: @{account}\nОшибка: {error[:120]}"
+            elif status == "manual_required":
+                emoji = "🟡"
+                msg = f"{emoji} Требует ручного вмешательства: @{account}\nПричина: {error[:120]}"
+            elif status == "empty_selection":
+                emoji = "⚠️"
+                msg = f"{emoji} Нет аккаунтов для залива: {error[:80]}"
+            elif status == "stopped":
+                emoji = "🛑"
+                msg = f"{emoji} Остановлено: @{account}"
+            else:
+                emoji = "❓"
+                msg = f"{emoji} {status}: @{account}\n{error[:80]}"
+
+            for chat_id in authorized_chat_ids():
+                try:
+                    await ctx.bot.send_message(chat_id=chat_id, text=msg)
+                except Exception:
+                    pass
+
+    except Exception as e:
+        logger.warning(f"completion check error: {e}")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -867,7 +949,8 @@ def main():
     if job_queue:
         job_queue.run_repeating(background_check_triggers, interval=600, first=30)
         job_queue.run_repeating(background_hourly_summary, interval=3600, first=60)
-        logger.info(f"Background jobs: triggers every 10min, hourly summary. Users: {len(AUTHORIZED_USERS)}")
+        job_queue.run_repeating(background_check_completion, interval=30, first=15)
+        logger.info(f"Background jobs: triggers 10min, hourly summary, completion check 30s. Users: {len(AUTHORIZED_USERS)}")
     else:
         logger.warning("No JobQueue! Install: pip install \"python-telegram-bot[job-queue]\"")
 
