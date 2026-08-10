@@ -42,9 +42,9 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 SPARKGRID_API = os.environ.get("SPARKGRID_API_URL", "http://127.0.0.1:8770")
 
-# Threshold range for triggering — first reel must hit 10-23K views
+# Threshold range for triggering — any reel hitting 10-12.5K views triggers first story
 VIEWS_THRESHOLD_MIN = 10000
-VIEWS_THRESHOLD_MAX = 23000
+VIEWS_THRESHOLD_MAX = 12500
 
 # Daily story interval — 24h base + 10-60 min random spread
 # Instagram detects exact 24h patterns; the spread prevents that
