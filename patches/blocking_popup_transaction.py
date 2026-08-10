@@ -379,9 +379,37 @@ _ACTION_SCRIPT = r"""payload => { // IG_BLOCKING_POPUP_ACTION
   }[payload.action];
   if(!match)return {ok:false,reason:'action_not_allowed'};
   const matches=top.controls.filter(el=>match(label(el)));
-  if(matches.length!==1)return {ok:false,
-    reason:matches.length?'action_ambiguous':'action_unavailable'};
-  return {ok:true,reason:'ready',target:matches[0]};
+  if(matches.length===1)return {ok:true,reason:'ready',target:matches[0]};
+  if(matches.length>1)return {ok:false,reason:'action_ambiguous'};
+  // ─── TEXT-BASED FALLBACK ───
+  // CSS selectors missed the button (Instagram may render it as <div>, <span>,
+  // or any custom element).  Scan ALL visible elements for text match.
+  const actionLabels={
+    cookie_allow_all:['allow all cookies','alle cookies erlauben','permitir todas las cookies','autoriser tous les cookies','consenti tutti i cookie','permitir todos os cookies'],
+    cookie_decline_optional:['decline optional cookies','optionale cookies ablehnen','rechazar cookies opcionales','refuser les cookies facultatifs','rifiuta cookie facoltativi','recusar cookies opcionais'],
+    dismiss_not_now:['not now','jetzt nicht','ahora no','pas maintenant','non ora','agora não'],
+    dismiss_cancel:['cancel'],
+    dismiss_close:['close'],
+    ads_get_started:['get started','los geht','empezar','commencer','inizia','começar'],
+    ads_select_free:['use my info for a free experience','free ads','kostenlose werbung','gratis anunci','gratuit publicit','gratuitamente pubblic'],
+    ads_continue:['continue','weiter','continuar','continuer','continua'],
+    ads_agree:['agree','zustimmen','aceptar','accepter','accetta','concordar'],
+    ads_personalized_continue:['continue with personalized ads','personalisierte werbung','anuncios personalizados','publicités personnalisées','inserzioni personalizzate','anúncios personalizados'],
+    ads_confirm:['confirm'],
+    ads_ok:['ok'],
+    request_processing_ok:['ok']
+  }[payload.action]||[];
+  if(actionLabels.length){
+    const all=[...document.querySelectorAll('*')].filter(visible);
+    for(const el of all){
+      const t=norm(el.getAttribute('aria-label')||el.innerText||el.textContent);
+      if(!t||t.length>60)continue;
+      if(actionLabels.some(al=>t.toLowerCase()===al||t.toLowerCase().includes(al))){
+        return {ok:true,reason:'text_fallback',target:el};
+      }
+    }
+  }
+  return {ok:false,reason:'action_unavailable'};"
 }"""
 
 
