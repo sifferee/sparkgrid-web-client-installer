@@ -320,22 +320,29 @@ _ACTION_SCRIPT = r"""payload => { // IG_BLOCKING_POPUP_ACTION
       el.getAttribute('value')||el.innerText||el.textContent));
     const rootText=norm(root.innerText||root.textContent);
     const typedCookie=
-      rootText.includes('allow the use of cookies by instagram')&&
-      labels.includes('allow all cookies')&&labels.includes('decline optional cookies');
-    const typedRequest=
-      (rootText.includes("your request couldn't be processed")||
-       rootText.includes("your request can't be processed")||
-       rootText.includes('your request couldn\u2019t be processed')||
-       rootText.includes('your request can\u2019t be processed'))&&
-      rootText.includes('there was a problem with this request')&&
-      rootText.includes('try again later')&&labels.includes('ok');
-    const consentPath=(location.pathname||'').toLowerCase().includes('/consent');
-    const typedPersonalized=consentPath&&
-      labels.includes('continue with personalized ads')&&
-      labels.includes('switch to less-personalized ads');
-    const typedConfirmation=consentPath&&labels.includes('confirm')&&
-      labels.includes('go back');
-    if(typedCookie||typedRequest||typedPersonalized||typedConfirmation){
+      const typedCookie=(rootText.includes('allow the use of cookies by instagram')||
+        rootText.includes('allow the use of cookies')||rootText.includes('cookie'))&&
+        (labels.includes('allow all cookies')||labels.includes('decline optional cookies')||
+         labels.some(l=>/^allow/i.test(l))||labels.some(l=>/^accept/i.test(l)));
+      const typedRequest=
+        (rootText.includes("your request couldn't be processed")||
+         rootText.includes("your request can't be processed")||
+         rootText.includes('your request couldn\u2019t be processed')||
+         rootText.includes('your request can\u2019t be processed'))&&
+        rootText.includes('there was a problem with this request')&&
+        rootText.includes('try again later')&&labels.includes('ok');
+      const consentPath=(location.pathname||'').toLowerCase().includes('/consent');
+      // Broader consent detection: any page on /consent/ with Agree/Allow/Accept/Continue button
+      const typedConsent=consentPath&&(labels.some(l=>rx.agree.test(l))||
+        labels.some(l=>/^allow/i.test(l))||labels.some(l=>/^accept$/i.test(l))||
+        labels.some(l=>rx.continue.test(l))||labels.some(l=>rx.freeAds.test(l))||
+        labels.some(l=>rx.getStarted.test(l))||labels.some(l=>rx.personalized.test(l)));
+      const typedPersonalized=consentPath&&
+        labels.includes('continue with personalized ads')&&
+        labels.includes('switch to less-personalized ads');
+      const typedConfirmation=consentPath&&labels.includes('confirm')&&
+        labels.includes('go back');
+      if(typedCookie||typedRequest||typedPersonalized||typedConfirmation||typedConsent){
       candidates=[{el:root,controls,score:0}];
     }
   }
@@ -663,9 +670,9 @@ def resolve_regional_ads_consent(
     page: Any,
     *,
     max_transitions: int = MAX_ADS_TRANSITIONS,
-    transition_timeout: float = 4.0,
-    successor_grace: float = 4.0,
-    overall_timeout: float = 30.0,
+    transition_timeout: float = 15.0,
+    successor_grace: float = 6.0,
+    overall_timeout: float = 120.0,
     settled_reads_required: int = ADS_SUCCESSOR_SETTLED_READS,
     max_successor_reads: int = MAX_ADS_SUCCESSOR_READS,
     poll_interval: float = 0.1,
@@ -913,7 +920,7 @@ def resolve_typed_consent_chain(
     page: Any,
     *,
     max_steps: int = MAX_CONSENT_CHAIN_STEPS,
-    overall_timeout: float = 35.0,
+    overall_timeout: float = 120.0,
     transition_timeout: float = 8.0,
     max_action_retries: int = MAX_CONSENT_ACTION_RETRIES,
     max_transition_reads: int = MAX_ADS_SUCCESSOR_READS,
