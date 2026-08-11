@@ -33,6 +33,16 @@
 
 ## Последнее изменение
 
+- 2026-08-11 — Claude (диагностика) + Hermes (применение, коммит 82ffec7) —
+  подключение vision-fallback к реальному консент-флоу: в двух местах
+  где консент раньше сдавался после исчерпания попыток структурного/
+  текстового поиска (cookie_consent ветка в resolve_typed_consent_chain
+  и resolve_regional_ads_consent для ads-шагов) — теперь вызывается
+  `vision_fallback.click_via_vision()`. Зрение включается ТОЛЬКО при
+  reason == "action_unavailable" или "container_missing" (честное «не
+  нашёл»); при "interaction_failed" (реальное исключение) НЕ вызывается,
+  чтобы не маскировать баги в коде. Недоступность модуля зрения не роняет
+  функцию. py_compile OK, pytest 6 passed.
 - 2026-08-11 — Claude (диагностика) + Hermes (применение, коммит 1899dc8) —
   фикс telegram_bot.py и view_analytics.py: (1) crash-loop guard в
   `run_forever()` — 5 быстрых падений подряд (<30с) → явное сообщение в
