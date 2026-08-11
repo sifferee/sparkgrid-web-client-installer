@@ -6025,7 +6025,17 @@ def _dismiss_post_login_prompts(
     action_telemetry.start()
 
     try:
-        if _login_info_prompt_present(page) and authenticated_before:
+        # Diagnosed 2026-08-11: gating this click on authenticated_before
+        # raced with _authenticated_session_present(page) not yet
+        # confirming the session right after 2FA (DIAG log showed
+        # authenticated_before=False, login_info_present=True — the click
+        # was simply never attempted). The gate was also redundant:
+        # Instagram only shows "Save your login info?" after a successful
+        # login in the first place, so the prompt's presence is already
+        # sufficient evidence. Not touching authenticated_before itself —
+        # it's still used correctly below for other decisions — only
+        # dropping it from this one click-gate.
+        if _login_info_prompt_present(page):
             requested = str(login_info_action or "not_now").strip().lower()
             if requested == "save":
                 patterns = (r"^\s*save info\s*$", r"^\s*save information\s*$", r"^\s*save\s*$")
