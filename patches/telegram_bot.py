@@ -962,10 +962,14 @@ async def background_daily_digest(ctx: ContextTypes.DEFAULT_TYPE):
     try:
         async with aiohttp.ClientSession() as session:
             data = await api_get(session, "/api/ig-web-upload/metrics/overview?hours=24")
+            data_1h = await api_get(session, "/api/ig-web-upload/metrics/overview?hours=1")
         if not data.get("ok"):
             return
         t = data.get("total", {})
         dl = data.get("delta_24h", {})
+        # The API keys this "delta_24h" regardless of the hours= param
+        # actually passed — with hours=1 it's really the last-hour delta.
+        dl_1h = data_1h.get("delta_24h", {}) if data_1h.get("ok") else {}
         accounts = data.get("accounts", [])
         if not accounts:
             return
@@ -977,6 +981,13 @@ async def background_daily_digest(ctx: ContextTypes.DEFAULT_TYPE):
             f"Подписчики: {fmt_delta(dl.get('followers', 0))} · "
             f"Лайки: {fmt_delta(dl.get('likes', 0))}",
         ]
+        if data_1h.get("ok"):
+            lines.append(
+                f"За последний час: "
+                f"{fmt_delta(dl_1h.get('views', 0))} просм · "
+                f"{fmt_delta(dl_1h.get('followers', 0))} подп · "
+                f"{fmt_delta(dl_1h.get('likes', 0))} лайк"
+            )
 
         def _fol_delta(acc):
             return int((acc.get("delta") or {}).get("followers", 0) or 0)
