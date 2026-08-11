@@ -33,12 +33,14 @@
 
 ## Последнее изменение
 
-- 2026-08-10 — Claude — фикс `_ACTION_SCRIPT` (дубль `const typedCookie`,
-  висячая кавычка, `rx` объявлен до использования) + логирование во все
-  `except Exception` в blocking_popup_transaction.py /
-  instagram_consent_flow.py / instagram_web_profile_workflow.py + новый
-  tests/test_js_syntax.py (авто-находит все `_XXX_SCRIPT` константы под
-  patches/ и гоняет `node --check`).
+- 2026-08-10 — Claude (диагностика) + Hermes (применение, коммит d5c80d4) —
+  фикс `_ACTION_SCRIPT` (дубль `const typedCookie`, висячая кавычка, `rx`
+  объявлен до использования) + логирование во все `except Exception` в
+  blocking_popup_transaction.py / instagram_consent_flow.py /
+  instagram_web_profile_workflow.py + новый tests/test_js_syntax.py
+  (авто-находит все `_XXX_SCRIPT` константы под patches/ и гоняет
+  `node --check`). Применено через Hermes: git pull → замена 5 файлов →
+  py_compile OK → pytest 6 passed → commit → push.
 
 ## Известные баги / в работе
 
