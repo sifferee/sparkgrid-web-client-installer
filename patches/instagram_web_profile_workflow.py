@@ -38,6 +38,7 @@ from instagram_session_goal import run_check_session_goal
 from initial_browser_load import recover_initial_browser_load
 from blocking_popup_transaction import (
     AUTOMATED_POPUP_CATEGORIES,
+    attempt_vision_click,
     inspect_topmost_blocker,
 )
 
@@ -8186,7 +8187,37 @@ def do_make_public(account: dict, args, run_id: str):
                                web_privacy_last_error="")
                 update_job(job, status="success", current_step="already_public", finished_at=now_iso())
                 return
-            switch.click(timeout=8000)
+            try:
+                switch.click(timeout=8000)
+            except Exception as click_exc:
+                # Diagnosed 2026-08-11: Playwright's click() can report a
+                # timeout even when the click's side effect (React state
+                # change -> confirmation dialog) already happened. Instagram
+                # replaces the toggle's DOM node right after the click, and
+                # Playwright's own post-click stability check fails against
+                # the now-detached old node even though the user-visible
+                # action succeeded (confirmed via dump snapshots: the dialog
+                # was visibly open right after a reported click timeout).
+                # Retry once with force=True (skips the stability wait) —
+                # matches the same pattern already used below for the
+                # confirmation button — before giving up on this click.
+                logger.debug(
+                    "switch.click timed out (%s: %s), retrying with force=True",
+                    type(click_exc).__name__, click_exc,
+                )
+                try:
+                    switch.click(timeout=3000, force=True)
+                except Exception as force_exc:
+                    # Still couldn't force it through — don't abort yet.
+                    # The dialog/toggle-state check right below already
+                    # tells us definitively whether the click actually took
+                    # effect, so let that be the real verdict instead of
+                    # trusting Playwright's click() report alone.
+                    logger.debug(
+                        "force click also failed (%s: %s); falling through "
+                        "to state check instead of aborting",
+                        type(force_exc).__name__, force_exc,
+                    )
             # After clicking the toggle, Instagram shows a confirmation
             # dialog "Switch to public account?" with a blue "Switch to
             # public" text button.  Playwright may refuse to click because
@@ -8217,6 +8248,22 @@ def do_make_public(account: dict, args, run_id: str):
                 except Exception as _exc:
                     logger.debug("%s: %s", type(_exc).__name__, _exc)
                     continue
+            if not clicked:
+                # Safe to try vision here specifically: by this point we've
+                # already confirmed (via _control_checked before the toggle
+                # click) that the account WAS private and we clicked to
+                # switch it public — so clicking whatever vision identifies
+                # as "Switch to public" is directionally unambiguous. This
+                # is NOT extended to the earlier "switch itself not found"
+                # case (see _private_switch above) — there we don't yet
+                # know the current state, and a wrong vision click could
+                # flip an already-public account back to private, which is
+                # worse than just failing cleanly.
+                vision_result = attempt_vision_click(
+                    page, "the blue 'Switch to public' confirmation button in the dialog",
+                )
+                if vision_result.get("ok"):
+                    clicked = True
             if not clicked:
                 # Check if toggle already switched (no dialog needed).
                 if not _control_checked(switch):

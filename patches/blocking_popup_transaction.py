@@ -71,6 +71,45 @@ _ACTION_VISION_INTENT = {
 }
 
 
+def attempt_vision_click(
+    page: Any,
+    intent: str,
+    *,
+    event_fn: Callable[[str, dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """General-purpose last resort: ask a vision model to find and click
+    something described by `intent`. The caller is responsible for only
+    invoking this after a genuine "structurally not found" outcome (no
+    exception happened) — this function itself does no reason-gating, it
+    just does the vision call + logging + graceful degradation. Callers
+    with a reason string to gate on should use _attempt_vision_fallback
+    (consent-flow specific) or replicate that gating inline.
+
+    Fails gracefully (returns {"ok": False, ...}) if the vision module or
+    its API key isn't available — this must never be why automation breaks.
+    """
+    try:
+        import vision_fallback
+    except ImportError as _exc:
+        logger.debug("vision_fallback unavailable: %s", _exc)
+        return {"ok": False, "reason": "vision_unavailable", "detail": "module_not_available"}
+
+    logger.info("vision_fallback: attempting intent=%r", intent)
+    result = vision_fallback.click_via_vision(page, intent=intent)
+    logger.info(
+        "vision_fallback: result intent=%r ok=%s reason=%s",
+        intent, result.get("ok"), result.get("reason"),
+    )
+    _emit_consent_event(
+        event_fn,
+        "vision_fallback_result",
+        intent=intent[:60],
+        ok=str(bool(result.get("ok"))),
+        reason=str(result.get("reason") or ""),
+    )
+    return result
+
+
 def _attempt_vision_fallback(
     page: Any,
     action: str,
@@ -78,40 +117,17 @@ def _attempt_vision_fallback(
     *,
     event_fn: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Last resort: ask a vision model to find and click the element, but
-    ONLY when structural/text matching completed cleanly and found nothing
-    (reason in _VISION_ELIGIBLE_REASONS). Never call this for a reason
-    that came from an exception — that needs a real code fix, not a
-    vision workaround; see vision_fallback.py's module docstring.
-
-    Fails gracefully (returns {"ok": False, ...}) if the vision module or
-    its API key isn't available — this must never be why the automation
-    itself breaks.
+    """Consent-flow-specific wrapper around attempt_vision_click: only
+    fires for reasons in _VISION_ELIGIBLE_REASONS (structural search ran
+    clean and found nothing) — never for a reason that came from an
+    exception. See attempt_vision_click and this module's docstring notes
+    for why that distinction matters.
     """
     if reason not in _VISION_ELIGIBLE_REASONS:
         return {"ok": False, "reason": "vision_not_eligible", "detail": reason}
-    try:
-        import vision_fallback
-    except ImportError as _exc:
-        logger.debug("vision_fallback unavailable: %s", _exc)
-        return {"ok": False, "reason": "vision_unavailable", "detail": "module_not_available"}
-
     intent = _ACTION_VISION_INTENT.get(action, f"the button for the action '{action}'")
-    logger.info("vision_fallback: attempting action=%s intent=%r", action, intent)
     _emit_consent_event(event_fn, "vision_fallback_attempted", action=action)
-    result = vision_fallback.click_via_vision(page, intent=intent)
-    logger.info(
-        "vision_fallback: result action=%s ok=%s reason=%s",
-        action, result.get("ok"), result.get("reason"),
-    )
-    _emit_consent_event(
-        event_fn,
-        "vision_fallback_result",
-        action=action,
-        ok=str(bool(result.get("ok"))),
-        reason=str(result.get("reason") or ""),
-    )
-    return result
+    return attempt_vision_click(page, intent, event_fn=event_fn)
 
 
 _INSPECT_SCRIPT = r"""() => { // IG_BLOCKING_POPUP_INSPECT
