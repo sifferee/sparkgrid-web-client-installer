@@ -3,3 +3,7 @@ Output/
 *.exe
 __pycache__/
 *.pyc
+
+# Secrets — never commit API keys / tokens
+secrets.local.ps1
+secrets.*.local.ps1
