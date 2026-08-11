@@ -1075,6 +1075,30 @@ def resolve_typed_consent_chain(
                 event_fn, "consent_chain_failed", reason="browser_internal_error"
             )
             return {"handled": handled, "ok": False, "step": "browser_internal_error"}
+        if category == "notifications_prompt":
+            # The JS side already classifies this AND knows the safe action
+            # (dismiss_not_now) — but this category is also in
+            # _terminal_consent_successor's set, so without this block the
+            # chain would just walk away without ever clicking "Not now",
+            # leaving the prompt unresolved for whatever runs next (or
+            # nothing at all, if nothing else picks it up).
+            action = str(observed.get("recommended_action") or "")
+            if action:
+                dispatched = dispatch(observed, action)
+                _emit_consent_event(
+                    event_fn,
+                    "consent_action_dispatched",
+                    category="notifications_prompt",
+                    action=action,
+                    ok=str(bool(dispatched.get("ok"))),
+                )
+                if dispatched.get("ok"):
+                    handled = True
+                    steps += 1
+                    continue
+                # Couldn't click it — fall through to the existing terminal
+                # behavior below rather than looping forever on a
+                # non-critical prompt.
         if _terminal_consent_successor(observed):
             _emit_consent_event(
                 event_fn,
