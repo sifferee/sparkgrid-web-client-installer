@@ -9,6 +9,7 @@ import time
 from typing import Any, Dict
 
 from blocking_popup_transaction import (
+    attempt_vision_click,
     inspect_topmost_blocker,
     perform_fresh_action,
 )
@@ -279,7 +280,7 @@ def _semantic_action(page, action: str) -> bool:
             )
             return bool(result.get("ok"))
     try:
-        return bool(page.evaluate(
+        found = bool(page.evaluate(
             f"""() => {{ // IG_DIALOG_GATE_ACTION {action}
               const visible = (el) => {{ const r=el.getBoundingClientRect(), s=getComputedStyle(el);
                 return r.width>8 && r.height>8 && s.display!=='none' && s.visibility!=='hidden' &&
@@ -296,7 +297,27 @@ def _semantic_action(page, action: str) -> bool:
             }}"""
         ))
     except Exception:
+        # A real exception here is a code/DOM-access bug, not a "not found"
+        # — vision must never paper over that. See attempt_vision_click's
+        # docstring for why this distinction matters.
         return False
+    if found:
+        return True
+    if action == "close":
+        # Diagnosed 2026-08-11: the exact-match label(el)===wanted check
+        # above misses Instagram's icon-only X close button on the
+        # "We removed your post" policy_notice dialog — icon buttons often
+        # carry no aria-label at all, or one that isn't the literal string
+        # "close". Structural search ran clean and found nothing here, so
+        # vision is a safe last resort. Not extended to the other three
+        # actions (allow_all_cookies / decline_optional_cookies / not_now)
+        # — no evidence yet that those miss the same way.
+        try:
+            result = attempt_vision_click(page, "the X close button to dismiss this notification dialog")
+            return bool(result.get("ok"))
+        except Exception:
+            return False
+    return False
 
 
 def _wait_absent(page, category: str, deadline: float) -> bool:
