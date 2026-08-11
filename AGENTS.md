@@ -33,6 +33,15 @@
 
 ## Последнее изменение
 
+- 2026-08-11 — Claude (диагностика) + Hermes (применение, коммит 1899dc8) —
+  фикс telegram_bot.py и view_analytics.py: (1) crash-loop guard в
+  `run_forever()` — 5 быстрых падений подряд (<30с) → явное сообщение в
+  лог и остановка, вместо вечного цикла; (2) атомарная запись файла
+  пользователей через `os.replace` (временный файл + rename), защита от
+  порчи при форсированном убийстве процесса; (3) логирование во все
+  `except Exception` (12 мест в telegram_bot.py, 8 в view_analytics.py).
+  Применено через Hermes: git pull → замена 2 файлов → py_compile OK →
+  commit → push → перезапуск бота через stop_bot.ps1/start_bot.ps1.
 - 2026-08-10 — Claude (диагностика) + Hermes (применение, коммит bad984c) —
   фикс гонки на /consent/: `recover_initial_browser_load` считал страницу
   готовой сразу при `document_category == "instagram_document"` (true как
