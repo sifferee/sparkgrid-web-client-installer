@@ -2142,10 +2142,20 @@ def run_account(args: argparse.Namespace, lane: dict[str, Any], account: dict[st
         and not recovery_ip_change_already_consumed
         and (
             args.operation == "story"
-            or (position == 0 and (
-                args.operation == "analytics_session"
-                or bool(int(account.get("rotate_before_first") or 0))
-            ))
+            # Diagnosed 2026-08-11 (Alexander's explicit instruction): when
+            # several accounts share one mobile connection, the IP must be
+            # rotated before EVERY account switch, not just the first one
+            # in the lane — otherwise account 2, 3, 4... all run on
+            # whatever IP the previous account happened to leave the
+            # connection on, risking two different accounts sharing one
+            # IP (a real ban-linkage risk). This was previously gated on
+            # position == 0, matching only "story", which already rotated
+            # unconditionally. Dropped the position gate here so
+            # analytics_session and the per-account rotate_before_first
+            # flag (DB default: enabled) behave the same way story
+            # already did — every position, not just the first.
+            or args.operation == "analytics_session"
+            or bool(int(account.get("rotate_before_first") or 0))
         )
     )
     if should_rotate_before_first:
