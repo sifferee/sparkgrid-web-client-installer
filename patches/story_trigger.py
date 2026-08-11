@@ -141,7 +141,7 @@ def get_last_story_time(conn: sqlite3.Connection, account_name: str) -> str:
 
 
 def should_post_daily_story(conn: sqlite3.Connection, account_name: str) -> bool:
-    """Check if enough time passed since last Story (20-26h)."""
+    """Check if enough time passed since last Story (24h + 10-60min)."""
     last = get_last_story_time(conn, account_name)
     if not last:
         return False  # No prior trigger — wait for views threshold
