@@ -59,7 +59,8 @@ _DOCUMENT_SCRIPT = r"""() => { // IG_INITIAL_DOCUMENT_INSPECT
       blank?'blank_document':instagram?'instagram_document':'unknown_document',
     login_surface:login,two_factor_surface:otp,challenge_surface:challenge,
     authenticated_surface:authenticated,
-    ready_state:String(document.readyState||'unknown')
+    ready_state:String(document.readyState||'unknown'),
+    rendered_text_length:body?String(body.innerText||'').trim().length:0
   };
 }"""
 
@@ -101,6 +102,7 @@ def inspect_initial_document(page: Any) -> dict[str, Any]:
         "popup_category": "",
         "page_live": False,
         "context_live": False,
+        "rendered_text_length": 0,
     }
     try:
         defaults["page_live"] = not bool(page.is_closed())
@@ -129,6 +131,10 @@ def inspect_initial_document(page: Any) -> dict[str, Any]:
             "authenticated_surface",
         ):
             defaults[key] = bool(raw.get(key))
+        try:
+            defaults["rendered_text_length"] = max(0, int(raw.get("rendered_text_length") or 0))
+        except (TypeError, ValueError):
+            defaults["rendered_text_length"] = 0
     try:
         blocker = inspect_topmost_blocker(page)
     except Exception:
@@ -175,6 +181,31 @@ def _wait_after_fresh_get(
     return last
 
 
+def _wait_for_meaningful_content(
+    page: Any,
+    *,
+    timeout_seconds: float,
+    inspect_fn: Callable[[Any], dict[str, Any]],
+    last: dict[str, Any],
+) -> dict[str, Any]:
+    """Bare `document_category == 'instagram_document'` is true as soon as
+    body has ANY child element — including an empty pre-mount React root
+    (e.g. `<div id="react-root">`) or bare script tags. On a cold browser
+    profile going through a proxy, the JS bundle can take longer to mount
+    than the fixed human-dwell window, so trusting the category alone races
+    ahead of React actually rendering anything. Poll briefly for either a
+    recognized surface or non-trivial rendered text before giving up and
+    falling back to the old permissive behavior.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while time.monotonic() < deadline:
+        if has_recognized_surface(last) or int(last.get("rendered_text_length") or 0) > 0:
+            return last
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        last = inspect_fn(page)
+    return last
+
+
 def recover_initial_browser_load(
     page: Any,
     *,
@@ -207,6 +238,18 @@ def recover_initial_browser_load(
         observed.get("document_category") == "instagram_document"
         and initial_error is None
     ):
+        if int(observed.get("rendered_text_length") or 0) == 0:
+            observed = _wait_for_meaningful_content(
+                page,
+                timeout_seconds=min(5.0, float(timeout_seconds)),
+                inspect_fn=inspect_fn,
+                last=observed,
+            )
+            base["document_category"] = str(
+                observed.get("document_category") or base["document_category"]
+            )
+            if has_recognized_surface(observed):
+                return {**base, "ok": True, "outcome": "initial_surface_ready"}
         return {**base, "ok": True, "outcome": "initial_document_ready"}
     if not base["browser_live"]:
         return {
