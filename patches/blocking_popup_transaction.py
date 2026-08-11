@@ -46,6 +46,73 @@ REGIONAL_ADS_ACTIONS = {
     "ads_ok",
 }
 
+# Only these two reasons mean "structural/text search ran clean and
+# genuinely found nothing" — NOT that something crashed. interaction_failed
+# (and anything else) means an exception happened inside perform_fresh_action
+# and was already logged via except-block logging; vision must never be used
+# to paper over that, or we'd recreate the exact failure mode that cost this
+# project two weeks (a real code bug silently "working around itself").
+_VISION_ELIGIBLE_REASONS = frozenset({"action_unavailable", "container_missing"})
+
+_ACTION_VISION_INTENT = {
+    "cookie_allow_all": "the button that allows/accepts all cookies",
+    "cookie_decline_optional": "the button that declines optional cookies",
+    "request_processing_ok": "the OK button on a request-processing error message",
+    "ads_get_started": "the 'Get started' button for the ads consent flow",
+    "ads_select_free": "the option to use the free, ad-supported version",
+    "ads_continue": "the 'Continue' button",
+    "ads_agree": "the 'Agree' or 'I agree' button consenting to data processing",
+    "ads_personalized_continue": (
+        "the button confirming personalized ads / "
+        "'Continue with personalized ads'"
+    ),
+    "ads_confirm": "the 'Confirm' button",
+    "ads_ok": "an 'OK' confirmation button",
+}
+
+
+def _attempt_vision_fallback(
+    page: Any,
+    action: str,
+    reason: str,
+    *,
+    event_fn: Callable[[str, dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Last resort: ask a vision model to find and click the element, but
+    ONLY when structural/text matching completed cleanly and found nothing
+    (reason in _VISION_ELIGIBLE_REASONS). Never call this for a reason
+    that came from an exception — that needs a real code fix, not a
+    vision workaround; see vision_fallback.py's module docstring.
+
+    Fails gracefully (returns {"ok": False, ...}) if the vision module or
+    its API key isn't available — this must never be why the automation
+    itself breaks.
+    """
+    if reason not in _VISION_ELIGIBLE_REASONS:
+        return {"ok": False, "reason": "vision_not_eligible", "detail": reason}
+    try:
+        import vision_fallback
+    except ImportError as _exc:
+        logger.debug("vision_fallback unavailable: %s", _exc)
+        return {"ok": False, "reason": "vision_unavailable", "detail": "module_not_available"}
+
+    intent = _ACTION_VISION_INTENT.get(action, f"the button for the action '{action}'")
+    logger.info("vision_fallback: attempting action=%s intent=%r", action, intent)
+    _emit_consent_event(event_fn, "vision_fallback_attempted", action=action)
+    result = vision_fallback.click_via_vision(page, intent=intent)
+    logger.info(
+        "vision_fallback: result action=%s ok=%s reason=%s",
+        action, result.get("ok"), result.get("reason"),
+    )
+    _emit_consent_event(
+        event_fn,
+        "vision_fallback_result",
+        action=action,
+        ok=str(bool(result.get("ok"))),
+        reason=str(result.get("reason") or ""),
+    )
+    return result
+
 
 _INSPECT_SCRIPT = r"""() => { // IG_BLOCKING_POPUP_INSPECT
   if (!/^https?:$/.test(location.protocol)) {
@@ -771,6 +838,12 @@ def resolve_regional_ads_consent(
                 break
             time.sleep(min(max(0.0, poll_interval), 0.1))
         if not dispatched.get("ok"):
+            vision_result = _attempt_vision_fallback(
+                page, action, str(dispatched.get("reason") or ""),
+            )
+            if vision_result.get("ok"):
+                dispatched = vision_result
+        if not dispatched.get("ok"):
             return {
                 "handled": transitions > 0,
                 "ok": False,
@@ -1172,6 +1245,15 @@ def resolve_typed_consent_chain(
                 time.sleep(min(max(0.0, poll_interval), 0.1))
             if reclassified:
                 continue
+            if not dispatched.get("ok"):
+                vision_result = _attempt_vision_fallback(
+                    page,
+                    action,
+                    str(dispatched.get("reason") or ""),
+                    event_fn=event_fn,
+                )
+                if vision_result.get("ok"):
+                    dispatched = vision_result
             if not dispatched.get("ok"):
                 _emit_consent_event(
                     event_fn,
