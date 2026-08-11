@@ -27,8 +27,9 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -938,8 +939,26 @@ async def background_check_triggers(ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning(f"trigger check error: {e}")
 
-async def background_hourly_summary(ctx: ContextTypes.DEFAULT_TYPE):
-    """Send hourly metrics summary to all authorized users."""
+async def background_daily_digest(ctx: ContextTypes.DEFAULT_TYPE):
+    """Daily minimalist digest: fleet totals+deltas, plus top outliers —
+    NOT a full per-account listing. Replaces the old hourly totals-only
+    summary (background_hourly_summary), which sent every hour with a
+    24h-trailing delta — mostly repeating the same numbers, and gave no
+    way to see WHICH accounts were driving the change.
+
+    Design agreed with Alexander 2026-08-11 (AGENTS.md, 'Дизайн
+    аналитики/уведомлений'): deltas over absolute totals, outliers over
+    exhaustive per-account listing, daily cadence instead of hourly.
+
+    Scoped honestly for what the existing /metrics/overview data actually
+    supports: outlier ranking uses follower delta as the primary signal
+    (simple, explainable — avoids inventing a weighted cross-metric score).
+    "New accounts today" and "no activity for N days" from the original
+    mockup aren't computable from a single 24h overview snapshot (the
+    former needs a backend flag, the latter needs per-account history
+    queries) — this reports "no change in today's 24h window" instead,
+    which is honest about what one snapshot comparison can actually show.
+    """
     try:
         async with aiohttp.ClientSession() as session:
             data = await api_get(session, "/api/ig-web-upload/metrics/overview?hours=24")
@@ -947,20 +966,78 @@ async def background_hourly_summary(ctx: ContextTypes.DEFAULT_TYPE):
             return
         t = data.get("total", {})
         dl = data.get("delta_24h", {})
+        accounts = data.get("accounts", [])
+        if not accounts:
+            return
 
-        def _arrow(delta):
-            if delta > 0:
-                return f" ▲{fmt(delta)}"
-            elif delta < 0:
-                return f" ▼{abs(delta)}"
-            return ""
+        lines = [
+            "📊 За сегодня",
+            f"{len(accounts)} аккаунтов",
+            f"Просмотры: {fmt_delta(dl.get('views', 0))} · "
+            f"Подписчики: {fmt_delta(dl.get('followers', 0))} · "
+            f"Лайки: {fmt_delta(dl.get('likes', 0))}",
+        ]
 
-        msg = (
-            f"📊 Часовая сводка\n"
-            f"Подписчики: {fmt(t.get('followers',0))}{_arrow(dl.get('followers',0))}\n"
-            f"Просмотры: {fmt(t.get('views',0))}{_arrow(dl.get('views',0))}\n"
-            f"Лайки: {fmt(t.get('likes',0))}{_arrow(dl.get('likes',0))}"
-        )
+        def _fol_delta(acc):
+            return int((acc.get("delta") or {}).get("followers", 0) or 0)
+
+        def _views_delta(acc):
+            return int((acc.get("delta") or {}).get("views", 0) or 0)
+
+        def _stalled(acc):
+            d = acc.get("delta") or {}
+            return (
+                int(d.get("followers", 0) or 0) == 0
+                and int(d.get("views", 0) or 0) == 0
+                and int(d.get("likes", 0) or 0) == 0
+            )
+
+        # Attention first (declining or flat), then growers from whatever
+        # remains — an account can't be both "growing" and "needs
+        # attention" in the same digest, even if one metric ticked up
+        # while followers declined overall.
+        decliners = sorted(
+            (a for a in accounts if _fol_delta(a) < 0), key=_fol_delta
+        )[:5]
+        stalled = [a for a in accounts if _stalled(a)]
+        attention = decliners + [a for a in stalled if a not in decliners]
+        attention = attention[:5]
+        attention_names = {a["name"] for a in attention}
+
+        growers = sorted(
+            (
+                a for a in accounts
+                if a["name"] not in attention_names
+                and (_fol_delta(a) > 0 or _views_delta(a) > 0)
+            ),
+            key=_fol_delta,
+            reverse=True,
+        )[:5]
+
+        if growers:
+            parts = []
+            for a in growers:
+                fol, views = _fol_delta(a), _views_delta(a)
+                if fol > 0:
+                    parts.append(f"@{a['name']} +{fmt(fol)} подп")
+                elif views > 0:
+                    parts.append(f"@{a['name']} +{fmt(views)} просмотров")
+            if parts:
+                lines.append("")
+                lines.append("🔥 " + " · ".join(parts))
+
+        if attention:
+            parts = []
+            for a in attention:
+                fol = _fol_delta(a)
+                if fol < 0:
+                    parts.append(f"@{a['name']} {fol} подп")
+                elif _stalled(a):
+                    parts.append(f"@{a['name']} без изменений сегодня")
+            if parts:
+                lines.append("⚠️ " + " · ".join(parts))
+
+        msg = "\n".join(lines)
         for chat_id in authorized_chat_ids():
             try:
                 await ctx.bot.send_message(chat_id=chat_id, text=msg)
@@ -968,7 +1045,7 @@ async def background_hourly_summary(ctx: ContextTypes.DEFAULT_TYPE):
                 logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
     except Exception as e:
-        logger.warning(f"hourly summary error: {e}")
+        logger.warning(f"daily digest error: {e}")
 
 
 # ─── Background: Upload/Story Completion Notifications ────────────────────────
@@ -1096,7 +1173,10 @@ def main():
     job_queue = app.job_queue
     if job_queue:
         job_queue.run_repeating(background_check_triggers, interval=600, first=30)
-        job_queue.run_repeating(background_hourly_summary, interval=3600, first=60)
+        job_queue.run_daily(
+            background_daily_digest,
+            time=dt_time(hour=9, minute=0, tzinfo=ZoneInfo("Europe/Moscow")),
+        )
         job_queue.run_repeating(background_check_completion, interval=30, first=15)
         logger.info(f"Background jobs: triggers 10min, hourly summary, completion check 30s. Users: {len(AUTHORIZED_USERS)}")
     else:
