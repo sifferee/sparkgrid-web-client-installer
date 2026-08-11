@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import time
 from typing import Any, Callable
+from log_config import get_logger
+
+logger = get_logger("automation")
 
 
 BLOCKER_CATEGORIES = {
@@ -297,6 +300,16 @@ _ACTION_SCRIPT = r"""payload => { // IG_BLOCKING_POPUP_ACTION
       Number.parseFloat(s.opacity||'1')>.01&&!el.disabled&&
       el.getAttribute('aria-disabled')!=='true';
   };
+  const rx={
+    allowAll:/^(allow all cookies|alle cookies erlauben|permitir todas las cookies|autoriser tous les cookies|consenti tutti i cookie|permitir todos os cookies)$/,
+    declineOptional:/^(decline optional cookies|optionale cookies ablehnen|rechazar cookies opcionales|refuser les cookies facultatifs|rifiuta cookie facoltativi|recusar cookies opcionais)$/,
+    notNow:/^(not now|jetzt nicht|ahora no|pas maintenant|non ora|agora não)$/,
+    getStarted:/^(get started|los geht.?s|empezar|commencer|inizia|começar)$/,
+    freeAds:/(free.*ads|kostenlos.*werbung|gratis.*anunci|gratuit.*publicit|gratuitamente.*pubblic|grátis.*anúnci)/,
+    continue:/^(continue|weiter|continuar|continuer|continua)$/,
+    agree:/^(agree|zustimmen|aceptar|accepter|accetta|concordar)$/,
+    personalized:/(personalized ads|personalisierte werbung|anuncios personalizados|publicités personnalisées|inserzioni personalizzate|anúncios personalizados)/
+  };
   let candidates=[...document.querySelectorAll(
     "[role='dialog'],[aria-modal='true'],[data-visualcompletion='ignore-dynamic']"
   )].filter(visible).map((el,index)=>{
@@ -319,8 +332,7 @@ _ACTION_SCRIPT = r"""payload => { // IG_BLOCKING_POPUP_ACTION
     const labels=controls.map(el=>norm(el.getAttribute('aria-label')||
       el.getAttribute('value')||el.innerText||el.textContent));
     const rootText=norm(root.innerText||root.textContent);
-    const typedCookie=
-      const typedCookie=(rootText.includes('allow the use of cookies by instagram')||
+    const typedCookie=(rootText.includes('allow the use of cookies by instagram')||
         rootText.includes('allow the use of cookies')||rootText.includes('cookie'))&&
         (labels.includes('allow all cookies')||labels.includes('decline optional cookies')||
          labels.some(l=>/^allow/i.test(l))||labels.some(l=>/^accept/i.test(l)));
@@ -349,16 +361,6 @@ _ACTION_SCRIPT = r"""payload => { // IG_BLOCKING_POPUP_ACTION
   const top=candidates[0];if(!top)return {ok:false,reason:'container_missing'};
   const label=el=>norm(el.getAttribute('aria-label')||el.getAttribute('value')||
     el.innerText||el.textContent);
-  const rx={
-    allowAll:/^(allow all cookies|alle cookies erlauben|permitir todas las cookies|autoriser tous les cookies|consenti tutti i cookie|permitir todos os cookies)$/,
-    declineOptional:/^(decline optional cookies|optionale cookies ablehnen|rechazar cookies opcionales|refuser les cookies facultatifs|rifiuta cookie facoltativi|recusar cookies opcionais)$/,
-    notNow:/^(not now|jetzt nicht|ahora no|pas maintenant|non ora|agora não)$/,
-    getStarted:/^(get started|los geht.?s|empezar|commencer|inizia|começar)$/,
-    freeAds:/(free.*ads|kostenlos.*werbung|gratis.*anunci|gratuit.*publicit|gratuitamente.*pubblic|grátis.*anúnci)/,
-    continue:/^(continue|weiter|continuar|continuer|continua)$/,
-    agree:/^(agree|zustimmen|aceptar|accepter|accetta|concordar)$/,
-    personalized:/(personalized ads|personalisierte werbung|anuncios personalizados|publicités personnalisées|inserzioni personalizzate|anúncios personalizados)/
-  };
   const match={
     cookie_allow_all:x=>rx.allowAll.test(x),
     cookie_decline_optional:x=>rx.declineOptional.test(x),
@@ -409,7 +411,7 @@ _ACTION_SCRIPT = r"""payload => { // IG_BLOCKING_POPUP_ACTION
       }
     }
   }
-  return {ok:false,reason:'action_unavailable'};"
+  return {ok:false,reason:'action_unavailable'};
 }"""
 
 
@@ -449,7 +451,8 @@ def _frames(page: Any) -> list[Any]:
         values = list(page.frames)
         if values:
             return values
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     return [page]
 
@@ -461,7 +464,8 @@ def inspect_topmost_blocker(page: Any) -> dict[str, Any]:
     for index, frame in enumerate(_frames(page)):
         try:
             value = frame.evaluate(_INSPECT_SCRIPT)
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
         observed = _safe_observation(value, f"frame-{index + 1}")
         if observed["document_category"] == "browser_internal_error":
@@ -517,7 +521,8 @@ def perform_fresh_action(
         ready = bool(ok_handle.json_value())
         target_handle = handle.get_property("target") if ready else None
         target = target_handle.as_element() if target_handle is not None else None
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return {"ok": False, "reason": "interaction_failed"}
     if not ready or target is None:
         return {"ok": False, "reason": reason}
@@ -532,7 +537,8 @@ def perform_fresh_action(
     )
     try:
         clicked = bool(human.click(target, timeout=5000))
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         clicked = False
     if not clicked:
         _emit_consent_event(
@@ -787,7 +793,8 @@ def resolve_regional_ads_consent(
         if on_action is not None:
             try:
                 on_action(observed, action)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
         transitions += 1
         successor, after, successor_reads = _wait_for_ads_successor(
@@ -824,7 +831,8 @@ def resolve_regional_ads_consent(
         if on_transition is not None:
             try:
                 on_transition(observed, after)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
         if successor == "completed":
             return {
@@ -862,7 +870,8 @@ def _emit_consent_event(
     }
     try:
         callback(str(event)[:80], safe)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 

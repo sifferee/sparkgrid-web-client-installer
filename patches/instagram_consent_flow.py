@@ -14,9 +14,13 @@ from blocking_popup_transaction import (
     inspect_topmost_blocker,
     resolve_typed_consent_chain,
 )
+from log_config import get_logger
+
+logger = get_logger("automation")
 try:
     from ig_human import make_human
-except Exception:  # pragma: no cover - optional in narrow test runtimes
+except Exception as _exc:  # pragma: no cover - optional in narrow test runtimes
+    logger.debug("%s: %s", type(_exc).__name__, _exc)
     make_human = None
 
 Capture = Callable[[Any, str, str], None]
@@ -25,7 +29,8 @@ Capture = Callable[[Any, str, str], None]
 def _body_text(page: Any) -> str:
     try:
         return str(page.locator("body").inner_text(timeout=1500) or "")
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return ""
 
 
@@ -50,7 +55,8 @@ def _click(page: Any, patterns: tuple[str, ...], human: Any = None) -> str:
                         try:
                             if not enabled_probe(timeout=350):
                                 continue
-                        except Exception:
+                        except Exception as _exc:
+                            logger.debug("%s: %s", type(_exc).__name__, _exc)
                             continue
                     if human is not None:
                         if not human.click(candidate, timeout=3500):
@@ -61,7 +67,8 @@ def _click(page: Any, patterns: tuple[str, ...], human: Any = None) -> str:
                         # the existing HumanInteractor above.
                         candidate.click(timeout=3500)
                     return pattern
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 continue
     return ""
 
@@ -84,14 +91,17 @@ def _choice_is_selected(page: Any, patterns: tuple[str, ...]) -> bool:
                     try:
                         if candidate.is_checked(timeout=350):
                             return True
-                    except Exception:
+                    except Exception as _exc:
+                        logger.debug("%s: %s", type(_exc).__name__, _exc)
                         pass
                     try:
                         if str(candidate.get_attribute("aria-checked") or "").lower() == "true":
                             return True
-                    except Exception:
+                    except Exception as _exc:
+                        logger.debug("%s: %s", type(_exc).__name__, _exc)
                         pass
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 continue
     return False
 
@@ -108,7 +118,8 @@ def _capture(capture: Capture | None, page: Any, step: str, detail: str) -> None
         return
     try:
         capture(page, step, detail)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 
@@ -170,7 +181,8 @@ def resolve_instagram_consent(
     if hasattr(page, "frames") and human is None and make_human is not None:
         try:
             human = make_human(page)
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             human = None
 
     if hasattr(page, "frames"):

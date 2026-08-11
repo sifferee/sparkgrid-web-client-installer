@@ -61,7 +61,8 @@ import uuid
 
 try:
     from browser_preferences import preferred_search_engine, save_browser_preferences
-except Exception:
+except Exception as _exc:
+    logger.debug("%s: %s", type(_exc).__name__, _exc)
     preferred_search_engine = None
     save_browser_preferences = None
 from typing import Any, Dict, List
@@ -82,20 +83,26 @@ from run_diagnostics import (
     ensure_run as ensure_run_diagnostics,
     update_latest_state as update_run_latest_state,
 )
+from log_config import get_logger
+
+logger = get_logger("automation")
 
 try:
     import pyotp
-except Exception:
+except Exception as _exc:
+    logger.debug("%s: %s", type(_exc).__name__, _exc)
     pyotp = None
 
 try:
     from ig_human import make_human
-except Exception:
+except Exception as _exc:
+    logger.debug("%s: %s", type(_exc).__name__, _exc)
     make_human = None
 
 try:
     from ig_network_capture import start_instagram_network_capture
-except Exception:
+except Exception as _exc:
+    logger.debug("%s: %s", type(_exc).__name__, _exc)
     start_instagram_network_capture = None
 
 try:
@@ -111,7 +118,8 @@ try:
         ProxyConfigurationError,
         BrowserProxyApplicationError,
     )
-except Exception:
+except Exception as _exc:
+    logger.debug("%s: %s", type(_exc).__name__, _exc)
     open_spark_browser = None
     save_browser_state = None
     sparkbrowser_state_path = None
@@ -133,7 +141,8 @@ DB_PATH = _DATA_ROOT / "bot.db"
 try:
     import geoip2  # present only when camoufox[geoip] extra is installed
     _GEOIP_OK = True
-except Exception:
+except Exception as _exc:
+    logger.debug("%s: %s", type(_exc).__name__, _exc)
     _GEOIP_OK = False
 DEBUG_ROOT = _DATA_ROOT / "ai_content_data" / "debug" / "ig_web_upload"
 PROFILE_ROOT = _DATA_ROOT / "browser_profiles" / "ig_web_upload"
@@ -172,7 +181,8 @@ def db_conn():
 def cols(conn, table: str) -> set[str]:
     try:
         return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return set()
 
 
@@ -280,7 +290,8 @@ def update_job(job_id: int, **kw):
                 is_not_null = row["notnull"] if hasattr(row, "keys") and "notnull" in row.keys() else row[3]
                 if is_not_null:
                     not_null.add(str(name))
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             not_null = {"finished_at", "started_at", "updated_at", "created_at"}
         sets, vals = [], []
         for k, v in kw.items():
@@ -393,7 +404,8 @@ def ensure_profile(account: dict) -> dict:
                 )
                 archived.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 legacy.unlink()
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
 
     signature = sparkbrowser_proxy_signature(proxy) if sparkbrowser_proxy_signature else ("direct" if not proxy else "configured")
@@ -503,7 +515,8 @@ def _write_auto_login_diagnostic(payload: dict[str, Any]) -> None:
         return
     try:
         recorder(payload)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 
@@ -519,7 +532,8 @@ class LiveDump:
                 task_category="workflow",
                 account_refs=[opaque_account_ref(run_id, account)],
             )
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         DEBUG_ROOT.mkdir(parents=True, exist_ok=True)
         (DEBUG_ROOT / "latest_run.txt").write_text(run_id, encoding="utf-8")
@@ -818,13 +832,15 @@ class LiveDump:
                 document_epoch=int(record.get("document_epoch") or 0),
                 mutation_epoch=int(record.get("mutation_epoch") or 0),
             )
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
 
     def visible_text(self, page) -> str:
         try:
             return (page.locator("body").inner_text(timeout=1500) or "")[:12000]
         except Exception as exc:
+            logger.debug("%s: %s", type(exc).__name__, exc)
             return f"<visible text unavailable: {exc}>"
 
     def capture(
@@ -843,7 +859,8 @@ class LiveDump:
         payload = {"run_id": self.run_id, "account": self.account, "state": state, "action": action, "error": error, "url": "", "ts": now_iso()}
         try:
             payload["url"] = str(page.url or "").split("?", 1)[0].split("#", 1)[0]
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         meaningful_visual = bool(
             take_screenshot
@@ -863,17 +880,20 @@ class LiveDump:
                       return !!el.value && (t==='password' || a==='one-time-code');
                     })"""
                 ))
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 sensitive_input = True
         if meaningful_visual and not sensitive_input:
             try:
                 page.screenshot(path=str(self.root / "latest.png"), full_page=False)
             except Exception as exc:
+                logger.debug("%s: %s", type(exc).__name__, exc)
                 payload["screenshot_error"] = str(exc)
         if take_visible_text:
             try:
                 self.writer.write_text(self.root / "latest_text.txt", self.visible_text(page))
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
         if not self.writer.write_text(self.root / "latest_state.json", json.dumps(payload, ensure_ascii=False, indent=2)): return
         if not self.writer.append_text(self.actions, json.dumps(payload, ensure_ascii=False) + "\n"): return
@@ -885,7 +905,8 @@ class LiveDump:
             if meaningful_visual and not sensitive_input:
                 try:
                     shutil.copy2(self.root / "latest.png", snap / f"{base}.png")
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
             if not self.writer.write_text(snap / f"{base}.json", json.dumps(payload, ensure_ascii=False, indent=2)): return
             files = sorted([x for x in snap.iterdir() if x.is_file()], key=lambda x: x.stat().st_mtime)
@@ -893,7 +914,8 @@ class LiveDump:
             for x in files[:overflow]:
                 try:
                     x.unlink()
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
         try:
             normalized_state = (
@@ -945,7 +967,8 @@ class LiveDump:
                         else "unknown_blocker"
                     ),
                 )
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
 
     def capture_safe_dom(self, page, label: str = "post_action_stable") -> str:
@@ -973,7 +996,8 @@ class LiveDump:
                 root.querySelectorAll('script,style,link,img,video,audio,source').forEach(el => el.remove());
                 return '<!doctype html>\\n' + root.outerHTML;
             }""")
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             return ""
         safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(label or "post_action_stable"))[:50]
         latest = self.root / "latest_safe_dom.html"
@@ -1017,7 +1041,8 @@ class LiveDump:
                 ),
                 transition_count=int(payload.get("attempt_number") or 0),
             )
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
 
     def record_initial_browser_load(self, payload: dict) -> None:
@@ -1064,7 +1089,8 @@ class LiveDump:
                     payload.get("target_category") or "unknown"
                 ),
             )
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
 
 
@@ -1084,7 +1110,8 @@ def _human_event_sink(dump: LiveDump):
         try:
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
 
     dump._human_event_sink = sink
@@ -1098,7 +1125,8 @@ def _human_for(page, account: str = "", dump: LiveDump | None = None):
         name = account or (dump.account if dump is not None else "instagram_web")
         sink = _human_event_sink(dump) if dump is not None else None
         return make_human(page, name, event_sink=sink)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return None
 
 
@@ -1118,6 +1146,7 @@ def require_playwright():
         from playwright.sync_api import sync_playwright
         return sync_playwright
     except Exception as exc:
+        logger.debug("%s: %s", type(exc).__name__, exc)
         raise RuntimeError("Playwright is required. Run install_windows.bat on Windows or ./install.command on macOS/Linux. " + str(exc))
 
 
@@ -1137,7 +1166,8 @@ def _parse_proxy_for_browser(proxy: str):
             if u.password:
                 out["password"] = u.password
             return out
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             return {"server": proxy}
     parts = proxy.split(":")
     if len(parts) == 4:
@@ -1173,7 +1203,8 @@ def _check_proxy_reachable(proxy: str, timeout: float = 15.0) -> tuple[bool, str
         return True, "no proxy configured"
     try:
         scheme = str(urlparse(proxy_url).scheme or "").lower()
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         scheme = ""
     # urllib does not provide native SOCKS transport. SparkBrowser/Playwright does,
     # so SOCKS endpoints are validated by the real browser connection instead of
@@ -1203,6 +1234,7 @@ def _check_proxy_reachable(proxy: str, timeout: float = 15.0) -> tuple[bool, str
         # must not abort the account task; the real browser connection remains
         # the authoritative proxy check and will report a genuine launch or
         # navigation failure normally.
+        logger.debug("%s: %s", type(exc).__name__, exc)
         error = str(exc) or type(exc).__name__
         if "timed out" in error.lower() or "timeout" in error.lower():
             return True, f"proxy precheck timed out; SparkBrowser will verify the proxy ({error})"
@@ -1307,7 +1339,8 @@ def _account_proxy_from_db(account: str) -> str:
                 return str(row["proxy"] or "") if row else ""
         finally:
             c.close()
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     return ""
 
@@ -1321,7 +1354,8 @@ def _open_camoufox_context(account: dict, headless: bool = False, manual: bool =
     cm, context, page = open_spark_browser(name, proxy_raw, mode="desktop", headless=headless, humanize=False)
     try:
         setattr(context, "_sparkgrid_proxy", proxy_raw)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     return cm, context, page
 
@@ -1334,7 +1368,8 @@ def _save_camoufox_state(context, account: str, proxy: str | None = None):
         storage_path = _profile_storage_state_path(account, "desktop")
         context.storage_state(path=str(storage_path))
         return str(storage_path)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return ""
 
 def launch_context(p, account: dict, provider: str = "playwright", headless: bool = False, manual: bool = False):
@@ -1349,6 +1384,7 @@ def launch_context(p, account: dict, provider: str = "playwright", headless: boo
         except Exception as exc:
             # Never change browser engine/fingerprint silently. A Camoufox
             # profile must either open correctly or fail with an actionable error.
+            logger.debug("%s: %s", type(exc).__name__, exc)
             if isinstance(exc, (ProxyConfigurationError, BrowserProxyApplicationError)):
                 raise
             raise RuntimeError(f"SparkBrowser launch failed: {exc}") from exc
@@ -1384,12 +1420,14 @@ def _authenticated_session_present(page) -> bool:
 def get_state(page) -> tuple[str, str]:
     try:
         txt = (page.locator("body").inner_text(timeout=2000) or "").lower()
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         txt = ""
     url = ""
     try:
         url = (page.url or "").lower()
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     if _is_consent_loop(page):
         return "consent_required", "Instagram cookie consent could not be saved"
@@ -1473,7 +1511,8 @@ def get_state(page) -> tuple[str, str]:
         has_password_field = page.locator(
             "input[type='password'], input[name='password'], input[autocomplete='current-password']"
         ).count() > 0
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         has_password_field = False
     if has_password_field:
         return "login_required", "password field present"
@@ -1494,7 +1533,8 @@ def get_state(page) -> tuple[str, str]:
             "svg[aria-label='Home' i], a[href='/'], [aria-label='New post' i], "
             "svg[aria-label='Startseite' i], nav a[href*='/direct/']"
         ).count() > 0
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         logged_in_ui = False
     if logged_in_ui:
         return "logged_in", "logged-in app UI present"
@@ -1506,7 +1546,8 @@ def get_state(page) -> tuple[str, str]:
             str(item.get("name") or "").lower() == "sessionid" and str(item.get("value") or "").strip()
             for item in cookies
         )
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         has_session = False
     if has_session and "instagram.com" in url:
         return "unknown", "session cookie exists but Instagram did not confirm authentication"
@@ -1530,7 +1571,8 @@ def _force_english(page, dump=None) -> None:
         time.sleep(random.uniform(1.0, 2.0))
         if dump:
             dump.capture(page, "arrive_force_english", "normalized IG UI to hl=en")
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 
@@ -1574,7 +1616,8 @@ def _arrive_instagram(
                         if account and save_browser_preferences:
                             try:
                                 save_browser_preferences(account, mode, last_working_search_engine=engine)
-                            except Exception:
+                            except Exception as _exc:
+                                logger.debug("%s: %s", type(_exc).__name__, _exc)
                                 pass
                         _force_english(page, dump)
                         result = recover_initial_browser_load(page)
@@ -1582,12 +1625,14 @@ def _arrive_instagram(
                             dump.record_initial_browser_load(result)
                         return result
             except Exception as exc:
+                logger.debug("%s: %s", type(exc).__name__, exc)
                 log(f"{engine} search arrival failed ({exc}); trying next route", "WARNING")
     initial_error = None
     try:
         url = "https://www.instagram.com/?hl=en" if FORCE_IG_ENGLISH else "https://www.instagram.com/"
         page.goto(url, wait_until="domcontentloaded", timeout=90000)
     except Exception as exc:
+        logger.debug("%s: %s", type(exc).__name__, exc)
         initial_error = exc
     result = recover_initial_browser_load(
         page,
@@ -1631,7 +1676,8 @@ def _click_login_if_present(page, dump, account: str = "") -> bool:
                 else:
                     time.sleep(random.uniform(1.5, 3.0))
                 return True
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
     return False
 
@@ -1656,7 +1702,8 @@ def _instagram_url_category(page) -> str:
         parsed = urlparse(str(getattr(page, "url", "") or ""))
         path = (parsed.path or "").lower()
         query = (parsed.query or "").lower()
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return "unknown"
     if "/challenge" in path or "challenge" in query:
         return "challenge"
@@ -1671,7 +1718,8 @@ def _wait_for_current_dom(page) -> None:
     """Wait on the current document without retaining any pre-navigation node."""
     try:
         page.wait_for_load_state("domcontentloaded", timeout=15000)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 
@@ -1773,9 +1821,10 @@ def _consent_recovery_result(
                     wait_until="domcontentloaded",
                     timeout=30000,
                 )
-            except Exception:
+            except Exception as _exc:
                 # A timeout may still leave a usable committed document.
                 # It consumes this attempt and is classified below.
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 navigation_failed = True
             _wait_for_current_dom(page)
             state_after_navigation, _ = _current_consent_recovery_state(page)
@@ -2191,7 +2240,8 @@ def _first_visible(page, selectors: List[str], timeout_ms: int = 1200):
             loc = page.locator(selector).first
             if loc and int(loc.count() or 0) > 0 and loc.is_visible(timeout=timeout_ms):
                 return loc
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
     return None
 
@@ -2202,7 +2252,8 @@ def _first_existing(page, selectors: List[str]):
             loc = page.locator(selector).first
             if loc and int(loc.count() or 0) > 0:
                 return loc
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
     return None
 
@@ -2219,14 +2270,16 @@ def _click_first(
                 try:
                     if not loc.is_visible(timeout=timeout_ms):
                         continue
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
                 if actor is not None and actor.click(loc, timeout=timeout_ms):
                     return True
                 loc.click(timeout=timeout_ms, force=True)
                 _record_direct_fallback(dump, action)
                 return True
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
     return False
 
@@ -2275,7 +2328,8 @@ def _fresh_totp_code(secret: str, submitted_codes: set[str]) -> tuple[str, str]:
         return "", "next_window_required"
     try:
         code = str(pyotp.TOTP(normalized).now() or "")
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return "", "invalid_secret"
     if not re.fullmatch(r"\d{6,8}", code):
         return "", "invalid_generated_code"
@@ -2293,7 +2347,8 @@ def _two_factor_feedback(page) -> tuple[str, str]:
     """Classify only explicit post-submit OTP feedback, never a timeout."""
     try:
         text = (page.locator("body").inner_text(timeout=1200) or "").lower()
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return "", ""
     expired = (
         "code has expired", "security code has expired", "expired code",
@@ -2315,13 +2370,15 @@ def _two_factor_liveness(page) -> tuple[str, str]:
     try:
         if bool(page.is_closed()):
             return "page_closed", "2FA page closed while waiting for Instagram"
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     try:
         browser = getattr(getattr(page, "context", None), "browser", None)
         if browser is not None and hasattr(browser, "is_connected") and not browser.is_connected():
             return "browser_unavailable", "browser became unavailable while waiting for Instagram"
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     return "", ""
 
@@ -2459,7 +2516,8 @@ def _credential_surface_readiness(
 def _diagnostic_document_epoch(dump: Any, raw: Any) -> int:
     try:
         return int(dump._auto_login_document_epoch(raw))
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return 0
 
 
@@ -2537,7 +2595,8 @@ def _record_arrival_route(
         )
         dump._stage1_arrival_route = route
         dump._stage1_route_evidence = dict(evidence)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     return evidence
 
@@ -2571,7 +2630,8 @@ def _record_credential_workflow_started(
             document_epoch=int(evidence.get("document_epoch") or 0),
             mutation_epoch=int(evidence.get("mutation_epoch") or 0),
         )
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 
@@ -2687,7 +2747,8 @@ def _record_auto_login_observation(
     if dump is not None:
         try:
             dump._auto_login_last_observation = observation
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
     selected = _auto_login_selected_candidate(observation)
     payload = _auto_login_diagnostic_base(observation, selected)
@@ -2952,11 +3013,13 @@ _LOGIN_SURFACE_SCRIPT = r"""() => {
 def _trusted_login_frames(page) -> list[tuple[int, Any]]:
     try:
         frames = list(getattr(page, "frames", []) or [])
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         frames = []
     try:
         main_frame = getattr(page, "main_frame", None)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         main_frame = None
     if not frames and main_frame is not None:
         frames = [main_frame]
@@ -2969,7 +3032,8 @@ def _trusted_login_frames(page) -> list[tuple[int, Any]]:
             parsed = urlparse(str(getattr(frame, "url", "") or ""))
             host = str(parsed.hostname or "").lower()
             scheme = str(parsed.scheme or "").lower()
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
         if scheme in {"about", "data"} or host == "instagram.com" or host.endswith(
             ".instagram.com"
@@ -2982,7 +3046,8 @@ def _login_route_category(page) -> str:
     try:
         parsed = urlparse(str(getattr(page, "url", "") or ""))
         path = str(parsed.path or "").lower()
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return "unknown"
     if "/challenge" in path or "/checkpoint" in path:
         return "challenge"
@@ -3002,7 +3067,8 @@ def _scoped_consent_surface(page) -> bool:
         return True
     try:
         dialog = inspect_dialog(page)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return False
     return bool(
         dialog.get("present")
@@ -3210,7 +3276,8 @@ def _observe_login_surface(page) -> LoginSurfaceObservation:
     for frame_index, frame in _trusted_login_frames(page):
         try:
             payload = frame.evaluate(_LOGIN_SURFACE_SCRIPT)
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
         if (
             not isinstance(payload, dict)
@@ -3236,7 +3303,8 @@ def _observe_login_surface(page) -> LoginSurfaceObservation:
     }:
         try:
             authenticated = bool(_authenticated_session_present(page))
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             authenticated = False
     observation = _classify_login_surface(
         raw_candidates,
@@ -3248,7 +3316,8 @@ def _observe_login_surface(page) -> LoginSurfaceObservation:
     )
     try:
         _record_auto_login_observation(observation)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     return observation
 
@@ -3273,7 +3342,8 @@ def _resolve_login_candidate(page, candidate: LoginCandidateDescriptor):
             )
             or ""
         )
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return None
     return locator if node_ref == candidate.recipe.node_ref else None
 
@@ -3320,7 +3390,8 @@ def _wait_for_login_surface_change(
             },
             timeout=max(50, int(timeout_ms)),
         )
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 
@@ -3354,14 +3425,16 @@ def _login_fields_available(page) -> bool:
 def _body_text_len(page) -> int:
     try:
         return len((page.locator("body").inner_text(timeout=1200) or "").strip())
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return 0
 
 
 def _input_value(locator) -> str:
     try:
         return str(locator.input_value(timeout=1500) or "")
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return ""
 
 
@@ -3380,7 +3453,8 @@ def _login_field_ready(field) -> bool:
         try:
             if not bool(check(timeout=900)):
                 return False
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             return False
     return True
 
@@ -3390,7 +3464,8 @@ def _set_login_form_failure(dump, code: str) -> None:
     # back to do_auto_login, never field content or credentials.
     try:
         dump.login_form_failure_code = code
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 
@@ -3448,13 +3523,15 @@ def _safe_clear_and_type(field, value: str, hum=None) -> bool:
         if hum is not None:
             try:
                 hum.move_to_locator(field, timeout=2500, allow_overshoot=False)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
         field.click(timeout=4000)
         field.fill("", timeout=5000)
         field.fill(value, timeout=8000)
         return True
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return False
 
 
@@ -3520,7 +3597,8 @@ def _fresh_login_value_postcondition(
             )
             or ""
         )
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         value = ""
     return (
         _value_postcondition(intent, value, expected),
@@ -3599,7 +3677,8 @@ def _interact_and_verify_login_candidate(
                     probes[method.removeprefix("is_")] = bool(
                         probe(timeout=500)
                     )
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
 
         # Probes are observations, so resolve the recipe again before acting.
@@ -3618,7 +3697,8 @@ def _interact_and_verify_login_candidate(
                     value_match=None,
                     node_replacement=True,
                 )
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             _wait_for_login_surface_change(
                 page,
@@ -3650,6 +3730,7 @@ def _interact_and_verify_login_candidate(
                 locator.fill("", timeout=2200)
                 locator.fill(expected, timeout=3500)
         except Exception as exc:
+            logger.debug("%s: %s", type(exc).__name__, exc)
             action_accepted = False
             if hum is not None:
                 human_action_failures += 1
@@ -3687,7 +3768,8 @@ def _interact_and_verify_login_candidate(
                 value_match=matched,
                 node_replacement=node_replacement,
             )
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         if matched:
             return LoginInteractionResult(
@@ -3735,6 +3817,7 @@ def _interact_and_verify_login_candidate(
                 try:
                     _react_fill(locator, expected)
                 except Exception as exc:
+                    logger.debug("%s: %s", type(exc).__name__, exc)
                     fallback_exception = type(exc).__name__
                     exceptions.append(fallback_exception)
                 matched, post_observation, post_candidate = (
@@ -3763,7 +3846,8 @@ def _interact_and_verify_login_candidate(
                             != candidate.recipe.node_ref
                         ),
                     )
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
                 if matched:
                     return LoginInteractionResult(
@@ -3831,7 +3915,8 @@ def _detect_login_rejection(page) -> str:
     """Classify only fresh, contextual login rejection evidence."""
     try:
         txt = (page.locator("body").inner_text(timeout=1200) or "").strip().lower()
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         txt = ""
     try:
         password_present = page.locator(
@@ -3839,7 +3924,8 @@ def _detect_login_rejection(page) -> str:
             "input[autocomplete='current-password']"
         ).count() > 0
         login_form_present = page.locator("form").count() > 0 and password_present
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         login_form_present = False
 
     # Explicit password evidence outranks generic blockers, but only on the
@@ -3933,7 +4019,8 @@ TERMINAL_FAILURE = "TERMINAL_FAILURE"
 def _safe_request_path(value: str) -> str:
     try:
         path = str(urlparse(str(value or "")).path or "/")
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         path = "/"
     if not path.startswith("/"):
         path = "/" + path
@@ -3998,7 +4085,8 @@ class LoginPostActionTelemetry:
                     self.dump.root / "login_post_action.jsonl",
                     serialized + "\n",
                 )
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
 
     @staticmethod
@@ -4011,7 +4099,8 @@ class LoginPostActionTelemetry:
                 (host == "instagram.com" or host.endswith(".instagram.com"))
                 and resource_type in {"document", "xhr", "fetch"}
             )
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             return False
 
     def start(self) -> None:
@@ -4022,7 +4111,8 @@ class LoginPostActionTelemetry:
             try:
                 self.page.on(event, handler)
                 self.attached_events.add(event)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
         self._emit(
             "telemetry_started",
@@ -4038,10 +4128,12 @@ class LoginPostActionTelemetry:
         for event, handler in self._handlers.items():
             try:
                 self.page.remove_listener(event, handler)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 try:
                     self.page.off(event, handler)
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
         for data in list(self.requests.values()):
             if not data.get("terminal"):
@@ -4122,7 +4214,8 @@ class LoginPostActionTelemetry:
         data["terminal"] = True
         try:
             failure = request.failure
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             failure = None
         data["outcome"] = "failed"
         data["failure_reason"] = _safe_network_failure(failure)
@@ -4139,7 +4232,8 @@ class LoginPostActionTelemetry:
         try:
             if frame != self.page.main_frame:
                 return
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         self.main_frame_navigations += 1
         self._emit("framenavigated", url_path=_safe_request_path(getattr(frame, "url", "")))
@@ -4269,7 +4363,8 @@ def _login_post_action_ui(page) -> dict:
         }""")
         if isinstance(result, dict):
             defaults.update({key: bool(result.get(key)) for key in defaults})
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     return defaults
 
@@ -4291,7 +4386,8 @@ def _login_submit_control(
         try:
             controls = frame.locator(LOGIN_CONTROL_SELECTOR)
             count = min(int(controls.count() or 0), 30)
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
         for index in range(count):
             try:
@@ -4327,7 +4423,8 @@ def _login_submit_control(
                 if not control.is_visible():
                     continue
                 return control
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 continue
     return None
 
@@ -4338,11 +4435,13 @@ def _control_state(control) -> dict:
     state = {"present": True, "visible": False, "enabled": False, "busy": False}
     try:
         state["visible"] = bool(control.is_visible(timeout=400))
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     try:
         state["enabled"] = bool(control.is_enabled(timeout=400))
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         state["enabled"] = True
     try:
         aria_busy = str(control.get_attribute("aria-busy") or "").lower() == "true"
@@ -4355,7 +4454,8 @@ def _control_state(control) -> dict:
             "disabled": disabled,
             "text_present": bool(text),
         })
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     return state
 
@@ -4379,13 +4479,15 @@ def _execute_login_submit(
             try:
                 if hum.click(control):
                     return ACTION_ACCEPTED_TRANSITIONING, "button_human_pointer", control, before
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
         try:
             control.click(timeout=5000)
             _record_direct_fallback(dump, "submit_login_form_locator")
             return ACTION_ACCEPTED_TRANSITIONING, "button_locator_click", control, before
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             return ACTION_NOT_EXECUTED, "button_click_failed", control, before
     try:
         if hum is not None:
@@ -4416,7 +4518,8 @@ def _execute_login_submit(
             pass_field.press("Enter", timeout=3000)
         _record_direct_fallback(dump, "submit_login_form_enter")
         return ACTION_ACCEPTED_TRANSITIONING, "password_enter", control, before
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return ACTION_NOT_EXECUTED, "enter_failed", control, before
 
 
@@ -4453,7 +4556,8 @@ class _AutoLoginTransactionCoordinator:
             )
         try:
             _record_auto_login_terminal(observation, code)
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         _set_login_form_failure(self.dump, code)
         self.dump.capture(
@@ -4624,7 +4728,8 @@ class _AutoLoginTransactionCoordinator:
             attempts += 1
             try:
                 control.click(timeout=5000)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             # The clicked control and all pre-click observations are invalid.
             post = _observe_login_surface(self.page)
@@ -4959,7 +5064,8 @@ class _AutoLoginTransactionCoordinator:
                             telemetry=telemetry,
                         )
                     )
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
         if transition in {
             UNKNOWN_STABLE_STATE, ACTION_NOT_EXECUTED, TERMINAL_FAILURE
@@ -5032,7 +5138,8 @@ def _wait_for_password_submit_activation(
     while True:
         try:
             current_url = str(page.url or "")
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             current_url = ""
         if current_url and current_url != str(before_url or ""):
             safe_url = current_url.split("?", 1)[0].split("#", 1)[0]
@@ -5091,7 +5198,8 @@ def _wait_for_password_submit_activation(
         try:
             if not fresh_password.is_visible(timeout=350):
                 return ACTION_ACCEPTED_TRANSITIONING, "visible login form disappeared"
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             return ACTION_ACCEPTED_TRANSITIONING, "login form detached during navigation"
         if state == "login_required":
             stable_reads += 1
@@ -5137,9 +5245,11 @@ def _find_2fa_code_field(page):
                 try:
                     if el.is_visible(timeout=500):
                         return el
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     continue
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
     # Last resort: IG's 2FA code input is often CSS-hidden (custom OTP widget:
     # a real <input type=text autocomplete=off> behind a visual layer), so
@@ -5151,7 +5261,8 @@ def _find_2fa_code_field(page):
             loc = page.locator(sel).first
             if int(loc.count() or 0) > 0:
                 return loc
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
     return None
 
@@ -5172,7 +5283,8 @@ def _read_confirmed_otp(page, code_field) -> str:
         direct = _digits_only(code_field.input_value(timeout=1200))
         if len(direct) >= 6:
             return direct
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     selectors = (
         "input[maxlength='1']",
@@ -5190,18 +5302,21 @@ def _read_confirmed_otp(page, code_field) -> str:
                 try:
                     if not item.is_visible(timeout=250):
                         continue
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     continue
                 try:
                     value = _digits_only(item.input_value(timeout=400))
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     value = ""
                 if value:
                     values.append(value)
             combined = "".join(values)
             if len(combined) >= 6:
                 return combined
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
     return direct
 
@@ -5222,7 +5337,8 @@ def _type_and_confirm_otp(page, code_field, code: str, account: dict, dump: Live
             dump.capture(page, "auto_login_2fa_input_retry", "OTP was not retained; retrying input")
         try:
             current.scroll_into_view_if_needed(timeout=1500)
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         focused = bool(hum and hum.click(current, timeout=3000))
         if not focused:
@@ -5235,18 +5351,21 @@ def _type_and_confirm_otp(page, code_field, code: str, account: dict, dump: Live
                     focus()
                     focused = True
                     break
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     continue
         try:
             current.press("ControlOrMeta+A")
             current.press("Delete")
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         typed = False
         if hum is not None:
             try:
                 typed = bool(hum.type_text(code, locator=current, clear=True, sensitive=True, allow_typos=False))
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 typed = False
         if not typed:
             for typer in (
@@ -5257,7 +5376,8 @@ def _type_and_confirm_otp(page, code_field, code: str, account: dict, dump: Live
                 try:
                     typer()
                     break
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     continue
         time.sleep(0.8)
         confirmed, actual_length = _otp_is_confirmed(page, current, code)
@@ -5314,7 +5434,8 @@ def _try_submit_totp(
         txt = ""
         try:
             txt = (page.locator("body").inner_text(timeout=1000) or "").lower()
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         # We are only called once get_state() confirmed the 2FA page (by URL), so
         # do NOT gate on English text — the code input is found by attributes,
@@ -5328,7 +5449,8 @@ def _try_submit_totp(
                      "2FA text detected but code input not found", force_snapshot=True)
         try:
             (dump.root / "2fa_page.html").write_text(page.content(), encoding="utf-8")
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         return False, "two_factor_code_required"
     if not secret:
@@ -5424,7 +5546,8 @@ def _2fa_submit_transition(page, code_field, before_url: str, clicked_control=No
     while time.time() < deadline:
         try:
             current_url = str(page.url or "")
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             current_url = ""
         if before_url and current_url and current_url != before_url:
             return True, "URL changed"
@@ -5432,30 +5555,35 @@ def _2fa_submit_transition(page, code_field, before_url: str, clicked_control=No
             state, reason = get_state(page)
             if state in {"logged_in", "checkpoint", "restricted", "login_required", "failed"}:
                 return True, f"state changed to {state}: {reason}"
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         try:
             if int(code_field.count() or 0) == 0 or not code_field.is_visible(timeout=350):
                 return True, "2FA field disappeared"
-        except Exception:
+        except Exception as _exc:
             # A detached locator is also evidence that the form transitioned.
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             return True, "2FA field detached"
         try:
             body = (page.locator("body").inner_text(timeout=600) or "").lower()
             if any(term in body for term in validating_terms):
                 return True, "Instagram is validating the code"
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         if clicked_control is not None:
             try:
                 if not clicked_control.is_enabled(timeout=300):
                     return True, "confirmation control became disabled"
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             try:
                 if (clicked_control.get_attribute("aria-busy") or "").lower() == "true":
                     return True, "confirmation control is busy"
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
         time.sleep(0.35)
     return False, "no form transition observed"
@@ -5484,7 +5612,8 @@ def _sync_react_otp_value(code_field) -> None:
             el.dispatchEvent(new Event('blur', {bubbles: true}));
             el.focus();
         }""")
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 
@@ -5536,7 +5665,8 @@ def _submit_2fa_confirmation(page, code_field, account: str, dump: LiveDump, hum
 
     try:
         code_box = code_field.bounding_box(timeout=1200)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         code_box = None
 
     def text_of(loc) -> str:
@@ -5550,7 +5680,8 @@ def _submit_2fa_confirmation(page, code_field, account: str, dump: LiveDump, hum
                 value = getter()
                 if value:
                     return str(value).strip()
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 continue
         return ""
 
@@ -5561,15 +5692,18 @@ def _submit_2fa_confirmation(page, code_field, account: str, dump: LiveDump, hum
             try:
                 if not loc.is_enabled(timeout=500):
                     return False
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             try:
                 if (loc.get_attribute("aria-disabled") or "").lower() == "true":
                     return False
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             return True
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             return False
 
     candidates = []
@@ -5577,7 +5711,8 @@ def _submit_2fa_confirmation(page, code_field, account: str, dump: LiveDump, hum
     controls = page.locator("button, [role='button'], input[type='submit']")
     try:
         control_count = min(int(controls.count() or 0), 40)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         control_count = 0
     for i in range(control_count):
         loc = controls.nth(i)
@@ -5588,12 +5723,14 @@ def _submit_2fa_confirmation(page, code_field, account: str, dump: LiveDump, hum
             continue
         try:
             box = loc.bounding_box(timeout=500)
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             box = None
         try:
             tag = (loc.evaluate("el => el.tagName.toLowerCase()") or "").lower()
             typ = (loc.get_attribute("type") or "").lower()
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             tag, typ = "", ""
         score = 0
         if label and positive.search(label):
@@ -5623,7 +5760,8 @@ def _submit_2fa_confirmation(page, code_field, account: str, dump: LiveDump, hum
         before_url = str(page.url or "")
         try:
             loc.scroll_into_view_if_needed(timeout=1200)
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         clicked = False
         try:
@@ -5642,7 +5780,8 @@ def _submit_2fa_confirmation(page, code_field, account: str, dump: LiveDump, hum
             else:
                 return False
             clicked = True
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             return False
         if clicked:
             ok, evidence = _2fa_submit_transition(page, code_field, before_url, clicked_control=loc, timeout_seconds=5.5)
@@ -5662,7 +5801,8 @@ def _submit_2fa_confirmation(page, code_field, account: str, dump: LiveDump, hum
             return True
         try:
             box = loc.bounding_box(timeout=500) or box
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         if click_and_verify(loc, label, box, "mouse"):
             return True
@@ -5680,7 +5820,8 @@ def _submit_2fa_confirmation(page, code_field, account: str, dump: LiveDump, hum
                 log(f"{account}: 2FA confirmation activated with Enter ({evidence})", "OK")
                 _record_direct_fallback(dump, f"submit_2fa_enter_{source}")
                 return True
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
 
     # Final targeted DOM click on the highest-ranked candidate.  Still require
@@ -5705,7 +5846,8 @@ def _submit_2fa_confirmation(page, code_field, account: str, dump: LiveDump, hum
                     log(f"{account}: 2FA form submitted with requestSubmit ({evidence})", "OK")
                     _record_direct_fallback(dump, "submit_2fa_request_submit")
                     return True
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     return False
 
@@ -5728,7 +5870,8 @@ def _ensure_trust_device_checked(page, account: str = "", dump: LiveDump | None 
             el = el.first
             try:
                 checked = el.is_checked(timeout=1000)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 checked = None
             if checked is False:
                 # definitively off → turn it on
@@ -5737,14 +5880,17 @@ def _ensure_trust_device_checked(page, account: str = "", dump: LiveDump | None 
                     try:
                         el.check(timeout=1500)
                         _record_direct_fallback(dump, "trust_device_check")
-                    except Exception:
+                    except Exception as _exc:
+                        logger.debug("%s: %s", type(_exc).__name__, _exc)
                         try:
                             el.click(timeout=1500)
                             _record_direct_fallback(dump, "trust_device_click")
-                        except Exception:
+                        except Exception as _exc:
+                            logger.debug("%s: %s", type(_exc).__name__, _exc)
                             pass
             return  # found the control (checked or unknown) → never toggle it off
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
 
 
@@ -5776,7 +5922,8 @@ def _wait_after_2fa_submit(page, dump: LiveDump, max_seconds: int = 60) -> tuple
             return "two_factor_transition_timeout", "2FA feedback was not an explicit OTP result"
         try:
             txt = (page.locator("body").inner_text(timeout=1200) or "").lower()
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             txt = ""
         if "being validated" in txt or "validating" in txt:
             saw_validating = True
@@ -5785,7 +5932,8 @@ def _wait_after_2fa_submit(page, dump: LiveDump, max_seconds: int = 60) -> tuple
             continue
         try:
             current_url_lower = str(page.url or "").lower()
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             current_url_lower = ""
         if "/challenge" in current_url_lower:
             return "challenge", "Instagram opened a challenge after 2FA submission"
@@ -5837,7 +5985,8 @@ def _wait_after_2fa_submit(page, dump: LiveDump, max_seconds: int = 60) -> tuple
 def _post_login_body_text(page) -> str:
     try:
         return str(page.locator("body").inner_text(timeout=1500) or "").lower()
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return ""
 
 
@@ -6117,7 +6266,8 @@ def _wait_after_password_submit(page, dump: LiveDump, max_seconds: int = 60) -> 
             return state
         try:
             txt = (page.locator("body").inner_text(timeout=1000) or "").lower()
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             txt = ""
         if any(s in txt for s in ["authentication code", "security code", "verification code", "two-factor", "2fa"]):
             return "2fa"
@@ -6143,7 +6293,8 @@ def _wait_after_password_submit(page, dump: LiveDump, max_seconds: int = 60) -> 
         return state
     try:
         final_text = (page.locator("body").inner_text(timeout=1000) or "").lower()
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         final_text = ""
     if any(s in final_text for s in [
         "authentication code", "security code", "verification code", "two-factor", "2fa"
@@ -6213,12 +6364,14 @@ def _hold_manual_post_login(
         try:
             if page.is_closed():
                 return False
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         try:
             if not [item for item in (getattr(ctx, "pages", []) or []) if not item.is_closed()]:
                 return False
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         state, _state_reason = get_state(page)
         ready = bool(
@@ -6297,7 +6450,8 @@ def _persist_browser_domain_failure(
                 safe_detail,
                 force_snapshot=True,
             )
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
     update_account(
         name,
@@ -6366,7 +6520,8 @@ def _record_source_routing_fingerprint(run_id: str) -> None:
             dirty_worktree=bool(str(status.stdout or "").strip()),
             **hashes,
         )
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 
@@ -6409,7 +6564,8 @@ def _record_known_popup_completion(
             ),
             mutation_epoch_after=int(after.get("mutation_epoch") or 0),
         )
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 
@@ -6422,13 +6578,15 @@ def _source_live_stop_requested(page: Any, context: Any) -> bool:
     try:
         if page.is_closed():
             return True
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return True
     try:
         pages = list(getattr(context, "pages", []) or [])
         if not any(not item.is_closed() for item in pages):
             return True
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return True
     return False
 
@@ -6901,15 +7059,18 @@ def do_auto_login(account: dict, args, run_id: str):
                     and getattr(args, "provider", "playwright") == "camoufox"
                 ):
                     _save_camoufox_state(ctx, name)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             ctx.close()
             try:
                 if 'ctx_obj' in locals() and ctx_obj and hasattr(ctx_obj, "__exit__"):
                     ctx_obj.__exit__(None, None, None)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
     except Exception as exc:
+        logger.debug("%s: %s", type(exc).__name__, exc)
         error = str(exc) or type(exc).__name__
         lowered = error.lower()
         reason = _password_submission_blocker_reason(error)
@@ -6990,12 +7151,14 @@ def _browser_session(account: dict, args):
             if context is not None:
                 try:
                     context.close()
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
             if manager is not None and hasattr(manager, "__exit__"):
                 try:
                     manager.__exit__(None, None, None)
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
             # Do not let the worker exit (and the scheduler start the next
             # profile) while the native Camoufox window is still tearing down.
@@ -7018,7 +7181,8 @@ def _browser_session(account: dict, args):
             finally:
                 try:
                     context.close()
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
 
 
@@ -7034,14 +7198,16 @@ def _keep_manual_profile_open(name: str, account: dict, dump: LiveDump, job: int
     pages = []
     try:
         pages = [p for p in (getattr(ctx, "pages", []) or []) if not p.is_closed()]
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pages = []
     if pages:
         page = pages[0]
     else:
         try:
             page = ctx.new_page()
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
 
     try:
@@ -7050,9 +7216,11 @@ def _keep_manual_profile_open(name: str, account: dict, dump: LiveDump, job: int
                 page.goto("https://www.instagram.com/?hl=en", wait_until=wait_until, timeout=60000)
                 if "instagram.com" in (page.url or ""):
                     break
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 continue
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
     _dismiss_instagram_consent(page, dump, name)
@@ -7063,7 +7231,8 @@ def _keep_manual_profile_open(name: str, account: dict, dump: LiveDump, job: int
         update_job(job, status="manual_required", current_step="consent_failed", last_error=reason, finished_at=now_iso())
         try:
             ctx.close()
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         return
 
@@ -7071,7 +7240,8 @@ def _keep_manual_profile_open(name: str, account: dict, dump: LiveDump, job: int
     # issue foreground/focus commands after startup.
     try:
         dump.capture(page, "manual_open_ready", "SparkBrowser is ready for manual control", force_snapshot=True)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     try:
         import manual_recorder
@@ -7079,6 +7249,7 @@ def _keep_manual_profile_open(name: str, account: dict, dump: LiveDump, job: int
         if recpath:
             log(f"{name}: recording manual session -> {recpath}", "INFO")
     except Exception as exc:
+        logger.debug("%s: %s", type(exc).__name__, exc)
         log(f"{name}: manual recorder not attached ({exc})", "WARNING")
 
     update_job(job, status="manual_required", current_step="manual_open", last_error="", finished_at=None)
@@ -7092,13 +7263,15 @@ def _keep_manual_profile_open(name: str, account: dict, dump: LiveDump, job: int
         try:
             if hasattr(page, "is_closed") and page.is_closed():
                 break
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             break
         try:
             live_pages = [p for p in (getattr(ctx, "pages", []) or []) if not p.is_closed()]
             if not live_pages:
                 break
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
 
         now = time.time()
@@ -7106,11 +7279,13 @@ def _keep_manual_profile_open(name: str, account: dict, dump: LiveDump, job: int
             next_state_save = now + 15.0
             try:
                 _save_camoufox_state(ctx, name)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             try:
                 current_url = str(page.url or "")
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 current_url = ""
             if current_url != last_url:
                 last_url = current_url
@@ -7122,7 +7297,8 @@ def _keep_manual_profile_open(name: str, account: dict, dump: LiveDump, job: int
                         take_screenshot=False,
                         take_visible_text=False,
                     )
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
 
         # Optional deep debugging. Disabled by default because screenshots can
@@ -7131,19 +7307,22 @@ def _keep_manual_profile_open(name: str, account: dict, dump: LiveDump, job: int
             next_debug_capture = now + 30.0
             try:
                 dump.capture(page, "manual_live", "optional manual trace checkpoint")
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
         time.sleep(1.0)
 
     try:
         _save_camoufox_state(ctx, name)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     try:
         if not page.is_closed():
             dump.capture(page, "manual_closed", "final manual trace checkpoint", force_snapshot=True)
             (dump.root / "latest.html").write_text(page.content(), encoding="utf-8")
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     update_job(job, status="success", current_step="manual_closed", last_error="", finished_at=now_iso())
 
@@ -7178,6 +7357,7 @@ def do_check_login(account: dict, args, run_id: str):
                                 "OK",
                             )
                 except Exception as exc:
+                    logger.debug("%s: %s", type(exc).__name__, exc)
                     log(
                         f"{name}: manual network capture did not start: "
                         f"{type(exc).__name__}",
@@ -7195,6 +7375,7 @@ def do_check_login(account: dict, args, run_id: str):
                                 "OK",
                             )
                     except Exception as exc:
+                        logger.debug("%s: %s", type(exc).__name__, exc)
                         log(
                             f"{name}: manual capture finalize failed: "
                             f"{type(exc).__name__}",
@@ -7278,15 +7459,18 @@ def do_check_login(account: dict, args, run_id: str):
                     and getattr(args, "provider", "playwright") == "camoufox"
                 ):
                     _save_camoufox_state(ctx, name)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             ctx.close()
             try:
                 if 'ctx_obj' in locals() and ctx_obj and hasattr(ctx_obj, "__exit__"):
                     ctx_obj.__exit__(None, None, None)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
     except Exception as exc:
+        logger.debug("%s: %s", type(exc).__name__, exc)
         error = str(exc) or type(exc).__name__
         if _finish_proxy_failure(name, job, error):
             return
@@ -7315,19 +7499,22 @@ def _wm_mouse_wander(page, moves=None, hum=None):
         try:
             hum.wander(moves)
             return
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
     try:
         vp = page.viewport_size or {"width": 1280, "height": 800}
         w, h = int(vp.get("width", 1280)), int(vp.get("height", 800))
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         w, h = 1280, 800
     for _ in range(moves or random.randint(1, 3)):
         try:
             x = random.randint(int(w * 0.22), int(w * 0.78))
             y = random.randint(int(h * 0.20), int(h * 0.80))
             page.mouse.move(x, y, steps=random.randint(8, 24))
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         _wm_dwell(0.4, 1.4)
 
@@ -7341,7 +7528,8 @@ def _wm_click_svg(page, labels, timeout_ms=1500, hum=None):
                     return True
                 el.click(timeout=2500)
                 return True
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
     return False
 
@@ -7353,11 +7541,13 @@ def _wm_like(page, hum=None):
             if hum is not None:
                 try:
                     hum.move_to_element(vid)
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
             vid.dblclick(timeout=2500)
             return True
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     return _wm_click_svg(page, ["Like"], hum=hum)
 
@@ -7375,20 +7565,24 @@ def _wm_next_reel(page, hum=None):
         else:
             page.mouse.move(random.randint(480, 820), random.randint(300, 620), steps=random.randint(6, 16))
         _wm_dwell(0.2, 0.6)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     if random.random() < 0.55:
         try:
             page.mouse.wheel(0, random.randint(700, 1150))
             return
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
     try:
         page.keyboard.press("ArrowDown")
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         try:
             page.mouse.wheel(0, random.randint(700, 1000))
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
 
 
@@ -7397,12 +7591,14 @@ def _wm_read_comments(page, hum=None):
         for _ in range(random.randint(1, 3)):
             try:
                 page.mouse.wheel(0, random.randint(250, 600))
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             _wm_dwell(1.2, 3.0)
         try:
             page.keyboard.press("Escape")
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         _wm_dwell(0.6, 1.4)
 
@@ -7417,15 +7613,18 @@ def _wm_view_profile(page, hum=None):
             for _ in range(random.randint(2, 4)):
                 try:
                     page.mouse.wheel(0, random.randint(300, 700))
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
                 _wm_dwell(1.0, 2.5)
             try:
                 page.go_back(timeout=8000)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             _wm_dwell(1.0, 2.0)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 
@@ -7436,16 +7635,19 @@ def _wm_browse_explore(page, back_to_reels):
         for _ in range(random.randint(2, 5)):
             try:
                 page.mouse.wheel(0, random.randint(400, 900))
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             _wm_dwell(1.5, 3.5)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
     if back_to_reels:
         try:
             page.goto("https://www.instagram.com/reels/?hl=en", wait_until="domcontentloaded", timeout=45000)
             _wm_dwell(2.0, 4.0)
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
 
 
@@ -7461,6 +7663,7 @@ def warmup_actions(page, dump: LiveDump, minutes: float, account_name: str = "")
             page, dump, float(minutes), mode="desktop", account=account_name
         )
     except Exception as exc:
+        logger.debug("%s: %s", type(exc).__name__, exc)
         dump.capture(page, "ig_warmup_error", error=str(exc), force_snapshot=True)
         return {"ok": False, "state": "failed", "error": str(exc)}
 
@@ -7502,19 +7705,23 @@ def do_warmup(account: dict, args, run_id: str):
                         network_capture.stop()
                         log(f"{name}: network capture saved -> {dump.root / 'network'}", "OK")
                 except Exception as exc:
+                    logger.debug("%s: %s", type(exc).__name__, exc)
                     log(f"{name}: network capture finalize failed: {type(exc).__name__}", "WARNING")
             try:
                 if getattr(args, "provider", "playwright") == "camoufox":
                     _save_camoufox_state(ctx, name)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             ctx.close()
             try:
                 if 'ctx_obj' in locals() and ctx_obj and hasattr(ctx_obj, "__exit__"):
                     ctx_obj.__exit__(None, None, None)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
     except Exception as exc:
+        logger.debug("%s: %s", type(exc).__name__, exc)
         error = str(exc) or type(exc).__name__
         if _finish_proxy_failure(name, job, error):
             return
@@ -7592,6 +7799,7 @@ def do_post_story(account: dict, args, run_id: str):
                             "OK",
                         )
             except Exception as exc:
+                logger.debug("%s: %s", type(exc).__name__, exc)
                 log(
                     f"{name}: Story network capture did not start: "
                     f"{type(exc).__name__}",
@@ -7604,7 +7812,8 @@ def do_post_story(account: dict, args, run_id: str):
                     wait_until="domcontentloaded",
                     timeout=90000,
                 )
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
 
             update_job(job, current_step="story_entry_opened")
@@ -7753,7 +7962,8 @@ def do_post_story(account: dict, args, run_id: str):
             try:
                 if getattr(args, "provider", "playwright") == "camoufox":
                     _save_camoufox_state(ctx, name)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
             finally:
                 try:
@@ -7765,6 +7975,7 @@ def do_post_story(account: dict, args, run_id: str):
                             "OK",
                         )
                 except Exception as exc:
+                    logger.debug("%s: %s", type(exc).__name__, exc)
                     log(
                         f"{name}: Story capture finalize failed: "
                         f"{type(exc).__name__}",
@@ -7773,7 +7984,8 @@ def do_post_story(account: dict, args, run_id: str):
 
             try:
                 ctx.close()
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
 
             try:
@@ -7783,10 +7995,12 @@ def do_post_story(account: dict, args, run_id: str):
                     and hasattr(ctx_obj, "__exit__")
                 ):
                     ctx_obj.__exit__(None, None, None)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
 
     except Exception as exc:
+        logger.debug("%s: %s", type(exc).__name__, exc)
         error = str(exc) or type(exc).__name__
         if _finish_proxy_failure(name, job, error):
             return
@@ -7805,7 +8019,8 @@ def do_post_story(account: dict, args, run_id: str):
 def _settings_body(page) -> str:
     try:
         return (page.locator("body").inner_text(timeout=2500) or "")[:30000]
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         return ""
 
 
@@ -7831,7 +8046,8 @@ def _settings_click(page, names, timeout_ms: int = 8000) -> str:
                     if loc.is_visible(timeout=500):
                         loc.click(timeout=timeout_ms)
                         return str(name)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 continue
     return ""
 
@@ -7909,7 +8125,8 @@ def _private_switch(page):
                 loc = candidate.nth(index)
                 try:
                     visible = loc.is_visible(timeout=2000)
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     visible = False
                 if visible:
                     return loc
@@ -7920,9 +8137,11 @@ def _private_switch(page):
                     tag = loc.evaluate("el => el.tagName")
                     if tag and tag.lower() in ("input", "div", "button"):
                         return loc
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
     return None
 
@@ -7930,10 +8149,12 @@ def _private_switch(page):
 def _control_checked(control) -> bool:
     try:
         return bool(control.is_checked())
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         try:
             return str(control.get_attribute("aria-checked") or "").lower() == "true"
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             return False
 
 
@@ -7988,11 +8209,13 @@ def do_make_public(account: dict, args, run_id: str):
                         # Try normal click first, then force click.
                         try:
                             sel.first.click(timeout=3000)
-                        except Exception:
+                        except Exception as _exc:
+                            logger.debug("%s: %s", type(_exc).__name__, _exc)
                             sel.first.click(timeout=3000, force=True)
                         clicked = True
                         break
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     continue
             if not clicked:
                 # Check if toggle already switched (no dialog needed).
@@ -8012,9 +8235,11 @@ def do_make_public(account: dict, args, run_id: str):
             update_job(job, status="success", current_step="public_verified", finished_at=now_iso())
             try:
                 _save_camoufox_state(context, name)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
     except Exception as exc:
+        logger.debug("%s: %s", type(exc).__name__, exc)
         error = f"{type(exc).__name__}: {exc}"
         _sync_login_status_from_settings_error(name, error)
         update_account(name, web_privacy_status="public" if previous_privacy == "public" else "unknown", web_privacy_checked_at=now_iso(),
@@ -8070,7 +8295,8 @@ def _category_checkbox(page):
                 loc = candidate.nth(index)
                 if loc.is_visible(timeout=500):
                     return loc
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             continue
     return None
 
@@ -8090,6 +8316,7 @@ def do_convert_professional(account: dict, args, run_id: str):
         from account_privacy import verify_account_state
         privacy = str(verify_account_state(name, rotate_mobile=False).get("privacy") or "unknown")
     except Exception as exc:
+        logger.debug("%s: %s", type(exc).__name__, exc)
         log(f"{name}: API privacy precheck unavailable; checking the settings switch: {exc}", "WARNING")
     if privacy != "public":
         do_make_public(account, args, run_id)
@@ -8148,6 +8375,7 @@ def do_convert_professional(account: dict, args, run_id: str):
                 search.fill(category, timeout=8000)
                 time.sleep(1.0)
             except Exception as exc:
+                logger.debug("%s: %s", type(exc).__name__, exc)
                 dump.capture(page, "professional_category_search_failed", error=str(exc), force_snapshot=True)
             category_selected = _settings_click(page, [category], 8000)
             if not category_selected:
@@ -8157,7 +8385,8 @@ def do_convert_professional(account: dict, args, run_id: str):
                     search.press("ArrowDown", timeout=3000)
                     search.press("Enter", timeout=3000)
                     category_selected = True
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     category_selected = False
             if not category_selected:
                 dump.capture(page, "professional_category_missing", f"requested category={category}", force_snapshot=True)
@@ -8190,6 +8419,7 @@ def do_convert_professional(account: dict, args, run_id: str):
                     if str(verified_state.get("professional") or "") in {"creator", "business"}:
                         break
                 except Exception as exc:
+                    logger.debug("%s: %s", type(exc).__name__, exc)
                     verify_error = f"{type(exc).__name__}: {exc}"
                 time.sleep(2.0 + attempt)
             actual_type = str((verified_state or {}).get("professional") or "")
@@ -8205,9 +8435,11 @@ def do_convert_professional(account: dict, args, run_id: str):
             update_job(job, status="success", current_step="professional_verified", finished_at=now_iso())
             try:
                 _save_camoufox_state(context, name)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
     except Exception as exc:
+        logger.debug("%s: %s", type(exc).__name__, exc)
         error = f"{type(exc).__name__}: {exc}"
         _sync_login_status_from_settings_error(name, error)
         update_account(name, web_professional_status="unknown",
@@ -8249,6 +8481,7 @@ def do_create_profiles(accounts: List[dict], run_id: str):
                 "OK",
             )
         except Exception as exc:
+            logger.debug("%s: %s", type(exc).__name__, exc)
             update_account(name, web_upload_profile_status="profile_error", web_upload_last_error=str(exc))
             update_job(job, status="failed", current_step="profile_create_failed", last_error=str(exc), finished_at=now_iso())
             log(f"{name}: profile creation failed: {exc}", "ERROR")
@@ -8261,6 +8494,7 @@ def _run_accounts(fn, accounts: List[dict], args, run_id: str) -> None:
             try:
                 fn(acc, args, run_id)
             except Exception as exc:
+                logger.debug("%s: %s", type(exc).__name__, exc)
                 log(f"{acc.get('name', 'account')}: worker failed; continuing queue: {exc}", "ERROR")
             time.sleep(random.uniform(0.8, 2.2))
         return
@@ -8274,6 +8508,7 @@ def _run_accounts(fn, accounts: List[dict], args, run_id: str) -> None:
             try:
                 fut.result()
             except Exception as exc:
+                logger.debug("%s: %s", type(exc).__name__, exc)
                 log(f"account worker crashed: {exc}", "ERROR")
 
 
