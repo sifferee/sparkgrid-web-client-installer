@@ -33,6 +33,12 @@
 
 ## Последнее изменение
 
+- 2026-08-11 — Claude (диагностика) + Hermes (применение, коммит f2d8e5e) —
+  Sonnet-ревью pipeline + telegram-approve: vision_fallback.py с
+  логированием, новый vision_review.py (ревью меток зрения через
+  Sonnet, запускается раз в сутки через Task Scheduler),
+  telegram_bot.py с обработчиками vfapprove/vfdeny для ручного
+  подтверждения кликов зрения. Бот перезапущен.
 - 2026-08-11 — Claude (диагностика) + Hermes (применение, коммит 95f0f9f) —
   vision fallback для закрытия диалога "We removed your post"
   (policy_notice): если структурный поиск кнопки "close" честно не находит
