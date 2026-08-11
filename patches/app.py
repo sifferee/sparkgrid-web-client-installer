@@ -1033,6 +1033,7 @@ def _start_publication_verifier() -> None:
     try:
         import story_trigger
         story_trigger.start_trigger_thread()
+        story_trigger.start_retry_thread()
     except Exception as exc:
         print(f"[startup] story trigger failed to start: {exc}")
 

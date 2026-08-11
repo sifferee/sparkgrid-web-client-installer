@@ -356,6 +356,107 @@ def run_trigger_check() -> int:
     return posted
 
 
+def get_pending_retry_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Accounts whose MOST RECENT story_triggers row is a failed post
+    attempt (story_posted_at IS NULL, error non-empty) — i.e. the trigger
+    condition (threshold or daily interval) was already confirmed true,
+    but the actual POST to Instagram failed. These are eligible for the
+    fast retry loop rather than waiting for the next slow discovery scan.
+    """
+    rows = conn.execute("""
+        SELECT t.account_name, t.trigger_reel_pk, t.trigger_views, t.threshold_used
+        FROM story_triggers t
+        INNER JOIN (
+            SELECT account_name, MAX(id) AS max_id
+            FROM story_triggers
+            GROUP BY account_name
+        ) latest ON t.account_name = latest.account_name AND t.id = latest.max_id
+        WHERE t.story_posted_at IS NULL AND COALESCE(t.error, '') != ''
+    """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def run_retry_check() -> int:
+    """Fast retry pass for accounts whose last story-post attempt failed.
+
+    Alexander's explicit design (2026-08-11): once a trigger condition
+    (views threshold or daily interval) is confirmed true, a POST
+    failure is an infrastructure problem (API error, network, etc), not
+    a reason to re-evaluate whether the account should get a story at
+    all — so this does NOT re-check the threshold or daily interval, it
+    just retries the post using the SAME trigger data that was already
+    recorded as valid.
+    """
+    conn = _db_conn()
+    retried = 0
+    try:
+        ensure_story_trigger_schema(conn)
+        pending = get_pending_retry_accounts(conn)
+        if not pending:
+            return 0
+        log(f"Retry pass: {len(pending)} account(s) with a failed story post")
+        for row in pending:
+            name = row["account_name"]
+            if has_story_today(conn, name):
+                # A normal cycle already succeeded for this account since
+                # the failure was recorded — nothing left to retry.
+                continue
+            result = trigger_story_post(name)
+            if result.get("ok") and result.get("started", True) is not False:
+                job_id = int(result.get("story_job_id", 0) or result.get("run_id", 0) or 0)
+                record_trigger(
+                    conn, name,
+                    str(row.get("trigger_reel_pk") or ""),
+                    int(row.get("trigger_views") or 0),
+                    int(row.get("threshold_used") or 0),
+                    job_id,
+                )
+                retried += 1
+                log(f"@{name}: ✅ Story posted on retry (job_id={job_id})")
+            else:
+                error = str(result.get("error") or result.get("reason") or result.get("message") or "unknown")
+                log(f"@{name}: retry still failing: {error}", "WARNING")
+                record_trigger(
+                    conn, name,
+                    str(row.get("trigger_reel_pk") or ""),
+                    int(row.get("trigger_views") or 0),
+                    int(row.get("threshold_used") or 0),
+                    0, error,
+                )
+    except Exception as e:
+        log(f"Retry check error: {e}", "ERROR")
+    finally:
+        conn.close()
+    log(f"Story retry cycle: {retried} posted")
+    return retried
+
+
+def start_retry_thread() -> "threading.Thread":
+    """Fixed 10-minute retry loop for failed story posts — separate from
+    the main discovery loop's randomized 5-43min interval.
+
+    Deliberately NOT randomized like the main loop: the main loop's
+    jitter exists to stop Instagram from fingerprinting a fixed
+    fleet-wide check pattern. A retry for one SPECIFIC account that
+    already had a confirmed trigger condition isn't that same fleet-wide
+    pattern risk, and Alexander was explicit about wanting exactly 10
+    minutes, not "roughly 10."
+    """
+    import threading
+    def _loop():
+        log("Story retry checker started (fixed 10-min interval)")
+        while True:
+            try:
+                run_retry_check()
+            except Exception as e:
+                log(f"Retry loop error: {e}", "ERROR")
+            time.sleep(600)
+
+    t = threading.Thread(target=_loop, daemon=True, name="story-retry")
+    t.start()
+    return t
+
+
 def start_trigger_thread() -> "threading.Thread":
     """Start trigger checker in background thread."""
     import threading
