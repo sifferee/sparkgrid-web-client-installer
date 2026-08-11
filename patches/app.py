@@ -2444,6 +2444,7 @@ def overview() -> dict[str, Any]:
                    a.web_upload_profile_status, a.web_upload_login_status,
                    web_upload_cookie_status, web_upload_last_error,
                    web_upload_last_upload_at, web_upload_cooldown_until,
+                   COALESCE(a.created_at,'') AS created_at,
                    web_upload_content_mode, COALESCE(web_upload_quality_niche,'') AS web_upload_quality_niche,
                    COALESCE(web_upload_scale_niche,'') AS web_upload_scale_niche,
                    web_upload_cycle_count, web_upload_next_cycle_at,
@@ -2605,8 +2606,8 @@ async def import_accounts(request: Request) -> JSONResponse:
             else:
                 conn.execute(
                     """
-                    INSERT INTO accounts(name,password,api_password,api_totp_secret,proxy,status,web_upload_enabled,web_upload_content_mode,web_upload_quality_niche,web_upload_scale_niche)
-                    VALUES (?,?,?,?,?,'ready',1,?,?,?)
+                    INSERT INTO accounts(name,password,api_password,api_totp_secret,proxy,status,web_upload_enabled,web_upload_content_mode,web_upload_quality_niche,web_upload_scale_niche,created_at)
+                    VALUES (?,?,?,?,?,'ready',1,?,?,?,datetime('now'))
                     """,
                     (item["name"], item["password"], item["password"], item["totp"], item_proxy, content_mode or "scale", quality_niche, scale_niche),
                 )
@@ -2711,8 +2712,8 @@ async def add_account(request: Request) -> JSONResponse:
         exists = conn.execute("SELECT 1 FROM accounts WHERE name=?", (name,)).fetchone()
         conn.execute(
             """
-            INSERT INTO accounts(name,password,api_password,api_totp_secret,proxy,status,web_upload_enabled)
-            VALUES (?,?,?,?,?,'ready',1)
+            INSERT INTO accounts(name,password,api_password,api_totp_secret,proxy,status,web_upload_enabled,created_at)
+            VALUES (?,?,?,?,?,'ready',1,datetime('now'))
             ON CONFLICT(name) DO UPDATE SET
                 password=excluded.password,
                 api_password=excluded.api_password,

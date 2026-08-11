@@ -194,6 +194,71 @@ def is_account_usable(a: dict) -> bool:
         return False
     return True
 
+
+def _is_banned(a: dict) -> bool:
+    error = str(a.get("web_upload_last_error") or "").lower()
+    return any(w in error for w in ("suspend", "banned", "disabled", "restrict", "checkpoint", "challenge"))
+
+
+def _cooldown_hours_remaining(a: dict) -> float:
+    """Hours remaining before this account clears its upload cooldown.
+    0 or less = ready now.
+
+    Alexander's explicit rule (2026-08-11): a brand-new account (never
+    uploaded yet) gets a 6h cooldown measured from when it was added to
+    the software (created_at) — not the normal 8h. After its first
+    upload, the standard 8h cooldown applies, measured from
+    web_upload_last_upload_at.
+
+    Computed directly here from created_at/last_upload_at rather than
+    trusting web_upload_cooldown_until — that column's write path lives
+    in a module outside this repo (ig_signals.py) that hasn't been
+    verified to implement this same 6h-for-new-accounts rule, so this
+    is deliberately self-contained rather than assuming.
+
+    If neither timestamp is available (legacy accounts added before
+    created_at was populated) — don't block. Missing data isn't
+    evidence of an active cooldown, and blocking on a guess would keep
+    an account stuck in a synthetic cooldown forever.
+    """
+    last_upload = str(a.get("web_upload_last_upload_at") or "").strip()
+    if last_upload:
+        anchor, window_hours = last_upload, 8.0
+    else:
+        anchor, window_hours = str(a.get("created_at") or "").strip(), 6.0
+    if not anchor:
+        return 0.0
+    try:
+        anchor_dt = datetime.strptime(anchor[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return 0.0
+    elapsed_hours = (datetime.now() - anchor_dt).total_seconds() / 3600.0
+    return max(0.0, window_hours - elapsed_hours)
+
+
+def _categorize_for_mass_upload(accounts: list) -> dict:
+    """Bucket accounts for a mass-upload trigger: ready to go now, or the
+    specific reason they're being skipped. Checked in a fixed priority
+    order — an account only ever lands in ONE bucket, even if it
+    technically matches more than one condition (e.g. banned AND in
+    cooldown — banned is the more useful thing to tell the user)."""
+    buckets = {"ready": [], "cooldown": [], "banned": [], "not_logged_in": [], "error": []}
+    for a in accounts:
+        if _is_banned(a):
+            buckets["banned"].append(a)
+            continue
+        if str(a.get("web_upload_login_status") or "") != "logged_in":
+            buckets["not_logged_in"].append(a)
+            continue
+        if _cooldown_hours_remaining(a) > 0:
+            buckets["cooldown"].append(a)
+            continue
+        if str(a.get("web_upload_last_error") or "").strip():
+            buckets["error"].append(a)
+            continue
+        buckets["ready"].append(a)
+    return buckets
+
 # ─── API Client ───────────────────────────────────────────────────────────────
 # post-story endpoint reads form data, not JSON.
 # Other endpoints (start, workflow, stop, metrics/run, delete-banned) accept JSON.
@@ -835,17 +900,55 @@ async def callback_handler(update: Update, ctx):
                 "post_warmup_min": 1, "post_warmup_max": 3, "cooldown_hours": 8,
             })
         elif data == "upload_all":
-            await query.edit_message_text("🚀 Залив всех готовых аккаунтов...")
             overview = await api_get(session, "/api/ig-web-upload/overview")
-            names = [a["name"] for a in overview.get("accounts", []) if is_account_usable(a)]
-            if not names:
-                await query.edit_message_text("Нет готовых аккаунтов")
+            all_accounts = overview.get("accounts", [])
+            buckets = _categorize_for_mass_upload(all_accounts)
+            ready_names = [a["name"] for a in buckets["ready"]]
+
+            skip_lines = []
+            if buckets["cooldown"]:
+                skip_lines.append(f"{len(buckets['cooldown'])} — кулдаун")
+            if buckets["banned"]:
+                skip_lines.append(f"{len(buckets['banned'])} — бан")
+            if buckets["not_logged_in"]:
+                skip_lines.append(f"{len(buckets['not_logged_in'])} — не залогинены")
+            if buckets["error"]:
+                skip_lines.append(f"{len(buckets['error'])} — ошибка")
+
+            if not ready_names:
+                summary = (
+                    f"{len(all_accounts)} аккаунтов\n"
+                    f"Готовых к заливке: 0\n\n"
+                    f"Не залито:\n" + "\n".join(skip_lines) if skip_lines else "Нет аккаунтов вообще."
+                )
+                await query.edit_message_text(summary)
+                log_action(user_id, username, "upload_all", detail="0 ready")
                 return
+
             result = await api_post_json(session, "/api/ig-web-upload/start", {
-                "accounts": names, "engine": "clean_web", "browser_parallel": 5,
+                "accounts": ready_names, "engine": "clean_web", "browser_parallel": 5,
                 "target": 3, "pre_warmup_min": 1, "pre_warmup_max": 2,
                 "post_warmup_min": 1, "post_warmup_max": 3, "cooldown_hours": 8,
             })
+
+            summary_lines = [
+                f"{len(all_accounts)} аккаунтов",
+                f"Запущено: {len(ready_names)}",
+            ]
+            if skip_lines:
+                summary_lines.append("")
+                summary_lines.append("Не залито:")
+                summary_lines.extend(skip_lines)
+            summary = "\n".join(summary_lines)
+
+            if result.get("ok"):
+                run_id = result.get("run_id", "")
+                log_action(user_id, username, "upload_all", detail=f"ready={len(ready_names)}", result=f"run_id={run_id}")
+                await query.edit_message_text(summary, reply_markup=main_menu_keyboard())
+            else:
+                log_action(user_id, username, "upload_all", error=str(result.get("error")))
+                await query.edit_message_text(f"❌ {result.get('error', 'ошибка')}\n\n{summary}", reply_markup=main_menu_keyboard())
+            return
         elif data.startswith("stories:"):
             name = data.split(":", 1)[1]
             await query.edit_message_text(f"📸 История @{name}...")
