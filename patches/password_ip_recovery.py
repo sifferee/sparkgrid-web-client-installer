@@ -493,7 +493,18 @@ def mark_rotation_requested(
     lease_id: str = "",
     lease_owner: str = "",
 ) -> dict[str, Any]:
-    """Consume the sole recovery IP-change budget before external mutation."""
+    """Consume one of the two recovery IP-change slots before external mutation.
+
+    Diagnosed 2026-08-11: this was capped at 1 total IP change, which only
+    ever allows 2 total password submissions (original + 1 retry) before
+    record_first_rejection's own terminal check (count >= 3) becomes
+    unreachable. Alexander's intended design is a full 3-submission budget
+    (rotate after rejection 1, rotate after rejection 2, terminal after
+    rejection 3) — that requires 2 IP changes, not 1. Raised the cap to
+    match record_first_rejection, which already implements the 3-submission
+    logic correctly and was the source of truth this cap should have
+    followed.
+    """
     conn = _connect()
     try:
         ensure_schema(conn)
@@ -508,7 +519,7 @@ def mark_rotation_requested(
         if not row:
             conn.rollback()
             return {"ok": False, "reason": "recovery_workflow_not_active"}
-        if int(row["recovery_ip_change_count"] or 0) >= 1:
+        if int(row["recovery_ip_change_count"] or 0) >= 2:
             conn.rollback()
             return {"ok": False, "reason": "recovery_ip_change_limit_reached"}
         if str(row["recovery_stage"] or "") != "FIRST_PASSWORD_REJECTED":
@@ -517,7 +528,7 @@ def mark_rotation_requested(
         conn.execute(
             """
             UPDATE password_ip_recovery
-            SET recovery_ip_change_count=1,recovery_stage='ROTATION_REQUESTED',
+            SET recovery_ip_change_count=recovery_ip_change_count+1,recovery_stage='ROTATION_REQUESTED',
                 recovery_mobile_generation=?,mobile_lease_id=?,mobile_lease_owner=?,
                 rotation_requested_at=datetime('now'),updated_at=datetime('now')
             WHERE id=?

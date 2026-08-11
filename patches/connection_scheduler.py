@@ -1651,12 +1651,22 @@ def _set_auto_login_terminal(name: str, code: str, detail: str) -> None:
 
 
 def _delete_account_and_proxy(name: str) -> None:
-    """Permanently delete an account and its sole-use proxy after 3 credential failures.
+    """Permanently delete an account after 3 credential failures.
 
     Mirrors app.delete_account() but is callable from the scheduler without
-    importing app.py (avoids circular import).  Deletes the account's proxy
-    from web_connections (if sole user), all related jobs/history/assets, and
-    the account row itself.
+    importing app.py (avoids circular import).  Deletes the account row,
+    all related jobs/history/assets, and — for a STATIC connection only —
+    the account's sole-use proxy from web_connections.
+
+    Diagnosed 2026-08-11 (Alexander's explicit instruction): a mobile/phone
+    connection must NEVER be deleted here, categorically, regardless of
+    whether this account happens to be its only current user. Mobile
+    connections are one shared endpoint with thousands of real IPs behind
+    a rotation link — deleting one is expensive and pointless (the IP pool
+    itself isn't scarce; the account's credentials are what's actually
+    bad). Static connections remain deletable — those are a dedicated,
+    limited, per-account proxy, so a rejected one genuinely is a wasted
+    resource worth freeing.
     """
     from connections import direct_connection_id
     conn = db_conn()
@@ -1670,13 +1680,18 @@ def _delete_account_and_proxy(name: str) -> None:
         connection_id = int(account_row["web_connection_id"] or 0) if account_row else 0
         proxy_deleted = False
         if connection_id and connection_id != direct_id:
-            other_users = int(conn.execute(
-                "SELECT COUNT(*) FROM accounts WHERE web_connection_id=? AND name!=?",
-                (connection_id, name),
-            ).fetchone()[0])
-            if other_users == 0:
-                conn.execute("DELETE FROM web_connections WHERE id=?", (connection_id,))
-                proxy_deleted = True
+            connection_row = conn.execute(
+                "SELECT connection_type FROM web_connections WHERE id=?", (connection_id,)
+            ).fetchone()
+            connection_type = str(connection_row["connection_type"] or "") if connection_row else ""
+            if connection_type not in ("mobile", "phone"):
+                other_users = int(conn.execute(
+                    "SELECT COUNT(*) FROM accounts WHERE web_connection_id=? AND name!=?",
+                    (connection_id, name),
+                ).fetchone()[0])
+                if other_users == 0:
+                    conn.execute("DELETE FROM web_connections WHERE id=?", (connection_id,))
+                    proxy_deleted = True
         set_ids = [int(row[0]) for row in conn.execute(
             "SELECT id FROM ig_account_content_plan_sets WHERE account_name=?", (name,)
         ).fetchall()]
@@ -2323,7 +2338,12 @@ def run_account(args: argparse.Namespace, lane: dict[str, Any], account: dict[st
         recovery = get_active_password_recovery(
             name, workflow_id=workflow_id
         ) or recovery
-        if int(recovery.get("recovery_ip_change_count") or 0) >= 1:
+        # Diagnosed 2026-08-11: was ">= 1", which only ever permitted 1 IP
+        # change (2 total submissions). record_first_rejection already
+        # implements a correct 3-submission budget (terminal at count>=3,
+        # which requires 2 IP changes to reach) — this redundant guard just
+        # needs to match it, not enforce its own separate, stricter limit.
+        if int(recovery.get("recovery_ip_change_count") or 0) >= 2:
             reason = "invalid_credentials_after_ip_retry"
             mark_password_recovery_terminal(name, workflow_id, reason)
             _set_auto_login_terminal(name, reason, reason)
