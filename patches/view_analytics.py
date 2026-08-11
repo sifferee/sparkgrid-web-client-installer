@@ -515,7 +515,8 @@ def _response_payload(response: Any) -> dict[str, Any]:
         try:
             value = json.loads(response.text())
             return value if isinstance(value, dict) else {}
-        except Exception:
+        except Exception as _exc:
+            log(f"{type(_exc).__name__}: {_exc}", "WARNING")
             return {}
 
 
@@ -524,7 +525,8 @@ def _cookie_value(api: Any, name: str) -> str:
         for cookie in (api.storage_state() or {}).get("cookies", []):
             if str(cookie.get("name") or "") == name:
                 return str(cookie.get("value") or "")
-    except Exception:
+    except Exception as _exc:
+        log(f"{type(_exc).__name__}: {_exc}", "WARNING")
         pass
     return ""
 
@@ -588,7 +590,8 @@ def _discover_reels_doc_id(api: Any, profile_html: str, profile_url: str) -> str
             if found:
                 _REELS_DOC_ID_CACHE = found
                 return found
-        except Exception:
+        except Exception as _exc:
+            log(f"{type(_exc).__name__}: {_exc}", "WARNING")
             continue
     return ""
 
@@ -648,6 +651,7 @@ def _request_account_batch(
     try:
         profile = api.get(profile_url, timeout=60_000, fail_on_status_code=False)
     except Exception as exc:
+        log(f"{type(exc).__name__}: {exc}", "WARNING")
         raise ParserBlocked(f"Reels bootstrap failed: {type(exc).__name__}: {exc}") from exc
     if int(profile.status) in {401, 403, 429}:
         raise ParserBlocked(f"Reels bootstrap HTTP {int(profile.status)}")
@@ -785,7 +789,8 @@ def _open_authenticated_api(playwright: Any, account: str, proxy: str):
             if value:
                 tokens[key] = value
         return api, tokens, _headers
-    except Exception:
+    except Exception as _exc:
+        log(f"{type(_exc).__name__}: {_exc}", "WARNING")
         api.dispose()
         raise
 
@@ -807,6 +812,7 @@ def _request_target(api: Any, headers_fn: Any, tokens: dict[str, str], target: d
             fail_on_status_code=False,
         )
     except Exception as exc:
+        log(f"{type(exc).__name__}: {exc}", "WARNING")
         raise ParserBlocked(f"API request failed: {type(exc).__name__}: {exc}") from exc
     status = int(response.status)
     payload = _response_payload(response)
@@ -1061,13 +1067,15 @@ def run_parser_pool(limit: int = 0, force: bool = False) -> int:
                     cooldown = 60 if any(word in parser_error.lower() for word in ("429", "challenge", "checkpoint")) else 20
                     _set_parser_state(conn, account, "cooldown", parser_error, cooldown)
                 except Exception as exc:
+                    log(f"{type(exc).__name__}: {exc}", "WARNING")
                     parser_error = f"{type(exc).__name__}: {exc}"
                     _set_parser_state(conn, account, "cooldown", parser_error, 20)
                 finally:
                     if api is not None:
                         try:
                             api.dispose()
-                        except Exception:
+                        except Exception as _exc:
+                            log(f"{type(_exc).__name__}: {_exc}", "WARNING")
                             pass
                 if not parser_error:
                     _set_parser_state(conn, account, "ready")

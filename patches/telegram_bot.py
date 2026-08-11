@@ -71,10 +71,18 @@ def load_users() -> dict:
 
 
 def save_users(users: dict) -> None:
-    """Save authorized users to JSON."""
+    """Save authorized users to JSON. Writes to a temp file and renames it
+    into place — os.replace() is atomic on the same filesystem, so a crash
+    or force-kill mid-write can never leave USERS_FILE half-written. A
+    plain write_text() could get killed mid-write (e.g. by a forced
+    Stop-Process from the launcher scripts) and truncate the file, which
+    load_users() would then treat as corrupt and silently reseed to just
+    the admin — quietly dropping every approved user."""
     try:
         USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path = USERS_FILE.with_suffix(USERS_FILE.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, USERS_FILE)
     except Exception as e:
         logger.warning(f"Failed to save users file: {e}")
 
@@ -129,7 +137,8 @@ log_dir = os.path.join(os.environ.get("SPARKGRID_DATA_DIR", "."), "logs")
 try:
     os.makedirs(log_dir, exist_ok=True)
     logger.addHandler(logging.FileHandler(os.path.join(log_dir, "telegram_bot.log"), encoding="utf-8"))
-except Exception:
+except Exception as _exc:
+    logger.debug("%s: %s", type(_exc).__name__, _exc)
     pass
 
 # ─── Action Logger ─────────────────────────────────────────────────────────────
@@ -137,7 +146,8 @@ except Exception:
 ACTION_LOG_DIR = os.path.join(log_dir, "telegram_actions")
 try:
     os.makedirs(ACTION_LOG_DIR, exist_ok=True)
-except Exception:
+except Exception as _exc:
+    logger.debug("%s: %s", type(_exc).__name__, _exc)
     pass
 
 def log_action(user_id, username, action, detail="", result="", error=""):
@@ -156,7 +166,8 @@ def log_action(user_id, username, action, detail="", result="", error=""):
     try:
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(line)
-    except Exception:
+    except Exception as _exc:
+        logger.debug("%s: %s", type(_exc).__name__, _exc)
         pass
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -191,6 +202,7 @@ async def api_get(session, path):
         async with session.get(f"{API_URL}{path}", timeout=aiohttp.ClientTimeout(total=30)) as resp:
             return await resp.json()
     except Exception as e:
+        logger.debug("%s: %s", type(e).__name__, e)
         return {"ok": False, "error": str(e)}
 
 async def api_post_json(session, path, body=None):
@@ -203,6 +215,7 @@ async def api_post_json(session, path, body=None):
         ) as resp:
             return await resp.json()
     except Exception as e:
+        logger.debug("%s: %s", type(e).__name__, e)
         return {"ok": False, "error": str(e)}
 
 async def api_post_form(session, path, form_fields=None):
@@ -220,6 +233,7 @@ async def api_post_form(session, path, form_fields=None):
         ) as resp:
             return await resp.json()
     except Exception as e:
+        logger.debug("%s: %s", type(e).__name__, e)
         return {"ok": False, "error": str(e)}
 
 # Keep backward-compat alias
@@ -275,7 +289,8 @@ async def _check_auth(update: Update) -> bool:
                         InlineKeyboardButton("❌ Отклонить", callback_data=f"deny:{user.id}"),
                     ]])
                     await update.get_bot().send_message(chat_id=admin_id, text=msg, reply_markup=keyboard)
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
     if update.message:
         await update.message.reply_text("🔒 У вас нет доступа. Запрос отправлен администратору.")
@@ -602,7 +617,8 @@ async def _reply(update_or_query, text, **kwargs):
         try:
             await update_or_query.edit_message_text(text, **kwargs)
             return
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass  # message not modified or too long → fall through to send new
     if hasattr(update_or_query, "message") and update_or_query.message:
         await update_or_query.message.reply_text(text, **kwargs)
@@ -696,7 +712,8 @@ async def callback_handler(update: Update, ctx):
         # Notify the approved user
         try:
             await ctx.bot.send_message(chat_id=approved_id, text="✅ Доступ одобрен! Напиши /start чтобы начать.")
-        except Exception:
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
             pass
         return
 
@@ -871,7 +888,8 @@ async def background_check_triggers(ctx: ContextTypes.DEFAULT_TYPE):
                 for chat_id in authorized_chat_ids():
                     try:
                         await ctx.bot.send_message(chat_id=chat_id, text=msg)
-                    except Exception:
+                    except Exception as _exc:
+                        logger.debug("%s: %s", type(_exc).__name__, _exc)
                         pass
             last_seen_trigger_id = max(last_seen_trigger_id, tid)
     except Exception as e:
@@ -903,7 +921,8 @@ async def background_hourly_summary(ctx: ContextTypes.DEFAULT_TYPE):
         for chat_id in authorized_chat_ids():
             try:
                 await ctx.bot.send_message(chat_id=chat_id, text=msg)
-            except Exception:
+            except Exception as _exc:
+                logger.debug("%s: %s", type(_exc).__name__, _exc)
                 pass
     except Exception as e:
         logger.warning(f"hourly summary error: {e}")
@@ -1001,7 +1020,8 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
             for chat_id in authorized_chat_ids():
                 try:
                     await ctx.bot.send_message(chat_id=chat_id, text=msg)
-                except Exception:
+                except Exception as _exc:
+                    logger.debug("%s: %s", type(_exc).__name__, _exc)
                     pass
 
     except Exception as e:
@@ -1066,8 +1086,15 @@ def main():
 
 
 def run_forever():
-    """Run bot with auto-restart on crash. Never dies."""
+    """Run bot with auto-restart on crash. Gives up after repeated fast
+    crashes instead of looping forever silently (same failure pattern the
+    PowerShell launchers had before start_service_template.ps1 got a
+    crash-loop guard — this is the Python-side equivalent)."""
+    import time
+
+    crash_count = 0
     while True:
+        start_time = time.monotonic()
         try:
             logger.info("Запуск бота...")
             main()
@@ -1075,8 +1102,19 @@ def run_forever():
             logger.info("Остановка по запросу")
             break
         except Exception as e:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= 30:
+                crash_count = 0
+            else:
+                crash_count += 1
+            if crash_count >= 5:
+                logger.error(
+                    f"Бот упал: {e}. Crash-loop: 5 быстрых падений подряд, "
+                    f"автоперезапуск остановлен. Разберись руками, потом "
+                    f"запусти заново."
+                )
+                break
             logger.error(f"Бот упал: {e}. Перезапуск через 10 сек...")
-            import time
             time.sleep(10)
 
 
