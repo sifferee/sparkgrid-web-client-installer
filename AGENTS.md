@@ -33,6 +33,16 @@
 
 ## Последнее изменение
 
+- 2026-08-10 — Claude (диагностика) + Hermes (применение, коммит bad984c) —
+  фикс гонки на /consent/: `recover_initial_browser_load` считал страницу
+  готовой сразу при `document_category == "instagram_document"` (true как
+  только у body есть хоть один дочерний элемент, включая пустой
+  pre-mount React root). Добавлен сигнал `rendered_text_length` в
+  `_DOCUMENT_SCRIPT` и bounded-wait (до 5с) — ждём либо recognized
+  surface, либо непустой текст, прежде чем доверять голой категории.
+  Диагностика: katrinat82h/stephanie6xyq получали 0 байт текста на
+  холодном профиле через прокси (JS-бандл не успевал догрузиться до
+  проверки); sushilarangarajan012 прошёл (бандл уже был закеширован).
 - 2026-08-10 — Claude (диагностика) + Hermes (применение, коммит d5c80d4) —
   фикс `_ACTION_SCRIPT` (дубль `const typedCookie`, висячая кавычка, `rx`
   объявлен до использования) + логирование во все `except Exception` в
@@ -45,10 +55,14 @@
 ## Известные баги / в работе
 
 - Ads-consent цепочка (Get started → Agree) с новым `_ACTION_SCRIPT` не
-  тестирована на живых аккаунтах, только cookie_allow_all.
+  тестирована на живых аккаунтах, только cookie_allow_all. (частично
+  подтверждено: sushilarangarajan012 прошёл весь wizard cookie→ads→7
+  шагов → logged_in; katrinat82h/stephanie6xyq не дошли до клика из-за
+  гонки рендеринга, теперь должен быть зафиксирован).
 - `human.click()` в perform_fresh_action не проверялся отдельно — элемент
   теперь находится корректно, но клик по нему в реальном Camoufox не
-  верифицирован.
+  верифицирован. (подтверждён клик по cookie_allow_all и всем ads-шагам
+  на sushilarangarajan012, success=True на каждом шаге).
 
 ## Не трогать без причины
 
