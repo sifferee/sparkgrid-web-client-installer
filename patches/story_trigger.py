@@ -2,14 +2,15 @@
 Story Auto-Trigger.
 
 Monitors account metrics and automatically posts Stories when a Reel
-hits 10k-23k views. After the first trigger, posts once per day with
-±10-60 min randomization.
+hits 10k-12.5k views. After the first trigger, posts once per day with
++10-60 min randomization (24h00m-25h00m between Stories).
 
 Logic:
   1. After each metrics check cycle, scan for accounts with a Reel
-     that has views >= threshold (random 10k-23k per account per day).
+     that has views >= threshold (random 10k-12.5k per account per check).
   2. If triggered and no Story posted today → post Story.
-  3. After first trigger: once per 20-26h, check if last Story > 20-26h ago.
+  3. After first trigger: once per 24h+(10-60min), check if last Story
+     was that long ago.
   4. Story images come from story_library (already in software).
   5. Story settings (caption, link, sticker) from story_settings.
 
