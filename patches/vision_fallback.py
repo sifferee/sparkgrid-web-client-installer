@@ -41,6 +41,8 @@ import os
 import re
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Any
 
 VISION_MODEL = "claude-haiku-4-5-20251001"  # matches the exact model name enabled on the token — no -thinking suffix, this task doesn't need it
@@ -77,6 +79,38 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         return json.loads(match.group(0))
     except (json.JSONDecodeError, ValueError):
         return None
+
+
+def _log_success_for_review(page: Any, intent: str, result: dict[str, Any]) -> None:
+    """Append a structured record of a successful vision click to a
+    JSON-lines file, for later offline review (a separate process can read
+    this, ask a stronger model to propose a permanent fast-path fix, and
+    surface it for human approval). Deliberately decoupled from the click
+    path itself — this must never be able to block or fail the actual
+    automation, so every failure mode here is swallowed silently.
+    """
+    try:
+        log_dir = Path(os.environ.get("SPARKGRID_DATA_DIR", ".")) / "logs" / "vision_fallback"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        screenshot_path = log_dir / f"{int(time.time() * 1000)}.png"
+        try:
+            page.screenshot(path=str(screenshot_path))
+        except Exception:
+            screenshot_path = None
+        record = {
+            "id": uuid.uuid4().hex[:12],
+            "ts": time.time(),
+            "intent": intent,
+            "x": result.get("x"),
+            "y": result.get("y"),
+            "confidence": result.get("confidence"),
+            "screenshot": str(screenshot_path) if screenshot_path else None,
+            "reviewed": False,
+        }
+        with open(log_dir / "successes.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # logging for later review must never break the automation itself
 
 
 def click_via_vision(
@@ -183,10 +217,15 @@ def click_via_vision(
     except Exception as exc:
         return {"ok": False, "reason": "click_failed", "detail": f"{type(exc).__name__}: {exc}"}
 
-    return {
+    result = {
         "ok": True,
         "reason": "clicked",
         "x": x,
         "y": y,
         "confidence": str(parsed.get("confidence", "unknown")),
     }
+    try:
+        _log_success_for_review(page, intent, result)
+    except Exception:
+        pass  # logging for later review must never break the actual click result
+    return result

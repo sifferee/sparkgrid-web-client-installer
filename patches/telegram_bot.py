@@ -726,6 +726,49 @@ async def callback_handler(update: Update, ctx):
         await query.edit_message_text(f"❌ Отклонён: {denied_id}")
         return
 
+    # ─── Vision-fallback suggestion approval (admin only) ───
+    # Approval never applies code automatically — it only formats a
+    # ready-to-relay Hermes task, same as every other fix this session.
+    # A human still reviews and applies it via the normal Hermes flow.
+    if data.startswith("vfapprove:") or data.startswith("vfdeny:"):
+        if not is_admin(user_id):
+            await query.edit_message_text("⛔ Только администратор")
+            return
+        record_id = data.split(":", 1)[1]
+        try:
+            import vision_review
+            records = vision_review._load_records()
+        except Exception as _exc:
+            logger.debug("%s: %s", type(_exc).__name__, _exc)
+            records = []
+        record = next((r for r in records if r.get("id") == record_id), None)
+
+        if data.startswith("vfdeny:"):
+            log_action(user_id, username, "vf_deny", detail=record_id)
+            await query.edit_message_text("❌ Предложение отклонено, ничего не меняем.")
+            return
+
+        if not record or not record.get("proposal"):
+            await query.edit_message_text("❌ Запись не найдена (возможно, лог уже очищен).")
+            return
+
+        log_action(user_id, username, "vf_approve", detail=record_id)
+        task_text = (
+            "ЗАДАЧА: применить предложение зрения к быстрому пути (не менять "
+            "поведение, только добавить распознавание паттерна).\n\n"
+            f"Контекст: зрение сработало для \"{record.get('intent')}\" — "
+            "структурный поиск не нашёл элемент сам.\n\n"
+            f"Предложение Sonnet:\n{record.get('proposal')}\n\n"
+            "Найди соответствующий regex/паттерн в коде (скорее всего "
+            "blocking_popup_transaction.py или рядом) и добавь предложенный "
+            "вариант текста, НЕ меняя остальную логику. Проверь py_compile "
+            "и pytest tests/test_js_syntax.py перед коммитом."
+        )
+        await query.edit_message_text(
+            f"✅ Одобрено. Задача для Гермеса:\n\n{task_text}"
+        )
+        return
+
     # ─── Auth check for all other callbacks ───
     if not is_authorized(user_id):
         await query.edit_message_text("🔒 Нет доступа")
