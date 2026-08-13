@@ -7452,7 +7452,21 @@ def do_check_login(account: dict, args, run_id: str):
                 ):
                     state = "suspended"
             elif result.code is SESSION_NO_PROGRESS_TIMEOUT:
-                state, reason = "suspended", "session check made no progress; account may be blocked"
+                # Diagnosed 2026-08-13: this used to set "suspended", which
+                # put the account straight into the bot's "Delete banned"
+                # bucket — a near-miss almost deleted a live account
+                # (akpinarniy.azi.475) whose only crime was a cold browser
+                # profile through a proxy taking longer than 8s to render
+                # (same root cause class as the initial_browser_load race
+                # fixed in bad984c, just a different code path). "No
+                # progress" means the check saw NOTHING at all — not even
+                # an unclassified blocker — which is much weaker evidence
+                # than the STABLE_BLOCKER branch above (which DID detect
+                # something, just couldn't classify it, and deliberately
+                # keeps its "suspended" treatment — not touched here).
+                # "unknown" correctly routes to re-login (not delete) and
+                # shows as a neutral ⚠️ in /session, not a ❌.
+                state, reason = "unknown", "session check timed out with no signal (page may not have finished rendering) — needs a real check, not confirmed as blocked"
             else:
                 state = result.operation_state or "failed"
                 reason = result.error_category or "session check failed"
