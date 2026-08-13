@@ -199,6 +199,72 @@ def stop_ads_browser(profile_id: str, timeout: int = 15) -> None:
 
 # ─── Playwright Connection ────────────────────────────────────────────────────
 
+def close_stray_ads_profiles(keep_profile_ids: set[str] | None = None) -> int:
+    """Close any AdsPower profile that is running but isn't needed.
+
+    Diagnosed 2026-08-13: 23 SunBrowser processes (~2GB) were sitting idle
+    on the VPS, left behind by profiles AdsPower had opened and never
+    closed. That memory is exactly what the upload browsers need — a
+    16GB box hit MemoryError at 4 parallel Camoufox because of it. This
+    checker already closes the profile it opens; these leftovers come
+    from elsewhere, so nothing was reclaiming them.
+
+    Returns the number of profiles closed. Best-effort: any failure is
+    logged and ignored, since freeing memory must never break metrics
+    collection.
+    """
+    keep = {str(p) for p in (keep_profile_ids or set())}
+    api_key = ""
+    api_url = ADS_POWER_API_URL
+    try:
+        conn = _db_conn()
+        api_key = get_config(conn, "ads_power_api_key", "")
+        db_url = get_config(conn, "ads_power_api_url", "")
+        if db_url:
+            api_url = db_url
+        conn.close()
+    except Exception:
+        pass
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        resp = urlopen(Request(f"{api_url}/api/v1/browser/local-active", headers=headers), timeout=15)
+        payload = json.loads(resp.read())
+    except Exception as e:
+        log(f"Could not list active AdsPower profiles: {e}", "WARNING")
+        return 0
+
+    active = []
+    try:
+        for item in (payload.get("data") or {}).get("list") or []:
+            user_id = str(item.get("user_id") or "").strip()
+            if user_id:
+                active.append(user_id)
+    except Exception:
+        return 0
+
+    stray = [uid for uid in active if uid not in keep]
+    if not stray:
+        return 0
+
+    log(f"Found {len(stray)} stray AdsPower profile(s) holding memory — closing")
+    closed = 0
+    for user_id in stray:
+        try:
+            urlopen(
+                Request(f"{api_url}/api/v1/browser/stop?user_id={user_id}", headers=headers),
+                timeout=15,
+            )
+            closed += 1
+        except Exception as e:
+            log(f"  could not close profile {user_id}: {e}", "WARNING")
+    log(f"Closed {closed} stray AdsPower profile(s)")
+    return closed
+
+
 def connect_browser(ws_url: str):
     """Connect to running browser via CDP. Returns (browser, context, page).
     
@@ -606,6 +672,13 @@ def run_once() -> int:
             return 0
 
         log(f"Checking {len(targets)} accounts using {len(profiles)} parser profile(s)")
+
+        # Reclaim memory from profiles nobody is using before opening ours.
+        # Keeps only the parser profiles this cycle actually needs.
+        try:
+            close_stray_ads_profiles(keep_profile_ids=set(profiles))
+        except Exception as e:
+            log(f"Stray profile cleanup skipped: {e}", "WARNING")
 
         checked = 0
         for profile_id in profiles:
