@@ -499,16 +499,29 @@ def save_snapshot(
     parser_profile: str = "",
     error: str = "",
 ) -> None:
-    # If all key metrics are zero, this is likely a collection failure
-    # (Ads Power session lost, Instagram blocked, account restricted) — not a
-    # real data point.  Skip saving so the previous valid snapshot remains and
-    # delta calculations don't produce false massive drops.
+    # Diagnosed 2026-08-13: this used to skip saving whenever followers,
+    # views and likes were all zero, on the assumption that zeros always
+    # mean a failed collection. That permanently starved brand-new
+    # accounts: an account genuinely at 0 followers / 0 views could NEVER
+    # get a first snapshot, so it stayed in the bot's "no data" list
+    # forever no matter how many collection cycles ran. Alexander watched
+    # that count sit at 13 across two days of cycles for exactly this
+    # reason.
+    #
+    # The reliable signal is user_id from Instagram's profile API: if it
+    # came back, the request genuinely succeeded and the zeros are real
+    # data worth recording. An empty user_id means the fetch didn't
+    # actually reach the profile — that's the case worth skipping, so an
+    # existing good snapshot isn't overwritten with a false zero.
     fol = int(metrics.get("followers", 0))
     views = int(metrics.get("total_views", 0))
     likes = int(metrics.get("total_likes", 0))
-    if fol == 0 and views == 0 and likes == 0 and not error:
-        log(f"  @{account_name}: all metrics zero — skipping snapshot (likely collection failure)", "WARNING")
+    user_id = str(metrics.get("user_id") or "").strip()
+    if fol == 0 and views == 0 and likes == 0 and not error and not user_id:
+        log(f"  @{account_name}: all metrics zero AND no user_id — collection failed, skipping snapshot", "WARNING")
         return
+    if fol == 0 and views == 0 and likes == 0 and user_id:
+        log(f"  @{account_name}: genuinely at zero (user_id present) — saving snapshot")
 
     conn = _db_conn()
     try:
@@ -560,6 +573,17 @@ def get_target_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     is checked each cycle — with the ordering still mattering: it decides
     who gets checked FIRST within the cycle, so the most-overdue accounts
     are covered earliest even if a cycle is interrupted partway through.
+
+    Diagnosed 2026-08-13 (second issue, same symptom): the filter used to
+    be `web_upload_login_status = 'logged_in'`, which silently excluded
+    every account in any other state — 9 of Alexander's 26, including
+    ones that were merely 'unknown' or had a failed browser load. That
+    filter was never meaningful here: metrics are collected by a separate
+    parser profile querying PUBLIC profile data by username, so whether
+    the target account itself is logged in is irrelevant. An empty
+    account (no posts yet) is not a banned account and must still be
+    checked. Only genuinely suspended accounts are skipped — their
+    profile isn't reachable, so there is nothing to collect.
     """
     query = """
         SELECT a.name, a.web_upload_login_status, a.web_privacy_status,
@@ -570,8 +594,8 @@ def get_target_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             FROM account_metrics_snapshots
             GROUP BY account_name
         ) s ON s.account_name = a.name
-        WHERE a.web_upload_login_status = 'logged_in'
-        AND a.enabled = 1
+        WHERE a.enabled = 1
+        AND COALESCE(a.web_upload_login_status,'') != 'suspended'
         ORDER BY (s.last_checked IS NULL) DESC, s.last_checked ASC, a.name ASC
     """
     if MAX_TARGETS_PER_CYCLE > 0:
@@ -659,6 +683,11 @@ def _run_browser_session(ws_url: str, targets: list[dict[str, Any]], profile_id:
                             "total_views": post_data.get("total_views", 0),
                             "active_stories_count": reels_data.get("active_stories_count", 0),
                             "posts": post_data.get("posts", []),
+                            # Carried through so save_snapshot can tell a real
+                            # zero (profile fetched fine, account is simply
+                            # empty) from a failed fetch. Without this every
+                            # brand-new account is skipped forever.
+                            "user_id": user_id,
                         }
                         
                         save_snapshot(username, metrics, profile_id)
@@ -841,13 +870,24 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
     ensure_metrics_schema(conn)
     cutoff = datetime.now().strftime("%Y-%m-%d %H:%M:%S", )  # now
     # Get latest snapshot per account
+    # Diagnosed 2026-08-13: this used to return snapshot columns only, so
+    # the bot had no way to tell WHY an account showed zeros — a banned
+    # account (nothing to collect, expected) looked identical to a genuine
+    # collection failure. The result was a permanent, alarming "13 accounts
+    # without data" line that never went away no matter how many collection
+    # cycles ran. Joining the account's own login status/error here lets the
+    # caller separate "banned, expected" from "should have data but doesn't".
     rows = conn.execute("""
-        SELECT s.* FROM account_metrics_snapshots s
+        SELECT s.*,
+               COALESCE(a.web_upload_login_status,'') AS login_status,
+               COALESCE(a.web_upload_last_error,'')   AS account_error
+        FROM account_metrics_snapshots s
         INNER JOIN (
             SELECT account_name, MAX(checked_at) as max_checked
             FROM account_metrics_snapshots
             GROUP BY account_name
         ) latest ON s.account_name = latest.account_name AND s.checked_at = latest.max_checked
+        LEFT JOIN accounts a ON a.name = s.account_name
         ORDER BY s.account_name
     """).fetchall()
 
@@ -904,6 +944,10 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
             "active_stories_count": d["active_stories_count"],
             "checked_at": d["checked_at"],
             "error": d["error"],
+            # Account-level state (not snapshot state) so callers can tell a
+            # banned account's zeros apart from a real collection failure.
+            "login_status": d["login_status"] if "login_status" in d.keys() else "",
+            "account_error": d["account_error"] if "account_error" in d.keys() else "",
             "delta": {
                 "followers": df,
                 "views": dv,

@@ -1710,14 +1710,34 @@ def click_dialog_label_js(page, labels: List[str], *, prefer_last: bool = True) 
                     el.getAttribute('aria-label') || '', el.getAttribute('title') || ''
                 ].join(' ').replace(/\\s+/g, ' ').trim();
                 const dlgs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(vis);
-                const scope = dlgs.length ? dlgs[dlgs.length - 1] : document.body;
-                let items = [...scope.querySelectorAll('button,[role="button"],a,[role="link"],div[tabindex]')]
-                    .filter(vis)
-                    .map(el => ({el, text:textOf(el)}))
-                    .filter(x => {
-                        const t = x.text.toLowerCase();
-                        return lows.some(l => t === l || t.includes(l));
-                    });
+                // Diagnosed 2026-08-13: searching only the last dialog made
+                // the "Try again" button unreachable whenever Instagram
+                // rendered its share-failure message inside the composer
+                // while another dialog sat above it. Collect candidates
+                // from every visible dialog (falling back to the whole
+                // page when there are none), keeping the last-dialog-first
+                // ordering so existing preferLast/first behaviour is
+                // unchanged for the common single-dialog case.
+                const scopes = dlgs.length ? [...dlgs].reverse() : [document.body];
+                let items = [];
+                for (const scope of scopes) {
+                    items = items.concat(
+                        [...scope.querySelectorAll('button,[role="button"],a,[role="link"],div[tabindex]')]
+                            .filter(vis)
+                            .map(el => ({el, text:textOf(el)}))
+                            .filter(x => {
+                                const t = x.text.toLowerCase();
+                                return lows.some(l => t === l || t.includes(l));
+                            })
+                    );
+                }
+                // De-duplicate: nested dialogs can surface the same node twice.
+                const seen = new Set();
+                items = items.filter(x => {
+                    if (seen.has(x.el)) return false;
+                    seen.add(x.el);
+                    return true;
+                });
                 if (!items.length) return null;
                 const picked = preferLast ? items[items.length - 1] : items[0];
                 picked.el.scrollIntoView({block:'center', inline:'center'});
@@ -1753,6 +1773,18 @@ def upload_screen_state(page) -> Dict:
             const d = dlgs.length ? dlgs[dlgs.length - 1] : document.body;
             const txt = (d.innerText || d.textContent || '').replace(/\\s+/g, ' ').trim();
             const low = txt.toLowerCase();
+            // Diagnosed 2026-08-13: the "Your post could not be shared /
+            // Try again" failure was never detected — three separate log
+            // searches found zero occurrences of SHARE_FAILED across all
+            // of August, while Alexander hit it repeatedly by hand. Cause:
+            // every check below reads only the LAST dialog, but Instagram
+            // renders this error inside the still-open composer while
+            // other dialogs may sit above it, so the text was simply out
+            // of view. Scanning all visible dialogs (plus the last one's
+            // text) for this one specific failure fixes the blind spot
+            // without loosening any of the other state checks.
+            const allDialogText = (dlgs.map(el => (el.innerText || el.textContent || '')).join(' ') + ' ' + txt)
+                .replace(/\\s+/g, ' ').trim().toLowerCase();
             const btnText = [...d.querySelectorAll('button,[role="button"],a,[role="link"],div[tabindex]')]
                 .filter(vis).map(el => (el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\\s+/g,' ').trim()).filter(Boolean).slice(-20);
             const hasFile = !!d.querySelector('input[type=file]');
@@ -1774,7 +1806,8 @@ def upload_screen_state(page) -> Dict:
                 .filter(vis).map(el => (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim())
                 .filter(Boolean).slice(0, 8);
             let state = 'UNKNOWN';
-            if (/couldn.t be shared|could not be shared|your post could not be shared|try again|restricted from uploading/i.test(low)) state = 'SHARE_FAILED';
+            if (/couldn.t be shared|could not be shared|your post could not be shared|restricted from uploading/i.test(allDialogText)
+                || /\\btry again\\b/i.test(allDialogText)) state = 'SHARE_FAILED';
             else if (hasProgress || /^(sharing|posting|publishing|processing|uploading|preparing|checking)\b/i.test(low)) state = 'PROCESSING';
             else if (/video posts are now shared as reels|shared as reels/i.test(low)) state = 'REELS_INFO';
             else if (/create new post|drag photos and videos here|select from computer|choose from computer/i.test(low) || hasFile) state = 'FILE_SELECT';

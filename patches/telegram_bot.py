@@ -491,16 +491,20 @@ async def _send_metrics(update_or_query):
             msg += f"\n  {fmt(fol)} подп | {fmt(views)} просм @{name}{d_fol}"
 
     # ── Accounts showing all zeros (one line) ──
-    # Split by reason instead of lumping everything under a scary "no
-    # metrics" count. Suspended accounts having zeros is expected — there
-    # is nothing to collect — and the checker deliberately skips them
-    # (it only queries logged_in accounts). Previously all of these were
-    # counted together, so a normal fleet with 7 banned accounts always
-    # showed an alarming "13 accounts without metrics" that looked like a
-    # broken collector when nothing was actually wrong.
+    # Split by reason. A banned account having zeros is expected — nothing
+    # to collect — while a logged-in account with zeros is either brand new
+    # or a real collection failure. Previously everything was lumped into
+    # one alarming "N accounts without data" count that never went down.
     if no_data:
-        banned_zero = [a for a in no_data if _is_banned(a)]
-        real_zero = [a for a in no_data if not _is_banned(a)]
+        def _acct_banned(a):
+            status = str(a.get("login_status") or "")
+            err = str(a.get("account_error") or "").lower()
+            return status == "suspended" or any(
+                w in err for w in ("suspend", "banned", "disabled", "restrict")
+            )
+
+        banned_zero = [a for a in no_data if _acct_banned(a)]
+        real_zero = [a for a in no_data if not _acct_banned(a)]
         if real_zero:
             if len(real_zero) <= 3:
                 names = ", ".join(f"@{a.get('name','?')}" for a in real_zero)

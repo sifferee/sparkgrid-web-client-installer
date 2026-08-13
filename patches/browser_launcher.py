@@ -912,6 +912,38 @@ def _build_launch_kwargs(
     # launched and checked cleanly in 11s. Do not re-add without solving
     # the crash first — the RDP freeze needs an OS-level fix (keeping the
     # session alive) rather than a browser rendering change.
+    # Firefox/Camoufox preferences for unattended operation.
+    #
+    # NOTE: a previous firefox_user_prefs block (9bf9535, reverted) forced
+    # software rendering and broke browser startup for 4 of 20 accounts —
+    # felicity4wje crashed with exitCode 0x80000003. Those were GRAPHICS
+    # prefs; the ones below are timer/UI prefs, a different subsystem. Any
+    # further additions here must still be verified by launching accounts
+    # one at a time, felicity4wje included.
+    #
+    # Background throttling (diagnosed 2026-08-13): browsers stall the
+    # moment Alexander minimises the RDP window and only resume when he
+    # moves the mouse. tscon already keeps the Windows session Active, so
+    # what remains is Firefox's own background/unfocused-window power
+    # saving — it clamps timers and suspends work in windows that aren't
+    # in front. These prefs turn that off so automation keeps running at
+    # full speed unattended.
+    #
+    # AI panel: Camoufox ships a built-in "See more with AI / Key points"
+    # overlay that appears on top of the page. It's browser chrome, not
+    # page content, so no DOM-based dialog handler can ever reach it —
+    # automation just hangs behind it until dismissed by hand. Disabled.
+    launch["firefox_user_prefs"] = {
+        "dom.min_background_timeout_value": 4,
+        "dom.min_background_timeout_value_without_budget_throttling": 4,
+        "dom.timeout.enable_budget_timer_throttling": False,
+        "dom.suspend_inactive.enabled": False,
+        "media.suspend-background-video.enabled": False,
+        "browser.ml.enable": False,
+        "browser.ml.chat.enabled": False,
+        "browser.ml.linkPreview.enabled": False,
+        "browser.ml.linkPreview.optin": False,
+    }
     return launch, meta
 
 
