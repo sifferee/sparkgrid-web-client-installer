@@ -2454,6 +2454,7 @@ def overview() -> dict[str, Any]:
                    a.web_upload_profile_status, a.web_upload_login_status,
                    web_upload_cookie_status, web_upload_last_error,
                    web_upload_last_upload_at, web_upload_cooldown_until,
+                   COALESCE(a.web_upload_last_login_at,'') AS web_upload_last_login_at,
                    COALESCE(a.created_at,'') AS created_at,
                    web_upload_content_mode, COALESCE(web_upload_quality_niche,'') AS web_upload_quality_niche,
                    COALESCE(web_upload_scale_niche,'') AS web_upload_scale_niche,

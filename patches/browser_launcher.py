@@ -899,20 +899,19 @@ def _build_launch_kwargs(
         launch["proxy"] = proxy_cfg
         if location.get("geoip"):
             launch["geoip"] = True
-    # Diagnosed 2026-08-13: on Windows VPS with KVM/QEMU (Red Hat VirtIO GPU)
-    # the browser freezes indefinitely when the RDP session disconnects —
-    # the GPU rendering context dies and Playwright/Camoufox blocks on
-    # page.evaluate/poll forever (8s timeout ignored, 3h52m hang observed).
-    # Forcing software rendering via Firefox prefs makes the browser render
-    # via CPU (SwiftShader), independent of the RDP display adapter.
-    launch["firefox_user_prefs"] = {
-        "gfx.webrender.all": False,
-        "gfx.webrender.software": True,
-        "layers.acceleration.disabled": True,
-        "gfx.direct2d.disabled": True,
-        "gfx.direct2d.force-disabled": True,
-        "dom.ipc.processCount": 1,
-    }
+    # NOTE (2026-08-13): a firefox_user_prefs block forcing software
+    # rendering (gfx.webrender.software, layers.acceleration.disabled,
+    # gfx.direct2d.disabled, dom.ipc.processCount=1) was added here in
+    # 9bf9535 to stop the browser freezing when the RDP session drops.
+    # It was REVERTED because it did not fix the freeze (a hang still
+    # occurred with it active) and it broke browser startup for 4 of 20
+    # accounts — felicity4wje crashed with exitCode 0x80000003
+    # (STATUS_BREAKPOINT) 7s after launch, and adatm84 / geraldinepetq /
+    # akpinarniy.azi.475 got browser_load_failed_after_retry. Confirmed
+    # causal by direct test: with the prefs commented out felicity4wje
+    # launched and checked cleanly in 11s. Do not re-add without solving
+    # the crash first — the RDP freeze needs an OS-level fix (keeping the
+    # session alive) rather than a browser rendering change.
     return launch, meta
 
 
