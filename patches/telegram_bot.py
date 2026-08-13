@@ -264,12 +264,34 @@ def _categorize_for_mass_upload(accounts: list) -> dict:
 # Other endpoints (start, workflow, stop, metrics/run, delete-banned) accept JSON.
 
 async def api_get(session, path):
-    try:
-        async with session.get(f"{API_URL}{path}", timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            return await resp.json()
-    except Exception as e:
-        logger.debug("%s: %s", type(e).__name__, e)
-        return {"ok": False, "error": str(e)}
+    """GET request with one transparent retry on transient network errors.
+
+    Diagnosed 2026-08-12: a single occurrence where the backend was
+    genuinely busy (many concurrent dashboard requests at once) caused a
+    ~26s delay that came close to the 30s timeout, ending in a
+    connection reset. The server was NOT down — it answered a request 4s
+    before and 1s after this one failed. This was a brief contention
+    blip, not an outage.
+
+    GET requests are safe to retry blindly (read-only, no side effects),
+    so one retry after a short pause turns a rare transient blip into a
+    non-event for the user instead of a scary "SparkGrid недоступен".
+
+    api_post_json is deliberately NOT given this treatment — retrying a
+    state-changing request risks a duplicate action (e.g. a second
+    upload job) if the first attempt actually succeeded but its response
+    was what got lost, not the request itself.
+    """
+    for attempt in (1, 2):
+        try:
+            async with session.get(f"{API_URL}{path}", timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                return await resp.json()
+        except Exception as e:
+            logger.debug("%s: %s (attempt %d/2)", type(e).__name__, e, attempt)
+            if attempt == 1:
+                await asyncio.sleep(1.5)
+                continue
+            return {"ok": False, "error": str(e)}
 
 async def api_post_json(session, path, body=None):
     """POST JSON body. Used by /start, /workflow, /stop, /metrics/run, /delete-banned."""
@@ -621,11 +643,20 @@ async def _run_session_check(update_or_query):
             other.append(f"⚠️ @{name} — {status}")
     msg = "*Результат проверки сессий*\n"
     if active:
-        msg += f"\n🟢 Активные ({len(active)}):\n" + "\n".join(active[:15]) + "\n"
+        msg += f"\n🟢 Активные ({len(active)}):\n" + "\n".join(active[:15])
+        if len(active) > 15:
+            msg += f"\n+{len(active) - 15} ещё"
+        msg += "\n"
     if expired:
-        msg += f"\n🔴 Протухшие/Заблокированные ({len(expired)}):\n" + "\n".join(expired[:15]) + "\n"
+        msg += f"\n🔴 Протухшие/Заблокированные ({len(expired)}):\n" + "\n".join(expired[:15])
+        if len(expired) > 15:
+            msg += f"\n+{len(expired) - 15} ещё"
+        msg += "\n"
     if other:
-        msg += f"\n🟡 Другие ({len(other)}):\n" + "\n".join(other[:5]) + "\n"
+        msg += f"\n🟡 Другие ({len(other)}):\n" + "\n".join(other[:5])
+        if len(other) > 5:
+            msg += f"\n+{len(other) - 5} ещё"
+        msg += "\n"
 
     keyboard = []
     if expired:
