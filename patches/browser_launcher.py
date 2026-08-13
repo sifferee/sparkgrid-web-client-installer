@@ -899,6 +899,20 @@ def _build_launch_kwargs(
         launch["proxy"] = proxy_cfg
         if location.get("geoip"):
             launch["geoip"] = True
+    # Diagnosed 2026-08-13: on Windows VPS with KVM/QEMU (Red Hat VirtIO GPU)
+    # the browser freezes indefinitely when the RDP session disconnects —
+    # the GPU rendering context dies and Playwright/Camoufox blocks on
+    # page.evaluate/poll forever (8s timeout ignored, 3h52m hang observed).
+    # Forcing software rendering via Firefox prefs makes the browser render
+    # via CPU (SwiftShader), independent of the RDP display adapter.
+    launch["firefox_user_prefs"] = {
+        "gfx.webrender.all": False,
+        "gfx.webrender.software": True,
+        "layers.acceleration.disabled": True,
+        "gfx.direct2d.disabled": True,
+        "gfx.direct2d.force-disabled": True,
+        "dom.ipc.processCount": 1,
+    }
     return launch, meta
 
 
