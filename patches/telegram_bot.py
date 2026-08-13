@@ -490,13 +490,25 @@ async def _send_metrics(update_or_query):
             d_fol = _arrow(delta.get("followers", 0))
             msg += f"\n  {fmt(fol)} подп | {fmt(views)} просм @{name}{d_fol}"
 
-    # ── Accounts with no metrics (one line) ──
+    # ── Accounts showing all zeros (one line) ──
+    # Split by reason instead of lumping everything under a scary "no
+    # metrics" count. Suspended accounts having zeros is expected — there
+    # is nothing to collect — and the checker deliberately skips them
+    # (it only queries logged_in accounts). Previously all of these were
+    # counted together, so a normal fleet with 7 banned accounts always
+    # showed an alarming "13 accounts without metrics" that looked like a
+    # broken collector when nothing was actually wrong.
     if no_data:
-        if len(no_data) <= 3:
-            names = ", ".join(f"@{a.get('name','?')}" for a in no_data)
-            msg += f"\n\n⚠️ Нет метрик: {names}"
-        else:
-            msg += f"\n\n⚠️ {len(no_data)} аккаунтов без метрик"
+        banned_zero = [a for a in no_data if _is_banned(a)]
+        real_zero = [a for a in no_data if not _is_banned(a)]
+        if real_zero:
+            if len(real_zero) <= 3:
+                names = ", ".join(f"@{a.get('name','?')}" for a in real_zero)
+                msg += f"\n\n⚠️ Без данных: {names}"
+            else:
+                msg += f"\n\n⚠️ {len(real_zero)} аккаунтов без данных (новые или сбой сбора)"
+        if banned_zero:
+            msg += f"\n🚫 {len(banned_zero)} забаненных — метрики не собираются"
 
     # ── Failed accounts (restricted/banned) ──
     failed = [a for a in accounts if a.get("error")]

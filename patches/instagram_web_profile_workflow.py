@@ -7441,16 +7441,25 @@ def do_check_login(account: dict, args, run_id: str):
             elif result.code is SESSION_STABLE_BLOCKER:
                 state = result.operation_state or "unknown"
                 reason = "stable browser blocker confirmed"
-                # When the session check hits a stable blocker that it cannot
-                # classify (checkpoint, face verification, phone/email challenge,
-                # restriction, or an unknown block page), treat the account as
-                # suspended so it shows up in "Delete banned" and is excluded
-                # from future workflows.  The blocker text is preserved in
-                # web_upload_last_error for manual inspection.
-                if state in ("unknown", "unknown_dialog", "") or state not in (
-                    "cookie_consent", "save_login", "notification", "policy_notice"
-                ):
-                    state = "suspended"
+                # Diagnosed 2026-08-13 (second occurrence of the same class
+                # of bug): this used to force ANY unclassified blocker to
+                # "suspended", which drops a live account into the bot's
+                # "Delete banned" list. geraldinepetq was flagged that way
+                # while the account was perfectly fine — the same near-miss
+                # that already happened with akpinarniy.azi.475 via the
+                # NO_PROGRESS_TIMEOUT branch below.
+                #
+                # A real ban is already detected reliably elsewhere: the
+                # classifier checks for /accounts/suspended in the URL and
+                # for "we suspended your account" in the page text, and
+                # returns state="suspended" on its own. So anything still
+                # sitting at "unknown" here is precisely the case where we
+                # do NOT have that evidence. Calling it a ban is a guess,
+                # and the cost of guessing wrong is a deleted working
+                # account. "unknown" routes to re-login instead, which is
+                # the right response to "we couldn't read this page".
+                if state in ("", "unknown_dialog"):
+                    state = "unknown"
             elif result.code is SESSION_NO_PROGRESS_TIMEOUT:
                 # Diagnosed 2026-08-13: this used to set "suspended", which
                 # put the account straight into the bot's "Delete banned"
