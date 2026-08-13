@@ -140,7 +140,12 @@ def start_ads_browser(profile_id: str, timeout: int = 30) -> dict[str, Any]:
     except Exception:
         pass
 
-    url = f"{api_url}/api/v1/browser/start?user_id={profile_id}&headless=0"
+    # headless=1: this checker never needs a visible window — every metric
+    # comes from API fetches issued inside the page, not from anything
+    # rendered on screen. A headless browser uses noticeably less RAM,
+    # which matters because AdsPower competes for memory with the upload
+    # browsers (16GB VPS, MemoryError observed at 4 parallel Camoufox).
+    url = f"{api_url}/api/v1/browser/start?user_id={profile_id}&headless=1"
     log(f"Starting Ads Power browser for profile {profile_id} (url={api_url}, key={'yes' if api_key else 'no'})")
     try:
         headers = {}
@@ -487,6 +492,24 @@ def _run_browser_session(ws_url: str, targets: list[dict[str, Any]], profile_id:
                 browser = p.chromium.connect_over_cdp(ws_url)
                 context = browser.contexts[0] if browser.contexts else browser.new_context()
                 page = context.pages[0] if context.pages else context.new_page()
+
+                # Close every other tab before starting. AdsPower restores
+                # the profile's previous session on launch, so tabs pile up
+                # across runs and every one of them reloads Instagram on
+                # startup — pure wasted bandwidth, since this checker only
+                # ever needs a single tab (all metrics come from API fetches
+                # issued through `page`, not from page navigation).
+                closed_tabs = 0
+                for stale in list(context.pages):
+                    if stale is page:
+                        continue
+                    try:
+                        stale.close()
+                        closed_tabs += 1
+                    except Exception:
+                        pass
+                if closed_tabs:
+                    log(f"Closed {closed_tabs} leftover tab(s) from previous runs")
                 
                 # Navigate to Instagram first
                 try:
@@ -614,15 +637,70 @@ def run_once() -> int:
         conn.close()
 
 
+def _upload_in_progress() -> bool:
+    """True when an upload/workflow job is currently running.
+
+    The checker and the upload workers both spawn browsers, and on this
+    16GB VPS they genuinely compete: 4 parallel Camoufox already produced
+    a MemoryError with ~4.7GB free. Metrics are never urgent — deferring a
+    cycle by one interval costs nothing, whereas starving an upload of
+    memory mid-run costs a real publish. So uploads always win.
+    """
+    try:
+        conn = _db_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM ig_web_upload_jobs WHERE status='running'"
+            ).fetchone()
+        finally:
+            conn.close()
+        return int((row["n"] if row else 0) or 0) > 0
+    except Exception:
+        return False  # can't tell -> don't block metrics collection
+
+
+def _minutes_since_last_check() -> float:
+    """Minutes since the most recent metrics snapshot of any account.
+    Returns a large number when nothing has ever been collected."""
+    try:
+        conn = _db_conn()
+        try:
+            ensure_metrics_schema(conn)
+            row = conn.execute(
+                "SELECT MAX(checked_at) AS last FROM account_metrics_snapshots"
+            ).fetchone()
+        finally:
+            conn.close()
+        last = str((row["last"] if row else "") or "").strip()
+        if not last:
+            return 1e9
+        last_dt = datetime.strptime(last[:19], "%Y-%m-%d %H:%M:%S")
+        return (datetime.now() - last_dt).total_seconds() / 60.0
+    except Exception:
+        return 1e9  # unknown -> behave as if overdue, never block collection
+
+
 def _checker_loop() -> None:
     """Background loop with randomization."""
     log("Metrics checker started")
+    # Don't collect immediately on startup if a cycle ran recently. The
+    # software gets restarted often during development, and each restart
+    # used to kick off a full collection run right away — repeatedly
+    # hitting every account far more often than the intended ~1h cadence,
+    # for no new data. Wait out the remainder of the interval instead.
+    elapsed = _minutes_since_last_check()
+    if elapsed < BASE_INTERVAL_MIN:
+        wait_min = BASE_INTERVAL_MIN - elapsed
+        log(f"Last check was {elapsed:.0f} min ago — waiting {wait_min:.0f} min before first cycle")
+        time.sleep(wait_min * 60)
     while True:
         try:
-            if CHECKER_ENABLED:
-                run_once()
-            else:
+            if not CHECKER_ENABLED:
                 log("Checker disabled, skipping cycle")
+            elif _upload_in_progress():
+                log("Upload in progress — skipping this metrics cycle (uploads get memory priority)")
+            else:
+                run_once()
         except Exception as e:
             log(f"Loop error: {e}", "ERROR")
 
