@@ -2034,7 +2034,8 @@ def upload_settings(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
         except Exception:
             browser_parallel = 3
         return {"upload_engine": engine, "api_parallel": parallel, "browser_parallel": browser_parallel,
-                "traffic_saver": str(values.get("traffic_saver") or "off")}
+                "traffic_saver": str(values.get("traffic_saver") or "off"),
+                "warmup_enabled": str(values.get("warmup_enabled") or "on")}
     finally:
         if own and conn is not None:
             conn.close()
@@ -2044,13 +2045,16 @@ def current_browser_parallel() -> int:
     return int(upload_settings().get("browser_parallel") or 3)
 
 
-def save_upload_settings(engine: str, api_parallel: int, browser_parallel: int = 3, traffic_saver: str = "") -> dict[str, Any]:
+def save_upload_settings(engine: str, api_parallel: int, browser_parallel: int = 3, traffic_saver: str = "", warmup_enabled: str = "") -> dict[str, Any]:
     engine = str(engine or "clean_web").strip().lower()
     if engine not in {"manual", "clean_web", "api"}:
         engine = "clean_web"
     parallel = max(1, min(int(api_parallel or 3), 100))
     browser_parallel = max(1, min(int(browser_parallel or 3), 50))
     ts_value = "on" if str(traffic_saver or "").lower() in {"on", "1", "true", "yes"} else "off"
+    # Default "on" (matches historical always-warmup behavior) if unset —
+    # only "off"/"0"/"false"/"no" turns it off, everything else is "on".
+    we_value = "off" if str(warmup_enabled or "").lower() in {"off", "0", "false", "no"} else "on"
     conn = db_conn()
     try:
         conn.execute(
@@ -2078,10 +2082,16 @@ def save_upload_settings(engine: str, api_parallel: int, browser_parallel: int =
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
             (ts_value,),
         )
+        conn.execute(
+            "INSERT INTO ig_web_upload_settings(key,value,updated_at) VALUES ('warmup_enabled',?,datetime('now')) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
+            (we_value,),
+        )
         conn.commit()
     finally:
         conn.close()
-    return {"upload_engine": engine, "api_parallel": parallel, "browser_parallel": browser_parallel, "traffic_saver": ts_value}
+    return {"upload_engine": engine, "api_parallel": parallel, "browser_parallel": browser_parallel,
+            "traffic_saver": ts_value, "warmup_enabled": we_value}
 
 
 def assign_legacy_proxy_connection(conn: sqlite3.Connection, account_name: str, proxy: str) -> dict[str, Any]:
@@ -2531,7 +2541,8 @@ async def set_upload_settings(request: Request) -> JSONResponse:
     parallel = body.get("api_parallel") if body.get("api_parallel") not in (None, "") else current["api_parallel"]
     browser_parallel = body.get("browser_parallel") if body.get("browser_parallel") not in (None, "") else current["browser_parallel"]
     traffic_saver = str(body.get("traffic_saver") or current.get("traffic_saver") or "off")
-    saved = save_upload_settings(engine, int(parallel), int(browser_parallel), traffic_saver)
+    warmup_enabled = str(body.get("warmup_enabled") or current.get("warmup_enabled") or "on")
+    saved = save_upload_settings(engine, int(parallel), int(browser_parallel), traffic_saver, warmup_enabled)
     return JSONResponse({"ok": True, **saved})
 
 
@@ -3780,6 +3791,13 @@ async def start_upload(request: Request) -> JSONResponse:
     # proxy remain sequential with rotation; distinct mobile connections and
     # static connections with unique exit IPs may run in parallel.
     lane_parallel = api_parallel if engine == "api" else browser_parallel
+    current_upload_settings = upload_settings()
+    warmup_is_enabled = str(current_upload_settings.get("warmup_enabled") or "on") == "on"
+    # Defaults follow the persisted Settings toggle (Александр's request
+    # 12.08 — a UI switch, not a bot-side hardcode). An explicit value in
+    # the request body still overrides this per-call if ever needed.
+    default_pre_min, default_pre_max = (1, 2) if warmup_is_enabled else (0, 0)
+    default_post_min, default_post_max = (1, 3) if warmup_is_enabled else (0, 0)
     command = [
         sys.executable, "-u", str(ROOT / "connection_scheduler.py"),
         "--operation", operation,
@@ -3790,10 +3808,10 @@ async def start_upload(request: Request) -> JSONResponse:
         "--worker-script", str(ROOT / ("instagram_private_web_api_upload.py" if engine == "api" else "instagram_web_upload.py")),
         "--max-workers", "1",
         "--target", str(int(body.get("target") or 1)),
-        "--pre-warmup-min", str(body.get("pre_warmup_min") if body.get("pre_warmup_min") not in (None, "") else 1),
-        "--pre-warmup-max", str(body.get("pre_warmup_max") if body.get("pre_warmup_max") not in (None, "") else 2),
-        "--post-warmup-min", str(body.get("post_warmup_min") if body.get("post_warmup_min") not in (None, "") else 1),
-        "--post-warmup-max", str(body.get("post_warmup_max") if body.get("post_warmup_max") not in (None, "") else 3),
+        "--pre-warmup-min", str(body.get("pre_warmup_min") if body.get("pre_warmup_min") not in (None, "") else default_pre_min),
+        "--pre-warmup-max", str(body.get("pre_warmup_max") if body.get("pre_warmup_max") not in (None, "") else default_pre_max),
+        "--post-warmup-min", str(body.get("post_warmup_min") if body.get("post_warmup_min") not in (None, "") else default_post_min),
+        "--post-warmup-max", str(body.get("post_warmup_max") if body.get("post_warmup_max") not in (None, "") else default_post_max),
         "--cooldown-hours", str(body.get("cooldown_hours") if body.get("cooldown_hours") not in (None, "") else 4),
     ]
     if bool(body.get("headless")):

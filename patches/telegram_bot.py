@@ -927,8 +927,12 @@ async def callback_handler(update: Update, ctx):
             await query.edit_message_text(f"🚀 Залив @{name}...")
             result = await api_post_json(session, "/api/ig-web-upload/start", {
                 "accounts": [name], "engine": "clean_web", "browser_parallel": 1,
-                "target": 3, "pre_warmup_min": 1, "pre_warmup_max": 2,
-                "post_warmup_min": 1, "post_warmup_max": 3, "cooldown_hours": 8,
+                # Warmup on/off is a Settings-page toggle now (Александр's
+                # request 12.08) — deliberately NOT passing pre_warmup_*/
+                # post_warmup_* here, so the backend applies whatever the
+                # UI switch is currently set to, rather than the bot
+                # silently overriding it with its own hardcoded choice.
+                "target": 3, "cooldown_hours": 8,
             })
         elif data == "upload_all":
             overview = await api_get(session, "/api/ig-web-upload/overview")
@@ -958,8 +962,9 @@ async def callback_handler(update: Update, ctx):
 
             result = await api_post_json(session, "/api/ig-web-upload/start", {
                 "accounts": ready_names, "engine": "clean_web", "browser_parallel": 5,
-                "target": 3, "pre_warmup_min": 1, "pre_warmup_max": 2,
-                "post_warmup_min": 1, "post_warmup_max": 3, "cooldown_hours": 8,
+                # Warmup on/off — see note in the upload: branch above,
+                # same reasoning applies here.
+                "target": 3, "cooldown_hours": 8,
             })
 
             summary_lines = [
