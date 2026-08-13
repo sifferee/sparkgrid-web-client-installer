@@ -46,7 +46,12 @@ ADS_POWER_PARSER_PROFILES = [p.strip() for p in os.environ.get("ADS_POWER_PARSER
 CHECKER_ENABLED = os.environ.get("METRICS_CHECKER_ENABLED", "1") == "1"
 BASE_INTERVAL_MIN = 55  # minutes
 BASE_INTERVAL_MAX = 75  # minutes
-MAX_TARGETS_PER_CYCLE = 10
+# 0 = no limit: check every eligible account in a single cycle (Александр's
+# requirement 2026-08-13 — a parser that can't reach every account isn't
+# doing its job). Kept as a configurable env override rather than deleted
+# outright, so a limit can be reimposed without a code change if a very
+# large roster ever makes full cycles impractical.
+MAX_TARGETS_PER_CYCLE = int(os.environ.get("METRICS_MAX_TARGETS_PER_CYCLE", "0") or 0)
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -424,19 +429,40 @@ def save_snapshot(
 # ─── Main Checker Loop ───────────────────────────────────────────────────────
 
 def get_target_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    """Get all logged_in accounts to check."""
-    rows = conn.execute(
-        """
-        SELECT name, web_upload_login_status, web_privacy_status,
-               web_upload_scale_niche
-        FROM accounts
-        WHERE web_upload_login_status = 'logged_in'
-        AND enabled = 1
-        ORDER BY name
-        LIMIT ?
-        """,
-        (MAX_TARGETS_PER_CYCLE,),
-    ).fetchall()
+    """Get the accounts most overdue for a metrics check.
+
+    Diagnosed 2026-08-13: this used to be `ORDER BY name LIMIT 10`, which
+    meant the same first 10 accounts alphabetically were re-checked every
+    cycle, forever — every account from "j" onward was NEVER checked at
+    all. With 26 accounts that left 16 permanently without metrics; the
+    "N accounts without metrics" warning in the bot never went down no
+    matter how many times a check was run, because those accounts could
+    not physically enter the queue.
+
+    Now ordered by "least recently checked first" (never-checked accounts
+    sort first, since NULL is treated as the oldest possible time). By
+    default there is no per-cycle limit at all — every eligible account
+    is checked each cycle — with the ordering still mattering: it decides
+    who gets checked FIRST within the cycle, so the most-overdue accounts
+    are covered earliest even if a cycle is interrupted partway through.
+    """
+    query = """
+        SELECT a.name, a.web_upload_login_status, a.web_privacy_status,
+               a.web_upload_scale_niche
+        FROM accounts a
+        LEFT JOIN (
+            SELECT account_name, MAX(checked_at) AS last_checked
+            FROM account_metrics_snapshots
+            GROUP BY account_name
+        ) s ON s.account_name = a.name
+        WHERE a.web_upload_login_status = 'logged_in'
+        AND a.enabled = 1
+        ORDER BY (s.last_checked IS NULL) DESC, s.last_checked ASC, a.name ASC
+    """
+    if MAX_TARGETS_PER_CYCLE > 0:
+        rows = conn.execute(query + " LIMIT ?", (MAX_TARGETS_PER_CYCLE,)).fetchall()
+    else:
+        rows = conn.execute(query).fetchall()
     return [dict(r) for r in rows]
 
 
