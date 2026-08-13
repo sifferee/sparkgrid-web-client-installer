@@ -35,6 +35,7 @@ DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" if Path(__file
 
 # Try to find DATA_DIR from environment
 import os
+import subprocess
 DATA_DIR = Path(os.environ.get("SPARKGRID_DATA_DIR") or DATA_DIR).resolve()
 DB_PATH = DATA_DIR / "bot.db"
 LOG_DIR = DATA_DIR / "logs"
@@ -263,6 +264,49 @@ def close_stray_ads_profiles(keep_profile_ids: set[str] | None = None) -> int:
             log(f"  could not close profile {user_id}: {e}", "WARNING")
     log(f"Closed {closed} stray AdsPower profile(s)")
     return closed
+
+
+def kill_orphaned_ads_processes(min_age_minutes: int = 60) -> int:
+    """Kill AdsPower browser processes that AdsPower itself has lost track of.
+
+    Diagnosed 2026-08-13: 12 SunBrowser processes (~730MB) were still
+    running from hours earlier, while AdsPower's own
+    /api/v1/browser/local-active reported ZERO active profiles — it had
+    already marked them stopped without actually killing the OS
+    processes. close_stray_ads_profiles() can't touch these because the
+    API doesn't know they exist; only an OS-level kill reaches them.
+
+    Safety: only processes older than `min_age_minutes` are killed. A
+    profile the checker just opened, or one Alexander opened by hand to
+    work in, is minutes old and will never match — genuine orphans have
+    been sitting for hours. Upload browsers are unaffected regardless:
+    those run as camoufox.exe, a different executable entirely.
+
+    Windows-only (uses PowerShell). Returns processes killed; any failure
+    is logged and ignored, since freeing memory must never break metrics.
+    """
+    if os.name != "nt":
+        return 0
+    script = (
+        "$cutoff = (Get-Date).AddMinutes(-{age}); "
+        "$procs = Get-Process -Name SunBrowser -ErrorAction SilentlyContinue | "
+        "Where-Object {{ $_.StartTime -lt $cutoff }}; "
+        "if ($procs) {{ $count = @($procs).Count; "
+        "$procs | Stop-Process -Force -ErrorAction SilentlyContinue; "
+        "Write-Output $count }} else {{ Write-Output 0 }}"
+    ).format(age=int(min_age_minutes))
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=60,
+        )
+        killed = int((completed.stdout or "0").strip() or 0)
+    except Exception as e:
+        log(f"Orphaned AdsPower process cleanup failed: {e}", "WARNING")
+        return 0
+    if killed:
+        log(f"Killed {killed} orphaned AdsPower process(es) older than {min_age_minutes} min")
+    return killed
 
 
 def connect_browser(ws_url: str):
@@ -679,6 +723,12 @@ def run_once() -> int:
             close_stray_ads_profiles(keep_profile_ids=set(profiles))
         except Exception as e:
             log(f"Stray profile cleanup skipped: {e}", "WARNING")
+        # Orphans the AdsPower API can't see (it thinks they're already
+        # stopped) need an OS-level kill — see kill_orphaned_ads_processes.
+        try:
+            kill_orphaned_ads_processes()
+        except Exception as e:
+            log(f"Orphan cleanup skipped: {e}", "WARNING")
 
         checked = 0
         for profile_id in profiles:
