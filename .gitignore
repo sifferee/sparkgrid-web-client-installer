@@ -7,3 +7,64 @@ __pycache__/
 # Secrets — never commit API keys / tokens
 secrets.local.ps1
 secrets.*.local.ps1
+
+# Data — databases, logs, dumps, browser profiles
+*.db
+*.db-journal
+data/
+logs/
+ai_content_data/
+browser_profiles/
+
+# Third-party packages (installed via pip, not committed)
+# These are in _internal/ alongside project code, but are standard PyPI packages
+PIL/
+pydantic/
+pydantic_core/
+fastapi/
+starlette/
+uvicorn/
+playwright/
+camoufox/
+browserforge/
+geoip2/
+maxminddb/
+numpy/
+numpy.libs/
+requests/
+aiohttp/
+yarl/
+multidict/
+orjson/
+lxml/
+yaml/
+pyotp/
+multipart/
+platformdirs/
+screeninfo/
+ua_parser/
+ua_parser_builtins/
+language_tags/
+imageio_ffmpeg/
+greenlet/
+propcache/
+charset_normalizer/
+certifi/
+frozenlist/
+tzdata/
+setuptools/
+attrs-*/
+*.dist-info/
+cryptography/
+fcntl.py
+
+# Runtime assets (GeoIP database, license keys — not redistributable)
+runtime_assets/
+license/
+
+# Branding assets (binary, not needed for code review)
+assets/
+
+# Windows temp files
+*.tmp
+Thumbs.db
