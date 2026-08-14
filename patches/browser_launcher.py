@@ -933,17 +933,26 @@ def _build_launch_kwargs(
     # overlay that appears on top of the page. It's browser chrome, not
     # page content, so no DOM-based dialog handler can ever reach it —
     # automation just hangs behind it until dismissed by hand. Disabled.
-    launch["firefox_user_prefs"] = {
-        "dom.min_background_timeout_value": 4,
-        "dom.min_background_timeout_value_without_budget_throttling": 4,
-        "dom.timeout.enable_budget_timer_throttling": False,
-        "dom.suspend_inactive.enabled": False,
-        "media.suspend-background-video.enabled": False,
-        "browser.ml.enable": False,
-        "browser.ml.chat.enabled": False,
-        "browser.ml.linkPreview.enabled": False,
-        "browser.ml.linkPreview.optin": False,
-    }
+    #
+    # DISABLED 2026-08-14: after these prefs went live (c0745a2), all three
+    # test accounts started failing with consent_chain_failed /
+    # browser_internal_error within 4-5 seconds — an exception inside
+    # page.evaluate, not a hang. That is the same failure shape the
+    # reverted graphics prefs (9bf9535) produced, via the same mechanism,
+    # so these are the prime suspect. Commented out to confirm by
+    # elimination: if the error disappears, they caused it; if it stays,
+    # the cause is elsewhere and they can come back.
+    # launch["firefox_user_prefs"] = {
+    #     "dom.min_background_timeout_value": 4,
+    #     "dom.min_background_timeout_value_without_budget_throttling": 4,
+    #     "dom.timeout.enable_budget_timer_throttling": False,
+    #     "dom.suspend_inactive.enabled": False,
+    #     "media.suspend-background-video.enabled": False,
+    #     "browser.ml.enable": False,
+    #     "browser.ml.chat.enabled": False,
+    #     "browser.ml.linkPreview.enabled": False,
+    #     "browser.ml.linkPreview.optin": False,
+    # }
     return launch, meta
 
 
