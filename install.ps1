@@ -660,31 +660,43 @@ if (Test-Path $secretsFile) {
     . $secretsFile
 }
 if (Test-Path $botDb) {
-    Write-Host "Чтение секретов из bot.db (настройки софта имеют приоритет)…"
-        try {
-            $dbResult = & $exe -c @"
-import sqlite3, json
-conn = sqlite3.connect(r'$botDb')
-cur = conn.cursor()
-try:
-    cur.execute("SELECT key, value FROM ads_power_config")
-    rows = cur.fetchall()
-    for k, v in rows:
-        print(f"{k}={v}")
-except Exception:
-    pass
-conn.close()
-"@
-            foreach ($line in $dbResult) {
-                if ($line -match '^(\S+)=(.*)$') {
-                    $key = $Matches[1]
-                    $val = $Matches[2]
-                    Set-Item -Path "env:$key" -Value $val
-                }
+    Write-Host "Чтение секретов из bot.db (настройки софта имеют приоритет)..."
+    # The reader lives in its own .py file rather than being passed inline
+    # to python -c. Diagnosed 2026-08-14: the inline version was a
+    # here-string nested inside the here-string that writes this whole
+    # script, and the quotes around the SQL didn't survive two rounds of
+    # escaping — the generated file ended up with `cur.execute(SELECT`
+    # and died with "SyntaxError: '(' was never closed". Every key the
+    # user had entered on /setup was silently ignored as a result.
+    # A separate file has no nesting, so nothing can be eaten.
+    $readerPy = Join-Path $env:TEMP 'sparkgrid_read_secrets.py'
+    $readerLines = @(
+        'import sqlite3, sys',
+        'db = sys.argv[1]',
+        'conn = sqlite3.connect(db)',
+        'cur = conn.cursor()',
+        'try:',
+        '    cur.execute(''SELECT key, value FROM ads_power_config'')',
+        '    for k, v in cur.fetchall():',
+        '        print(str(k) + chr(61) + str(v))',
+        'except Exception:',
+        '    pass',
+        'conn.close()'
+    )
+    Set-Content -Path $readerPy -Value $readerLines -Encoding UTF8
+    try {
+        $dbResult = & $exe $readerPy $botDb
+        foreach ($line in $dbResult) {
+            if ($line -match '^(\S+)=(.*)$') {
+                $key = $Matches[1]
+                $val = $Matches[2]
+                Set-Item -Path "env:$key" -Value $val
             }
+        }
     } catch {
         Write-Warning "Не удалось прочитать секреты из bot.db: $_"
     }
+    Remove-Item $readerPy -Force -ErrorAction SilentlyContinue
 }
 
 # Environment variables
