@@ -480,6 +480,18 @@ async def _send_metrics(update_or_query):
     msg += f"Просмотры: {fmt(t.get('views',0))}{_arrow(dl.get('views',0))}\n"
     msg += f"Лайки: {fmt(t.get('likes',0))}{_arrow(dl.get('likes',0))}\n"
     msg += f"Комментарии: {fmt(t.get('comments',0))}{_arrow(dl.get('comments',0))}\n"
+    # Change since the previous check, alongside the 24h totals. When
+    # checks run about hourly, the 24h numbers barely move between two of
+    # them and read as if nothing is happening — this shows what the
+    # latest check actually found. Hidden when there's nothing to report
+    # (first ever check, or genuinely no movement).
+    sl = data.get("delta_since_last") or {}
+    s_fol = int(sl.get("followers") or 0)
+    s_views = int(sl.get("views") or 0)
+    s_likes = int(sl.get("likes") or 0)
+    if s_fol or s_views or s_likes:
+        msg += (f"\nС прошлой проверки: {fmt_delta(s_views)} просм · "
+                f"{fmt_delta(s_fol)} подп · {fmt_delta(s_likes)} лайк\n")
 
     if not accounts:
         await _reply(update_or_query, msg)

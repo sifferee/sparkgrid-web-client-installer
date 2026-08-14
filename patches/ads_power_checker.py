@@ -309,6 +309,73 @@ def kill_orphaned_ads_processes(min_age_minutes: int = 60) -> int:
     return killed
 
 
+def _active_profile_ids() -> tuple[bool, set[str]]:
+    """Ask AdsPower which profiles it considers running.
+
+    Returns (api_answered, ids). The flag matters: "API says nothing is
+    running" and "couldn't reach the API" look the same as an empty set
+    but call for opposite behaviour — the first makes a full cleanup
+    safe, the second makes it reckless.
+    """
+    api_key = ""
+    api_url = ADS_POWER_API_URL
+    try:
+        conn = _db_conn()
+        api_key = get_config(conn, "ads_power_api_key", "")
+        db_url = get_config(conn, "ads_power_api_url", "")
+        if db_url:
+            api_url = db_url
+        conn.close()
+    except Exception:
+        pass
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        resp = urlopen(Request(f"{api_url}/api/v1/browser/local-active", headers=headers), timeout=15)
+        payload = json.loads(resp.read())
+    except Exception as e:
+        log(f"Could not query active AdsPower profiles: {e}", "WARNING")
+        return False, set()
+    ids = set()
+    try:
+        for item in (payload.get("data") or {}).get("list") or []:
+            uid = str(item.get("user_id") or "").strip()
+            if uid:
+                ids.add(uid)
+    except Exception:
+        return False, set()
+    return True, ids
+
+
+def clean_before_launch() -> int:
+    """Clear leftover browser processes right before opening a profile.
+
+    Diagnosed 2026-08-14: three metrics cycles in a row failed with
+    "Ads Power error: Failed to start browser" while AdsPower's own
+    local-active endpoint reported ZERO running profiles — yet 25
+    SunBrowser processes were alive. AdsPower refuses to launch when its
+    process pool is polluted like that, and the existing cleanup couldn't
+    help: it ran once per cycle (before the failures, not between them)
+    and only touched processes older than an hour, while these were
+    minutes old.
+
+    The safety rule is state-based rather than age-based: only when
+    AdsPower positively reports "nothing is running" is every live
+    browser process by definition a leftover, so killing all of them is
+    correct. If the API reports running profiles — or can't be reached at
+    all — fall back to the conservative age filter, which can never touch
+    a profile Alexander just opened by hand.
+    """
+    answered, active = _active_profile_ids()
+    if answered and not active:
+        killed = kill_orphaned_ads_processes(min_age_minutes=0)
+        if killed:
+            log(f"Cleared {killed} leftover browser process(es) — AdsPower reported none running")
+        return killed
+    if active:
+        log(f"AdsPower reports {len(active)} profile(s) running — leaving processes alone")
+    return kill_orphaned_ads_processes()  # conservative: only old ones
+
+
 def connect_browser(ws_url: str):
     """Connect to running browser via CDP. Returns (browser, context, page).
     
@@ -764,12 +831,9 @@ def run_once() -> int:
             close_stray_ads_profiles(keep_profile_ids=set(profiles))
         except Exception as e:
             log(f"Stray profile cleanup skipped: {e}", "WARNING")
-        # Orphans the AdsPower API can't see (it thinks they're already
-        # stopped) need an OS-level kill — see kill_orphaned_ads_processes.
-        try:
-            kill_orphaned_ads_processes()
-        except Exception as e:
-            log(f"Orphan cleanup skipped: {e}", "WARNING")
+        # OS-level orphan cleanup now happens per launch (clean_before_launch),
+        # not once here: leftovers accumulate DURING a cycle from failed
+        # launches, so a single pass at the start missed them entirely.
 
         checked = 0
         launch_errors: list[str] = []
@@ -777,11 +841,34 @@ def run_once() -> int:
             if checked >= len(targets):
                 break
 
+            # Clear leftovers immediately before launching, not once per
+            # cycle: the polluted process pool that blocks AdsPower builds
+            # up DURING a cycle, from the failed launches themselves.
+            try:
+                clean_before_launch()
+            except Exception as e:
+                log(f"Pre-launch cleanup skipped: {e}", "WARNING")
+
             # Start Ads Power browser
             start_result = start_ads_browser(profile_id)
             if not start_result.get("ok"):
                 err = str(start_result.get("error") or "unknown")
-                log(f"Failed to start browser for profile {profile_id}: {err}", "ERROR")
+                # One retry after a forced cleanup. "Failed to start
+                # browser" is exactly what AdsPower says when its pool is
+                # stuck, and clearing it is usually enough — worth one
+                # more attempt before writing the profile off for this
+                # cycle.
+                log(f"Launch failed for {profile_id} ({err}) — cleaning up and retrying once", "WARNING")
+                try:
+                    kill_orphaned_ads_processes(min_age_minutes=0)
+                    time.sleep(3)
+                except Exception as cleanup_exc:
+                    log(f"Retry cleanup failed: {cleanup_exc}", "WARNING")
+                start_result = start_ads_browser(profile_id)
+
+            if not start_result.get("ok"):
+                err = str(start_result.get("error") or "unknown")
+                log(f"Failed to start browser for profile {profile_id} after retry: {err}", "ERROR")
                 launch_errors.append(err)
                 continue
 
@@ -1019,12 +1106,36 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
     """.format(hours), ()).fetchall()
     old_map = {r["account_name"]: dict(r) for r in old_rows}
 
+    # Previous snapshot per account, whenever it happened. The 24h window
+    # above answers "how did today go"; this answers "what changed since
+    # the last check", which is what Alexander watches when checks run
+    # roughly hourly — a 24h delta barely moves between two checks an hour
+    # apart and reads as if nothing is happening.
+    #
+    # Accounts with only one snapshot are absent from this map on purpose:
+    # there is nothing to compare a first measurement against, and showing
+    # its full value as "growth" would be a lie.
+    prev_rows = conn.execute("""
+        SELECT s.* FROM account_metrics_snapshots s
+        INNER JOIN (
+            SELECT s2.account_name, MAX(s2.checked_at) AS prev_checked
+            FROM account_metrics_snapshots s2
+            WHERE s2.checked_at < (
+                SELECT MAX(s3.checked_at) FROM account_metrics_snapshots s3
+                WHERE s3.account_name = s2.account_name
+            )
+            GROUP BY s2.account_name
+        ) prev ON s.account_name = prev.account_name AND s.checked_at = prev.prev_checked
+    """).fetchall()
+    prev_map = {r["account_name"]: dict(r) for r in prev_rows}
+
     accounts = []
     total_followers = 0
     total_views = 0
     total_likes = 0
     total_comments = 0
     delta_followers = 0
+    since_followers = since_views = since_likes = 0
     delta_views = 0
     delta_likes = 0
     delta_comments = 0
@@ -1049,6 +1160,29 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
         dl = cur_likes - old_likes if (cur_likes > 0 and old_likes > 0) else 0
         dc = cur_comments - old_comments if (cur_comments > 0 and old_comments > 0) else 0
 
+        # Same comparison against the immediately previous snapshot. Note
+        # this deliberately does NOT apply the "both must be non-zero"
+        # guard used above: that guard exists to hide fake plunges caused
+        # by a failed 24h-old collection, whereas here a zero is usually
+        # a genuine starting point (a fresh account's first real numbers),
+        # and suppressing it would hide exactly the growth worth seeing.
+        prev = prev_map.get(d["account_name"])
+        if prev:
+            since_last = {
+                "followers": cur_fol - int(prev.get("followers", 0) or 0),
+                "views": cur_views - int(prev.get("total_views", 0) or 0),
+                "likes": cur_likes - int(prev.get("total_likes", 0) or 0),
+                "comments": cur_comments - int(prev.get("total_comments", 0) or 0),
+                "since": str(prev.get("checked_at") or ""),
+            }
+        else:
+            # First ever snapshot for this account — nothing to compare to.
+            since_last = {"followers": 0, "views": 0, "likes": 0, "comments": 0, "since": ""}
+
+        since_followers += int(since_last.get("followers") or 0)
+        since_views += int(since_last.get("views") or 0)
+        since_likes += int(since_last.get("likes") or 0)
+
         accounts.append({
             "name": d["account_name"],
             "followers": d["followers"],
@@ -1070,6 +1204,7 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
                 "likes": dl,
                 "comments": dc,
             },
+            "delta_since_last": since_last,
         })
 
         total_followers += cur_fol
@@ -1098,6 +1233,11 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
         "hours": hours,
         # Surfaced so the bot and dashboard can say WHY numbers aren't
         # moving, instead of the user discovering it a day later.
+        "delta_since_last": {
+            "followers": since_followers,
+            "views": since_views,
+            "likes": since_likes,
+        },
         "collector_error": get_config(conn, "metrics_last_failure", ""),
         "collector_error_at": get_config(conn, "metrics_last_failure_at", ""),
     }
