@@ -3807,6 +3807,7 @@ async def start_upload(request: Request) -> JSONResponse:
         engine, api_parallel, browser_parallel,
         str(current.get("traffic_saver") or "off"),
         str(current.get("warmup_enabled") or "on"),
+        str(current.get("background_web") or "off"),
     )
 
     operation = "api" if engine == "api" else "clean_web"
