@@ -465,6 +465,17 @@ async def _send_metrics(update_or_query):
 
     # ── Summary block (always shown, compact) ──
     msg = "📊 Метрики за 24ч\n"
+    # Say plainly when the collector itself is down. Without this the
+    # numbers simply stop changing and look like a fleet that isn't
+    # growing — Alexander lost a day to AdsPower being closed while every
+    # cycle quietly logged "0 accounts checked".
+    collector_error = str(data.get("collector_error") or "").strip()
+    if collector_error:
+        when = str(data.get("collector_error_at") or "")[:16]
+        msg = f"⚠️ Сбор метрик не работает: {collector_error}\n"
+        if when:
+            msg += f"   (последняя попытка: {when})\n"
+        msg += "   Данные ниже устарели.\n\n📊 Метрики за 24ч\n"
     msg += f"Подписчики: {fmt(t.get('followers',0))}{_arrow(dl.get('followers',0))}\n"
     msg += f"Просмотры: {fmt(t.get('views',0))}{_arrow(dl.get('views',0))}\n"
     msg += f"Лайки: {fmt(t.get('likes',0))}{_arrow(dl.get('likes',0))}\n"

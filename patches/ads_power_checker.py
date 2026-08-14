@@ -772,6 +772,7 @@ def run_once() -> int:
             log(f"Orphan cleanup skipped: {e}", "WARNING")
 
         checked = 0
+        launch_errors: list[str] = []
         for profile_id in profiles:
             if checked >= len(targets):
                 break
@@ -779,7 +780,9 @@ def run_once() -> int:
             # Start Ads Power browser
             start_result = start_ads_browser(profile_id)
             if not start_result.get("ok"):
-                log(f"Failed to start browser for profile {profile_id}: {start_result.get('error')}", "ERROR")
+                err = str(start_result.get("error") or "unknown")
+                log(f"Failed to start browser for profile {profile_id}: {err}", "ERROR")
+                launch_errors.append(err)
                 continue
 
             ws_url = start_result.get("ws_url", "")
@@ -792,6 +795,27 @@ def run_once() -> int:
                 stop_ads_browser(profile_id)
 
         log(f"Cycle complete: {checked}/{len(targets)} accounts checked")
+        # Remember why a cycle produced nothing, so the bot can say so out
+        # loud instead of the user noticing days later that numbers stopped
+        # moving. Added 2026-08-14: AdsPower was closed for ~20 hours and
+        # every cycle quietly logged "0/20 checked" — nothing surfaced.
+        try:
+            c = _db_conn()
+            try:
+                if checked == 0 and launch_errors:
+                    reason = launch_errors[0][:200]
+                    if "Cannot reach" in reason or "10061" in reason:
+                        reason = "AdsPower не отвечает — проверь, запущен ли он на VPS"
+                    set_config(c, "metrics_last_failure", reason)
+                    set_config(c, "metrics_last_failure_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                elif checked > 0:
+                    set_config(c, "metrics_last_failure", "")
+                    set_config(c, "metrics_last_failure_at", "")
+                c.commit()
+            finally:
+                c.close()
+        except Exception as e:
+            log(f"Could not record cycle status: {e}", "WARNING")
         return checked
 
     except Exception as e:
@@ -964,6 +988,11 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
     # without data" line that never went away no matter how many collection
     # cycles ran. Joining the account's own login status/error here lets the
     # caller separate "banned, expected" from "should have data but doesn't".
+    # INNER JOIN on accounts, not LEFT: a deleted account leaves its old
+    # snapshots behind, and they kept showing up in the dashboard long
+    # after the account was gone — 31 rows listed while only 20 accounts
+    # existed. History stays in the table (useful for audits); it just
+    # isn't presented as current state.
     rows = conn.execute("""
         SELECT s.*,
                COALESCE(a.web_upload_login_status,'') AS login_status,
@@ -974,7 +1003,7 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
             FROM account_metrics_snapshots
             GROUP BY account_name
         ) latest ON s.account_name = latest.account_name AND s.checked_at = latest.max_checked
-        LEFT JOIN accounts a ON a.name = s.account_name
+        INNER JOIN accounts a ON a.name = s.account_name
         ORDER BY s.account_name
     """).fetchall()
 
@@ -1067,6 +1096,10 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
         },
         "accounts": accounts,
         "hours": hours,
+        # Surfaced so the bot and dashboard can say WHY numbers aren't
+        # moving, instead of the user discovering it a day later.
+        "collector_error": get_config(conn, "metrics_last_failure", ""),
+        "collector_error_at": get_config(conn, "metrics_last_failure_at", ""),
     }
 
 
