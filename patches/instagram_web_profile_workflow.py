@@ -1432,6 +1432,18 @@ def get_state(page) -> tuple[str, str]:
         pass
     if _is_consent_loop(page):
         return "consent_required", "Instagram cookie consent could not be saved"
+    # Checked BEFORE the dialog gate on purpose. Diagnosed 2026-08-14:
+    # e8a6150 made any /accounts/suspended redirect count as banned, but
+    # placed the check further down — and the gate below returns first.
+    # On that page Instagram shows a "Confirm you're human" dialog with a
+    # Continue button, which the gate can't classify, so it returned
+    # unknown_popup and the URL check never ran. c32544408, jacquelinezk1s
+    # and janetm7vx all sat at "unknown" while being genuinely blocked.
+    #
+    # Once the browser is ON the suspension page the question is already
+    # answered; whatever dialog sits on top of it doesn't change that.
+    if "/accounts/suspended" in url or "/suspended" in url:
+        return "suspended", "account suspended"
     # A visible dialog is stronger evidence than a successful current-user
     # endpoint.  A content-removal notice is a temporary UI blocker, never a
     # durable account review/restriction state.
