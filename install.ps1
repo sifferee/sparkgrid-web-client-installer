@@ -495,7 +495,6 @@ if (Test-Path $secretsFile) {
 
 # Environment variables
 $env:SPARKGRID_DATA_DIR     = "C:\Users\<USER>\AppData\Local\SparkGrid\data"
-$env:SPARKGRID_CAMOUFOX_DIR = "$workDir\_internal\SparkBrowser"
 $env:SPARKGRID_GEOIP_PATH   = "$workDir\_internal\camoufox\GeoLite2-City.mmdb"
 $env:PYTHONPATH             = "$workDir\python\Lib\site-packages;$workDir\_internal;C:\Users\<USER>\AppData\Local\SparkGrid\lib;$workDir\lib"
 $env:WEB_UI_HOST            = "127.0.0.1"
