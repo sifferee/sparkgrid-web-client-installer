@@ -359,7 +359,12 @@ $packages = @(
     'numpy',
     'imageio-ffmpeg',
     'platformdirs',
-    'PySocks'
+    'PySocks',
+    # Added 2026-08-14: FastAPI needs this for form parsing. Without it
+    # story publishing fails at runtime with "The `python-multipart`
+    # library must be installed to use form parsing" — an error that only
+    # appears when a story is actually posted, long after install.
+    'python-multipart'
 )
 
 # Get list of installed packages

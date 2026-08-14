@@ -1,7 +1,7 @@
 """Typed vocabulary shared by goal-driven browser workflows."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -45,7 +45,16 @@ class BrowserWorkflowResult:
     code: BrowserWorkflowCode
     operation_state: str = ""
     error_category: str = ""
-    metadata: Mapping[str, Any] = MappingProxyType({})
+    # default_factory, not a bare MappingProxyType({}). Diagnosed
+    # 2026-08-14 on the new server: Python 3.11's dataclasses treats a
+    # mappingproxy as a mutable default and refuses it outright —
+    # "ValueError: mutable default ... use default_factory". The module
+    # died on IMPORT, so every single workflow (session check, login,
+    # upload) failed with exit code 1 about a second after starting,
+    # before a browser was ever launched. The old server ran Python 3.10,
+    # where this check didn't exist, which is why it surfaced only after
+    # the move.
+    metadata: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "code", BrowserWorkflowCode(self.code))
