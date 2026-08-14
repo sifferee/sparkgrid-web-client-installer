@@ -316,6 +316,20 @@ def run_trigger_check() -> int:
                 reel_pk = str(trigger_reel.get("pk", ""))
                 log(f"@{name}: TRIGGER! reel {reel_pk} has {views} views (threshold={threshold})")
 
+            # Account busy with its own reel upload? Remember it and post
+            # once that finishes, rather than colliding now and logging a
+            # failure for something that isn't broken.
+            if _account_busy_with_upload(name):
+                log(f"@{name}: upload in progress — story deferred until it finishes")
+                record_trigger(
+                    conn, name,
+                    str(trigger_reel.get("pk", "")) if trigger_reel else "",
+                    int(trigger_reel.get("views", 0)) if trigger_reel else 0,
+                    int(threshold or 0),
+                    0, DEFERRED_MARKER,
+                )
+                continue
+
             # Post the story
             result = trigger_story_post(name)
             if result.get("ok") and result.get("started", True) is not False:
@@ -355,6 +369,35 @@ def run_trigger_check() -> int:
 
     log(f"Story trigger cycle: {posted} stories posted")
     return posted
+
+
+DEFERRED_MARKER = "deferred:upload_in_progress"
+
+
+def _account_busy_with_upload(account_name: str) -> bool:
+    """True when this specific account has a running upload job.
+
+    Alexander's design (14.08): if a reel upload is in progress on the
+    account, let it finish — don't interrupt it, and don't fire a story
+    attempt that will just collide. Remember the account instead and post
+    once it's free.
+
+    Checked per-account, not globally: an upload on OTHER accounts is no
+    reason to hold this one's story back.
+    """
+    try:
+        conn = _db_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM ig_web_upload_jobs "
+                "WHERE account_name=? AND status='running'",
+                (str(account_name),),
+            ).fetchone()
+        finally:
+            conn.close()
+        return int((row["n"] if row else 0) or 0) > 0
+    except Exception:
+        return False  # can't tell -> behave as before, try posting
 
 
 def get_pending_retry_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -401,6 +444,12 @@ def run_retry_check() -> int:
             if has_story_today(conn, name):
                 # A normal cycle already succeeded for this account since
                 # the failure was recorded — nothing left to retry.
+                continue
+            # Still mid-upload? Leave the deferral standing and check again
+            # next pass. Re-recording it every 10 minutes would just churn
+            # the table and make a normal wait look like repeated failure.
+            if _account_busy_with_upload(name):
+                log(f"@{name}: still uploading — story stays queued")
                 continue
             result = trigger_story_post(name)
             if result.get("ok") and result.get("started", True) is not False:

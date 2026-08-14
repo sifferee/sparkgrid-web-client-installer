@@ -1273,6 +1273,7 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
 
         jobs = data.get("jobs", [])
         new_events: list[str] = []
+        stopped_accounts: list[str] = []
 
         for job in jobs[:20]:
             status = str(job.get("status") or "")
@@ -1328,13 +1329,29 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
                     continue
                 line = f"🟡 @{account}: {error[:80]}"
             elif status == "stopped":
-                line = f"🛑 @{account}"
+                # Diagnosed 2026-08-14: these are the "red circles" that
+                # flooded Alexander's chat — 🛑 renders as a red dot in
+                # Telegram, and one arrived per account every time a run
+                # was stopped. Stopping is his own deliberate action, so
+                # per-account confirmations tell him nothing he doesn't
+                # already know. Collected and reported as a single line
+                # below instead.
+                stopped_accounts.append(account)
+                continue
             elif status == "empty_selection":
                 continue  # Not useful for user
             else:
                 line = f"❓ {status}: @{account}"
 
             new_events.append(line)
+
+        # One line for everything stopped in this batch, instead of one
+        # message per account.
+        if stopped_accounts:
+            if len(stopped_accounts) <= 3:
+                new_events.append("🛑 Остановлено: " + ", ".join(f"@{a}" for a in stopped_accounts))
+            else:
+                new_events.append(f"🛑 Остановлено аккаунтов: {len(stopped_accounts)}")
 
         # Add to pending buffer
         _pending_notifications.extend(new_events)

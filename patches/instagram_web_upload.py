@@ -4287,10 +4287,20 @@ def account_lane(account: dict, args, run_id: str) -> None:
                             warm = {"ok": False, "error": f"post_warmup_exception: {warm_exc}"}
                         if not warm.get("ok"):
                             error = warm.get("error") or str(warm)
-                            update_job(job_id, **partial_success_after_warmup(posted, target, error))
+                            # Diagnosed 2026-08-14: this used to return,
+                            # abandoning the rest of the queue because a
+                            # post-publish warmup failed. The video was
+                            # already published; warmup is cosmetic pacing,
+                            # not part of publishing. Alexander's
+                            # requirement is 3 reels per run, full stop —
+                            # so a warmup problem gets logged and the queue
+                            # continues. (Currently latent: warmup is off
+                            # in his settings, so post_warm is 0 and this
+                            # block never runs. It would bite the moment he
+                            # turned warmup back on.)
+                            log(f"{name}: post-warmup failed ({error}) — continuing with remaining uploads", "WARNING")
                             update_account(name, web_upload_last_error=error)
                             dump.capture(page, "post_warmup_failed", error=error, force_snapshot=True)
-                            return
 
             if forced_retry:
                 if content_mode == "quality":
