@@ -420,7 +420,7 @@ body.workspace-quality .selection-bar{border-color:rgba(167,139,250,.28);backgro
           <div class="prow"><span class="pl">Provider</span><select id="provider"><option value="camoufox">SparkBrowser</option><option value="playwright">Playwright</option></select></div>
           <div class="prow clean-only"><span class="pl">Parallel browser lanes</span><input id="workers" type="number" min="1" max="50" value="3" onchange="changeBrowserParallel()"><span class="muted">Same mobile proxy stays sequential · different mobile/static connections can run together · ~0.7 GB RAM each</span></div>
           <div class="prow clean-only"><span class="pl">Traffic Saver</span><input type="checkbox" id="trafficSaver" onchange="toggleTrafficSaver()" title="Reduce warmup bandwidth: Save-Data header + tracker blocking + video segment reduction (~60-70% less traffic)"><span class="muted">Save-Data header + tracker block + video segment cut · ~60-70% less bandwidth during warmup · upload is unaffected</span></div>
-          <div class="prow clean-only"><span class="pl">Pre/post-upload warmup</span><input type="checkbox" id="warmupEnabled" checked onchange="toggleWarmupEnabled()" title="Brief warmup immediately before and after each upload (not the separate Warm up button/session below — this is the short bookend around a publish run)"><span class="muted">On: brief reel-scroll before &amp; after each upload · Off: log in, publish, exit — saves the most traffic but looks less human</span></div>
+          <div class="prow clean-only"><span class="pl">Отключить прогрев</span><input type="checkbox" id="warmupDisabled" onchange="toggleWarmupEnabled()" title="Галочка = прогрева НЕТ: аккаунт логинится, публикует и выходит. Без галочки — короткий скролл рилсов до и после каждой заливки."><span class="muted">✓ = прогрева нет (логин → публикация → выход, минимум трафика) · без галочки = короткий скролл рилсов до и после заливки</span></div>
           <div class="prow clean-only"><span class="pl">Warmup</span><span class="row"><select id="preset" onchange="applyPreset()"><option value="3">Light 3m</option><option value="8" selected>Normal 8m</option><option value="18">Strong 18m</option><option value="0">Custom</option></select><input type="number" id="minutes" value="8" style="width:48px">m</span></div>
           <div class="prow clean-only"><span class="pl">Background Web</span><input type="checkbox" id="headless" title="Run the Web workflow in the background"></div>
           <div class="prow"><span class="pl">Ignore connections</span><input type="checkbox" id="noproxy" title="Use this computer's internet connection directly for this run"></div>
@@ -983,7 +983,7 @@ function applyEngineUI(){
   manual.disabled=PROCESS_BUSY;clean.disabled=PROCESS_BUSY;apiBtn.disabled=PROCESS_BUSY;
   $('#apiParallel').value=API_PARALLEL;
   const ts=$('#trafficSaver');if(ts)ts.checked=TRAFFIC_SAVER;
-  const we=$('#warmupEnabled');if(we)we.checked=WARMUP_ENABLED;
+  const we=$('#warmupDisabled');if(we)we.checked=!WARMUP_ENABLED;
   $('#pageSub').textContent=UPLOAD_ENGINE==='api'?'Per-account content plans · optimized publishing':UPLOAD_ENGINE==='manual'?'Open and work with one Web account by hand':'Per-account content plans · clean browser publishing';
   const state=$('#apiRunState');if(state)state.textContent=PROCESS_BUSY?(PROCESS_LABEL||'API upload running'):'one upload at a time per account';
   updateTargets();
@@ -1070,7 +1070,7 @@ async function persistEngineSettings(){return api('/api/ig-web-upload/settings',
 function clampBrowserParallel(v){v=parseInt(v)||3;return Math.max(1,Math.min(v,50));}
 async function changeBrowserParallel(){const old=BROWSER_PARALLEL;BROWSER_PARALLEL=clampBrowserParallel($('#workers').value);$('#workers').value=BROWSER_PARALLEL;try{await persistEngineSettings();toast('Parallel browser lanes · '+BROWSER_PARALLEL,'ok');}catch(e){BROWSER_PARALLEL=old;$('#workers').value=old;toast(e.message,'err');}}
 async function toggleTrafficSaver(){TRAFFIC_SAVER=!TRAFFIC_SAVER;try{await persistEngineSettings();toast('Traffic Saver '+(TRAFFIC_SAVER?'enabled — warmup uses less bandwidth':'disabled'),'ok');}catch(e){TRAFFIC_SAVER=!TRAFFIC_SAVER;toast(e.message,'err');}}
-async function toggleWarmupEnabled(){WARMUP_ENABLED=!WARMUP_ENABLED;try{await persistEngineSettings();toast('Pre/post-upload warmup '+(WARMUP_ENABLED?'enabled':'disabled — uploads will log in, publish, and exit'),'ok');}catch(e){WARMUP_ENABLED=!WARMUP_ENABLED;toast(e.message,'err');}}
+async function toggleWarmupEnabled(){WARMUP_ENABLED=!WARMUP_ENABLED;try{await persistEngineSettings();toast(WARMUP_ENABLED?'Прогрев ВКЛЮЧЁН — скролл рилсов до и после заливки':'Прогрев ОТКЛЮЧЁН — логин, публикация, выход','ok');}catch(e){WARMUP_ENABLED=!WARMUP_ENABLED;toast(e.message,'err');}}
 async function setUploadEngine(engine){
   if(PROCESS_BUSY)return toast('stop the current process before switching mode','err');
   if(!['manual','clean_web','api'].includes(engine))return;
