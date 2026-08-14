@@ -4229,10 +4229,38 @@ def account_lane(account: dict, args, run_id: str) -> None:
                         elif deferred_observer is not None:
                             deferred_observer.close()
                     if not cleanup.get("ready") and pending_index < len(run_assets):
-                        error = f"success dialog cleanup incomplete: {cleanup.get('status') or 'unknown'}"
-                        update_job(job_id, **partial_success_after_warmup(posted, target, error))
-                        dump.capture(page, "upload_success_cleanup_partial", error=error, force_snapshot=True)
-                        return
+                        # Diagnosed 2026-08-14: this used to return outright,
+                        # abandoning the rest of the run. A video had already
+                        # been published successfully — only the "post
+                        # shared" confirmation dialog failed to close — yet
+                        # accounts ended at 1/3 or 2/3 because of it. Across
+                        # one run seven accounts stopped this way.
+                        #
+                        # A stuck confirmation dialog says nothing about
+                        # whether the next upload can proceed; a reload
+                        # clears it along with whatever left the page
+                        # unresponsive. So: try to recover once, verify the
+                        # page is actually usable, and only give up if it
+                        # isn't. Bailing out stays the fallback, not the
+                        # first move.
+                        cleanup_status = str(cleanup.get("status") or "unknown")
+                        log(f"{name}: success dialog cleanup incomplete ({cleanup_status}) — reloading to continue", "WARNING")
+                        recovered = False
+                        try:
+                            page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=30000)
+                            page.wait_for_timeout(2000)
+                            page = ensure_single_browser_page(page, dump)
+                            recovered = bool(page.evaluate("() => !!(document.body && document.body.innerText.trim().length > 50)"))
+                        except Exception as reload_exc:
+                            log(f"{name}: reload after cleanup failure did not work: {reload_exc}", "WARNING")
+                            recovered = False
+
+                        if not recovered:
+                            error = f"success dialog cleanup incomplete: {cleanup_status}"
+                            update_job(job_id, **partial_success_after_warmup(posted, target, error))
+                            dump.capture(page, "upload_success_cleanup_partial", error=error, force_snapshot=True)
+                            return
+                        log(f"{name}: recovered after cleanup failure — continuing with remaining uploads")
                 # A confirmed publication is irreversible business evidence.
                 # Consume its asset before optional post-warmup so a later
                 # warmup warning cannot put it back into automatic retry.

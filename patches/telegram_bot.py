@@ -1222,7 +1222,41 @@ async def background_daily_digest(ctx: ContextTypes.DEFAULT_TYPE):
 # ─── Background: Upload/Story Completion Notifications ────────────────────────
 
 # Track which run_ids we've already reported
-_reported_runs: set[str] = set()
+_REPORTED_RUNS_FILE = DATA_DIR / "telegram_reported_runs.json"
+
+
+def _load_reported_runs() -> set[str]:
+    """Run IDs already announced, persisted across bot restarts.
+
+    Diagnosed 2026-08-14: this set lived only in memory, so a bot restart
+    wiped it and every finished run got announced a second time —
+    Alexander saw "Рилсы: @akpinarniy.azi.475 (3 залито)" twice in the
+    same minute. The bot restarts often (crash-loop guard, manual
+    restarts, Conflict respawns), so in-memory alone was never going to
+    hold.
+    """
+    try:
+        if _REPORTED_RUNS_FILE.exists():
+            data = json.loads(_REPORTED_RUNS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return {str(x) for x in data}
+    except Exception as e:
+        logger.debug("could not load reported runs: %s", e)
+    return set()
+
+
+def _save_reported_runs(runs: set[str]) -> None:
+    try:
+        # Keep the most recent 200 — the file is a dedupe guard, not history.
+        trimmed = list(runs)[-200:]
+        tmp = _REPORTED_RUNS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(trimmed, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, _REPORTED_RUNS_FILE)
+    except Exception as e:
+        logger.debug("could not save reported runs: %s", e)
+
+
+_reported_runs: set[str] = _load_reported_runs()
 # Buffer for batching notifications — collects events, sends one combined message
 _pending_notifications: list[str] = []
 _last_notification_flush: float = 0
@@ -1254,6 +1288,7 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
             if len(_reported_runs) > 200:
                 _reported_runs.clear()
                 _reported_runs.add(run_id)
+            _save_reported_runs(_reported_runs)
 
             account = str(job.get("account_name") or "?")
             posted = int(job.get("posted_count") or 0)
@@ -1277,8 +1312,20 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
                 else:
                     line = f"⚠️ Рилсы (частично): @{account} — {posted}/{error[:60]}"
             elif status == "failed":
-                line = f"❌ @{account}: {error[:80]}"
+                line = f"❌ @{account}: {error[:80]}" if error else f"❌ @{account}"
             elif status == "manual_required":
+                # Diagnosed 2026-08-14: sending this with an empty error
+                # produced bare "🟡 @account: " messages with nothing after
+                # the colon. It happens when the poll catches a job mid
+                # transition — status already manual_required, last_error
+                # not filled in (or already cleared) — and moments later
+                # the job settles as success. Announcing a problem with no
+                # description, for a job that turns out fine, is worse than
+                # staying quiet: skip it and let the next poll report the
+                # settled state.
+                if not error:
+                    _reported_runs.discard(run_id)
+                    continue
                 line = f"🟡 @{account}: {error[:80]}"
             elif status == "stopped":
                 line = f"🛑 @{account}"
