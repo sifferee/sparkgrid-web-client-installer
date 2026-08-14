@@ -6,7 +6,14 @@
 [CmdletBinding()]
 param()
 
-$ErrorActionPreference = 'Stop'
+# 'Continue', not 'Stop'. Diagnosed on the first real install: with
+# 'Stop', ANY line an external tool writes to stderr becomes a
+# terminating error — and pip writes ordinary warnings there ("script
+# not on PATH"). Installation died halfway through the package list over
+# a warning that means nothing. Exit codes are what actually matter for
+# external commands, and every call below checks $LASTEXITCODE
+# explicitly. PowerShell's own errors are still caught by try/catch.
+$ErrorActionPreference = 'Continue'
 # StrictMode 2.0, not Latest: 'Latest' makes any reference to a
 # non-existent property fatal, which is wrong for an installer that must
 # probe the environment it's running in. That's exactly what killed the
@@ -257,6 +264,27 @@ if ($needPython) {
         }
         Expand-Archive -Path $pyZip -DestinationPath $script:pythonDir -Force
         Remove-Item $pyZip -Force -ErrorAction SilentlyContinue
+
+        # Embeddable Python ships with 'import site' commented out in its
+        # ._pth file, which keeps site-packages off sys.path. pip then
+        # installs fine but 'python -m pip' can't find itself afterwards,
+        # and neither can any installed package. Uncommenting it is the
+        # documented way to make an embeddable build usable as a normal
+        # interpreter. Found on the first real install — pip was dead
+        # until this was fixed by hand.
+        $pthFiles = Get-ChildItem -Path $script:pythonDir -Filter 'python*._pth' -ErrorAction SilentlyContinue
+        foreach ($pth in $pthFiles) {
+            try {
+                $content = Get-Content $pth.FullName -Raw
+                if ($content -match '(?m)^\s*#\s*import\s+site') {
+                    $content = $content -replace '(?m)^\s*#\s*import\s+site', 'import site'
+                    Set-Content -Path $pth.FullName -Value $content -Encoding ASCII -NoNewline
+                    Write-OK "Включён import site в $($pth.Name) — иначе pip не работает."
+                }
+            } catch {
+                Write-Warn2 "Не удалось поправить $($pth.Name): $_"
+            }
+        }
         
         # Embeddable Python has no pip — install it
         Write-Step 'Установка pip для embeddable Python…'
@@ -359,7 +387,7 @@ foreach ($pkg in $packages) {
 
 if ($toInstall.Count -gt 0) {
     Write-Step "Устанавливаю $($toInstall.Count) пакетов: $($toInstall -join ', ')"
-    $pkgArgs = @('-m', 'pip', 'install', '--upgrade') + $toInstall
+    $pkgArgs = @('-m', 'pip', 'install', '--upgrade', '--no-warn-script-location') + $toInstall
     & $script:pythonExe @pkgArgs 2>&1 | Out-Host
     if ($LASTEXITCODE -ne 0) {
         Write-Err2 "Ошибка установки пакетов: $($toInstall -join ', ')"
