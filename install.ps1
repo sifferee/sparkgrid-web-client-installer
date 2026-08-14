@@ -168,7 +168,25 @@ if (Test-Path $script:pythonExe) {
     if (-not $sysPython) {
         try { $sysPython = (Get-Command python3 -ErrorAction Stop).Source } catch {}
     }
-    if ($sysPython -and (Test-Path $sysPython)) {
+    # Reject Python that belongs to someone else's virtual environment.
+    # The first real install found hermes-agent\venv\Scripts\python.exe on
+    # PATH and installed all 19 packages into it. Three problems with that:
+    # the packages vanish if that tool rebuilds its venv, the software ends
+    # up depending on an unrelated program, and on a buyer's machine that
+    # path doesn't exist at all. A bundled Python costs ~25MB and belongs
+    # to us.
+    $isForeignEnv = $false
+    if ($sysPython) {
+        $lowerPath = $sysPython.ToLower()
+        foreach ($marker in @('\venv\', '\.venv\', '\virtualenv\', '\hermes', '\conda', '\anaconda')) {
+            if ($lowerPath.Contains($marker)) { $isForeignEnv = $true; break }
+        }
+    }
+    if ($isForeignEnv) {
+        Write-Warn2 "Найден Python внутри чужого окружения ($sysPython) — не используем его."
+        Write-Host "  Установим собственный Python, чтобы SparkGrid ни от чего не зависел."
+    }
+    elseif ($sysPython -and (Test-Path $sysPython)) {
         if (Test-PythonOK $sysPython) {
             $v = Get-PythonVersion $sysPython
             Write-OK "Системный Python найден: $($v.Raw) ($sysPython). Используем его."
