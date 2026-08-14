@@ -7,7 +7,23 @@
 param()
 
 $ErrorActionPreference = 'Stop'
-Set-StrictMode -Version Latest
+# StrictMode 2.0, not Latest: 'Latest' makes any reference to a
+# non-existent property fatal, which is wrong for an installer that must
+# probe the environment it's running in. That's exactly what killed the
+# first real run — $PSVersionTable.Platform doesn't exist on Windows
+# PowerShell 5.1, and the script died on line 37 before doing anything.
+Set-StrictMode -Version 2.0
+
+# Windows PowerShell 5.1 defaults to TLS 1.0/1.1, which python.org and
+# bootstrap.pypa.io no longer accept — every download would fail with an
+# opaque "Could not create SSL/TLS secure channel". Enabling TLS 1.2 must
+# happen before the first web request. Written as a bitwise OR so any
+# protocol already enabled is preserved.
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+} catch {
+    Write-Warning "Не удалось включить TLS 1.2: $_"
+}
 
 $script:currentUser   = $env:USERNAME
 $script:installDir    = 'C:\Program Files\SparkGrid Web Client'
@@ -34,7 +50,18 @@ function Write-Err2  { param([string]$msg) Write-Host "[!] $msg" -ForegroundColo
 Write-Step 'Шаг 1: Проверка окружения…'
 
 # OS check
-if ($PSVersionTable.Platform -and $PSVersionTable.Platform -ne 'Win32NT') {
+# Windows check that works on both Windows PowerShell 5.1 and
+# PowerShell 7+. $PSVersionTable.Platform only exists from PS6 onward, so
+# reading it directly breaks on 5.1 — which is what ships with Windows
+# Server and what Alexander's VPS runs. [Environment]::OSVersion is
+# present in every version.
+$isWindowsOS = $true
+try {
+    $isWindowsOS = [Environment]::OSVersion.Platform -eq 'Win32NT'
+} catch {
+    $isWindowsOS = $true  # can't tell -> assume Windows, the installer is Windows-only anyway
+}
+if (-not $isWindowsOS) {
     Write-Err2 'Этот скрипт предназначен только для Windows.'
     exit 1
 }
@@ -164,6 +191,13 @@ if ($needPython) {
     Write-Host "  Скачивание: $pyUrl"
     try {
         Invoke-WebRequest -Uri $pyUrl -OutFile $pyZip -UseBasicParsing -ErrorAction Stop
+        # A download can "succeed" and still leave a truncated or empty
+        # file — a dropped connection, a proxy error page. Unpacking that
+        # fails later with something confusing, so check the size now
+        # while we still know what went wrong.
+        if (-not (Test-Path $pyZip) -or (Get-Item $pyZip).Length -lt 1MB) {
+            throw "Скачанный файл повреждён или пуст"
+        }
     } catch {
         Write-Warn2 "Не удалось скачать embeddable Python: $_"
         Write-Step 'Пробую установщик python.org (exe)...'
@@ -171,6 +205,9 @@ if ($needPython) {
         $installerPath = Join-Path $env:TEMP "python-$pyVer-amd64.exe"
         try {
             Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+            if (-not (Test-Path $installerPath) -or (Get-Item $installerPath).Length -lt 5MB) {
+                throw "Установщик Python скачан повреждённым"
+            }
             Write-Host "  Запуск установщика (silent, для всех пользователей)…"
             $installProc = Start-Process -FilePath $installerPath -ArgumentList '/quiet','InstallAllUsers=1','PrependPath=1','Include_pip=1' -Wait -PassThru
             if ($installProc.ExitCode -ne 0) {
@@ -208,6 +245,9 @@ if ($needPython) {
         $getPip = Join-Path $env:TEMP 'get-pip.py'
         try {
             Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $getPip -UseBasicParsing -ErrorAction Stop
+            if (-not (Test-Path $getPip) -or (Get-Item $getPip).Length -lt 10KB) {
+                throw "get-pip.py скачан повреждённым"
+            }
             & $script:pythonExe $getPip --no-warn-script-location 2>&1 | Out-Host
         } catch {
             Write-Err2 "Не удалось установить pip: $_"
@@ -233,6 +273,9 @@ if (Test-PipOK $script:pythonExe) {
     $getPip = Join-Path $env:TEMP 'get-pip.py'
     try {
         Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile $getPip -UseBasicParsing -ErrorAction Stop
+        if (-not (Test-Path $getPip) -or (Get-Item $getPip).Length -lt 10KB) {
+            throw "get-pip.py скачан повреждённым"
+        }
         & $script:pythonExe $getPip --no-warn-script-location 2>&1 | Out-Host
     } catch {
         Write-Err2 "Не удалось установить pip: $_"
