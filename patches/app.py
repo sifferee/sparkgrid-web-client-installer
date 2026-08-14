@@ -2455,6 +2455,7 @@ def overview() -> dict[str, Any]:
                    web_upload_cookie_status, web_upload_last_error,
                    web_upload_last_upload_at, web_upload_cooldown_until,
                    COALESCE(a.web_upload_last_login_at,'') AS web_upload_last_login_at,
+                   COALESCE(a.web_upload_session_checked_at,'') AS web_upload_session_checked_at,
                    COALESCE(a.created_at,'') AS created_at,
                    web_upload_content_mode, COALESCE(web_upload_quality_niche,'') AS web_upload_quality_niche,
                    COALESCE(web_upload_scale_niche,'') AS web_upload_scale_niche,
@@ -3784,7 +3785,19 @@ async def start_upload(request: Request) -> JSONResponse:
         return response_error("Manual mode opens an account profile; it does not start automatic publishing")
     api_parallel = max(1, min(int(body.get("api_parallel") or body.get("parallel") or current["api_parallel"]), 100))
     browser_parallel = max(1, min(int(body.get("browser_parallel") or body.get("max_workers") or current["browser_parallel"]), 50))
-    save_upload_settings(engine, api_parallel, browser_parallel)
+    # Diagnosed 2026-08-14: this call used to omit traffic_saver and
+    # warmup_enabled, and save_upload_settings defaults a missing
+    # warmup_enabled back to "on". So every single upload silently reset
+    # the Settings toggle — Alexander would tick "disable warmup", press
+    # upload, and watch the checkbox clear itself while warmup ran anyway.
+    # Worse, the code below then re-reads the settings it just clobbered.
+    # Pass the current values through so starting an upload doesn't mutate
+    # unrelated preferences.
+    save_upload_settings(
+        engine, api_parallel, browser_parallel,
+        str(current.get("traffic_saver") or "off"),
+        str(current.get("warmup_enabled") or "on"),
+    )
 
     operation = "api" if engine == "api" else "clean_web"
     # Compatibility marker for the original explicit API command: "--parallel", str(api_parallel)

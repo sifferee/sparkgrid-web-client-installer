@@ -100,6 +100,14 @@ def ensure_automation_schema(conn: sqlite3.Connection) -> None:
     account_cols = _columns(conn, "accounts")
     if account_cols and "web_upload_last_login_at" not in account_cols:
         conn.execute("ALTER TABLE accounts ADD COLUMN web_upload_last_login_at TEXT NOT NULL DEFAULT ''")
+    # Added 2026-08-14: /session showed "last: <date>" taken from
+    # web_upload_last_login_at, i.e. the last time credentials were actually
+    # entered — often days old, since a session check only verifies an
+    # existing session and never re-logs in. Reading that next to a session
+    # check result implied the check itself was stale. This column records
+    # when the check ran, so the bot can show what it actually means.
+    if account_cols and "web_upload_session_checked_at" not in account_cols:
+        conn.execute("ALTER TABLE accounts ADD COLUMN web_upload_session_checked_at TEXT NOT NULL DEFAULT ''")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_automation_slots_due "
         "ON automation_plan_slots(status, scheduled_for, id)"

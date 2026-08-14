@@ -650,9 +650,14 @@ async def _run_session_check(update_or_query):
     for a in accounts:
         status = a.get("web_upload_login_status", "unknown")
         name = a.get("name", "?")
-        last_login = a.get("web_upload_last_login_at", "")
+        # Show when the CHECK ran, not when credentials were last entered.
+        # "last: 2026-08-10" next to a fresh check result read as "this
+        # result is 4 days old", when in fact it was the login date — a
+        # session check verifies an existing session and never re-logs in,
+        # so that date legitimately stays put for weeks.
+        checked = a.get("web_upload_session_checked_at", "")
         if status == "logged_in" and is_account_usable(a):
-            active.append(f"✅ @{name} (last: {last_login[:16] if last_login else '—'})")
+            active.append(f"✅ @{name} (проверен: {checked[:16] if checked else '—'})")
         elif status in ("suspended", "incorrect_credentials", "consent_failed", "manual_required", "browser_internal_error"):
             expired.append(f"❌ @{name} — {status}")
         else:

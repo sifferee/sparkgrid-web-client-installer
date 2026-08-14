@@ -7485,7 +7485,8 @@ def do_check_login(account: dict, args, run_id: str):
             # retain the prior account state so it is neither quarantined nor
             # highlighted as a lasting account problem.
             if state != "blocking_dialog_not_dismissed":
-                update_account(name, web_upload_login_status=state, web_upload_last_error="" if state == "logged_in" else reason)
+                update_account(name, web_upload_login_status=state, web_upload_last_error="" if state == "logged_in" else reason,
+                               web_upload_session_checked_at=now_iso())
             update_job(job, status="success" if state == "logged_in" else "manual_required", current_step=state, last_error="" if state == "logged_in" else reason, finished_at=now_iso())
             try:
                 if (
