@@ -34,7 +34,10 @@ AGENTS.md         — shared memory between Claude/Qwen/Hermes agents
   pip install fastapi uvicorn playwright pydantic pyotp aiohttp requests
   pip install camoufox[geoip] browserforge pillow lxml pyyaml
   pip install python-telegram-bot[job-queue] anthropic
+  pip install cryptography numpy imageio-ffmpeg platformdirs PySocks
   ```
+  Full list (all 20 packages):
+  `fastapi uvicorn playwright pydantic pyotp aiohttp requests camoufox[geoip] browserforge pillow lxml pyyaml python-telegram-bot[job-queue] anthropic cryptography numpy imageio-ffmpeg platformdirs PySocks`
 - Playwright browsers: `python -m playwright install chromium`
 - Camoufox: `python -m camoufox fetch`
 
@@ -81,13 +84,32 @@ SparkGrid-services/bot/stop_bot.ps1            — recursive tree kill + 5s Tele
 
 ## Quick Start
 
+### Automated install (recommended for clean Windows servers)
+
 1. Clone the repo
-2. Install Python dependencies (see above)
-3. Create `secrets.local.ps1` with your API keys
-4. Set `SPARKGRID_DATA_DIR` 
-5. Copy `patches/*.py` to your install `_internal/` directory
-6. Run: `python app.py` (starts FastAPI on port 8770)
+2. Run `install.ps1` as Administrator — installs Python, all dependencies, Camoufox/Playwright, service scripts, disables screen saver
+3. Open `http://127.0.0.1:8770/setup` in a browser
+4. Enter your API keys (Telegram token, chat ID, Anthropic key, AdsPower key)
+5. Click "Проверить" to verify each key
+6. Click "Перезапустить бота" to start the bot with the new keys
 7. Dashboard: `http://127.0.0.1:8770/dashboard`
+
+### Manual install
+
+1. Clone the repo
+2. Install Python 3.11+ and all dependencies (see above)
+3. Run `python -m playwright install chromium` and `python -m camoufox fetch`
+4. Create `secrets.local.ps1` with your API keys (see below)
+5. Set `SPARKGRID_DATA_DIR` 
+6. Copy `patches/*.py` to your install `_internal/` directory
+7. Run: `python app.py` (starts FastAPI on port 8770)
+8. Dashboard: `http://127.0.0.1:8770/dashboard`
+
+### Setup page (key entry without secrets.local.ps1)
+
+If `secrets.local.ps1` is absent, keys can be entered via the web UI at `/setup`.
+Keys are stored in the `ads_power_config` table in `bot.db`. `start_bot.ps1` reads
+from this table when `secrets.local.ps1` is not found.
 
 ## Known Issues
 

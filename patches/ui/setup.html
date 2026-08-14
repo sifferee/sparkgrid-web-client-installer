@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SparkGrid — Настройка ключей</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --card: #1a1d27;
+  --border: #2a2d3a;
+  --text: #e4e6eb;
+  --muted: #8b8fa3;
+  --accent: #5b8def;
+  --accent-hover: #4a7de0;
+  --success: #4caf50;
+  --error: #f44336;
+  --warn: #ff9800;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  padding: 40px 20px;
+}
+.container { max-width: 720px; margin: 0 auto; }
+h1 { font-size: 1.6rem; margin-bottom: 8px; }
+.subtitle { color: var(--muted); margin-bottom: 32px; font-size: 0.95rem; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 20px;
+}
+.card h2 { font-size: 1.1rem; margin-bottom: 16px; }
+.field { margin-bottom: 16px; }
+.field:last-child { margin-bottom: 0; }
+.field label {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.field-row { display: flex; gap: 8px; align-items: center; }
+.field input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  color: var(--text);
+  font-size: 0.9rem;
+  font-family: monospace;
+}
+.field input:focus { outline: none; border-color: var(--accent); }
+.field input::placeholder { color: var(--muted); opacity: 0.5; }
+.btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 10px 18px;
+  font-size: 0.85rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.2s;
+}
+.btn:hover { background: var(--accent-hover); }
+.btn-secondary {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.btn-secondary:hover { border-color: var(--accent); }
+.btn-save {
+  width: 100%;
+  padding: 14px;
+  font-size: 1rem;
+  margin-top: 8px;
+}
+.status {
+  font-size: 0.8rem;
+  margin-left: 8px;
+  white-space: nowrap;
+}
+.status.ok { color: var(--success); }
+.status.fail { color: var(--error); }
+.status.checking { color: var(--warn); }
+.hint { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
+.actions { display: flex; gap: 12px; margin-top: 24px; }
+.actions .btn { flex: 1; }
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 24px;
+  font-size: 0.9rem;
+  opacity: 0;
+  transition: opacity 0.3s;
+  pointer-events: none;
+  z-index: 100;
+}
+.toast.show { opacity: 1; }
+.toast.ok { border-color: var(--success); }
+.toast.fail { border-color: var(--error); }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>SparkGrid — Настройка</h1>
+  <p class="subtitle">Введите ключи и токены. Кнопка «Проверить» проверяет каждый ключ прямо здесь.</p>
+
+  <div class="card">
+    <h2>Telegram-бот</h2>
+    <div class="field">
+      <label>Токен бота</label>
+      <div class="field-row">
+        <input type="password" id="tg_token" placeholder="123456789:ABC-DEF-ghi..." />
+        <button class="btn btn-secondary" onclick="checkKey('tg_token', 'telegram')">Проверить</button>
+        <span class="status" id="status_tg_token"></span>
+      </div>
+    </div>
+    <div class="field">
+      <label>ID чата (ваш ID в Telegram)</label>
+      <div class="field-row">
+        <input type="text" id="tg_chat_id" placeholder="123456789" />
+        <button class="btn btn-secondary" onclick="checkKey('tg_chat_id', 'telegram_chat')">Проверить</button>
+        <span class="status" id="status_tg_chat_id"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Anthropic (распознавание через зрение)</h2>
+    <div class="field">
+      <label>API-ключ</label>
+      <div class="field-row">
+        <input type="password" id="anthropic_key" placeholder="sk-ant-..." />
+        <button class="btn btn-secondary" onclick="checkKey('anthropic_key', 'anthropic')">Проверить</button>
+        <span class="status" id="status_anthropic_key"></span>
+      </div>
+    </div>
+    <div class="field">
+      <label>Базовый URL</label>
+      <div class="field-row">
+        <input type="text" id="anthropic_url" placeholder="https://api.apiyi.com" />
+      </div>
+      <p class="hint">Без /v1 в конце. По умолчанию: https://api.apiyi.com</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>AdsPower</h2>
+    <div class="field">
+      <label>API-ключ</label>
+      <div class="field-row">
+        <input type="password" id="adspower_key" placeholder="1052c3b3..." />
+        <button class="btn btn-secondary" onclick="checkKey('adspower_key', 'adspower')">Проверить</button>
+        <span class="status" id="status_adspower_key"></span>
+      </div>
+    </div>
+    <div class="field">
+      <label>API-адрес</label>
+      <div class="field-row">
+        <input type="text" id="adspower_url" placeholder="http://local.adspower.net:50325" />
+      </div>
+      <p class="hint">По умолчанию: http://local.adspower.net:50325</p>
+    </div>
+  </div>
+
+  <button class="btn btn-save" onclick="saveAll()">Сохранить все</button>
+
+  <div class="actions">
+    <button class="btn" onclick="restartBot()">Перезапустить бота</button>
+    <button class="btn btn-secondary" onclick="restartSoftware()">Перезапустить софт</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+function maskVal(v) {
+  if (!v) return '';
+  if (v.length <= 4) return '••••';
+  return '••••' + v.slice(-4);
+}
+
+function setStatus(id, state, msg) {
+  const el = document.getElementById('status_' + id);
+  el.textContent = msg;
+  el.className = 'status ' + state;
+}
+
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/setup/config');
+    const d = await r.json();
+    if (d.ok) {
+      const cfg = d.config || {};
+      if (cfg.telegram_bot_token) document.getElementById('tg_token').value = cfg.telegram_bot_token;
+      if (cfg.telegram_chat_id) document.getElementById('tg_chat_id').value = cfg.telegram_chat_id;
+      if (cfg.anthropic_api_key) document.getElementById('anthropic_key').value = cfg.anthropic_api_key;
+      document.getElementById('anthropic_url').value = cfg.anthropic_base_url || 'https://api.apiyi.com';
+      if (cfg.ads_power_api_key) document.getElementById('adspower_key').value = cfg.ads_power_api_key;
+      document.getElementById('adspower_url').value = cfg.ads_power_api_url || 'http://local.adspower.net:50325';
+
+      // Show masked if already saved but field not edited
+      ['tg_token','anthropic_key','adspower_key'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el.value) {
+          const orig = el.value;
+          el.dataset.saved = orig;
+          el.value = maskVal(orig);
+          el.addEventListener('focus', function handler() {
+            if (el.dataset.saved && el.value === maskVal(el.dataset.saved)) {
+              el.value = '';
+            }
+            el.removeEventListener('focus', handler);
+          });
+        }
+      });
+    }
+  } catch(e) { console.error(e); }
+}
+
+function collectConfig() {
+  const cfg = {};
+  const tg = document.getElementById('tg_token');
+  cfg.telegram_bot_token = (tg.dataset.saved && tg.value === maskVal(tg.dataset.saved)) ? tg.dataset.saved : tg.value;
+  cfg.telegram_chat_id = document.getElementById('tg_chat_id').value;
+  const ak = document.getElementById('anthropic_key');
+  cfg.anthropic_api_key = (ak.dataset.saved && ak.value === maskVal(ak.dataset.saved)) ? ak.dataset.saved : ak.value;
+  cfg.anthropic_base_url = document.getElementById('anthropic_url').value;
+  const ap = document.getElementById('adspower_key');
+  cfg.ads_power_api_key = (ap.dataset.saved && ap.value === maskVal(ap.dataset.saved)) ? ap.dataset.saved : ap.value;
+  cfg.ads_power_api_url = document.getElementById('adspower_url').value;
+  return cfg;
+}
+
+async function checkKey(fieldId, kind) {
+  const val = document.getElementById(fieldId).value;
+  if (!val || val.startsWith('\u2022\u2022') || val.startsWith('••')) {
+    setStatus(fieldId, 'fail', 'Введите значение');
+    return;
+  }
+  setStatus(fieldId, 'checking', 'Проверка...');
+  try {
+    const cfg = collectConfig();
+    const r = await fetch('/api/setup/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kind: kind, config: cfg})
+    });
+    const d = await r.json();
+    if (d.ok) {
+      setStatus(fieldId, 'ok', '✓ ' + (d.message || 'OK'));
+    } else {
+      setStatus(fieldId, 'fail', '✗ ' + (d.error || 'Ошибка'));
+    }
+  } catch(e) {
+    setStatus(fieldId, 'fail', '✗ ' + e.message);
+  }
+}
+
+function showToast(msg, ok) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + (ok ? 'ok' : 'fail');
+  setTimeout(() => t.className = 'toast', 3000);
+}
+
+async function saveAll() {
+  try {
+    const cfg = collectConfig();
+    const r = await fetch('/api/setup/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(cfg)
+    });
+    const d = await r.json();
+    if (d.ok) {
+      showToast('Сохранено', true);
+      // Reload to apply masking
+      setTimeout(() => location.reload(), 800);
+    } else {
+      showToast('Ошибка: ' + (d.error || ''), false);
+    }
+  } catch(e) {
+    showToast('Ошибка: ' + e.message, false);
+  }
+}
+
+async function restartBot() {
+  showToast('Перезапуск бота...', true);
+  try {
+    const r = await fetch('/api/setup/restart-bot', {method: 'POST'});
+    const d = await r.json();
+    showToast(d.ok ? 'Бот перезапущен' : ('Ошибка: ' + (d.error||'')), d.ok);
+  } catch(e) { showToast(e.message, false); }
+}
+
+async function restartSoftware() {
+  showToast('Перезапуск софта...', true);
+  try {
+    const r = await fetch('/api/setup/restart-software', {method: 'POST'});
+    const d = await r.json();
+    showToast(d.ok ? 'Софт перезапущен' : ('Ошибка: ' + (d.error||'')), d.ok);
+  } catch(e) { showToast(e.message, false); }
+}
+
+loadConfig();
+</script>
+</body>
+</html>
