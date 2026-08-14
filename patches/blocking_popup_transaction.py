@@ -1087,10 +1087,36 @@ def resolve_typed_consent_chain(
             ads_step=observed.get("ads_step") or "",
         )
         if observed.get("document_category") == "browser_internal_error":
-            _emit_consent_event(
-                event_fn, "consent_chain_failed", reason="browser_internal_error"
-            )
-            return {"handled": handled, "ok": False, "step": "browser_internal_error"}
+            # Diagnosed 2026-08-14: this label is misleading. It comes from
+            # _INSPECT_SCRIPT's `location.protocol` guard, i.e. "the tab
+            # isn't on an http(s) page" — about:blank and friends. Nothing
+            # is broken; we're simply looking at the wrong page. It bit
+            # lilliancanx after its second video: the success dialog closed
+            # cleanly, the tab ended up on a blank page, and the consent
+            # check for video three failed instantly, ending the run at
+            # 2/3.
+            #
+            # Navigating back to Instagram costs one page load and recovers
+            # the run. Only if that doesn't produce an http(s) page do we
+            # give up — a genuinely dead tab still fails, just not a
+            # merely misplaced one.
+            recovered = False
+            try:
+                page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
+                recovered = bool(page.evaluate("() => /^https?:$/.test(location.protocol)"))
+            except Exception as nav_exc:
+                logger.debug("consent recovery navigation failed: %s", nav_exc)
+                recovered = False
+            if recovered:
+                _emit_consent_event(event_fn, "consent_recovered_after_blank_page")
+                observed = inspect_topmost_blocker(page)
+                category = str(observed.get("category") or "")
+            else:
+                _emit_consent_event(
+                    event_fn, "consent_chain_failed", reason="browser_internal_error"
+                )
+                return {"handled": handled, "ok": False, "step": "browser_internal_error"}
         if category == "notifications_prompt":
             # The JS side already classifies this AND knows the safe action
             # (dismiss_not_now) — but this category is also in

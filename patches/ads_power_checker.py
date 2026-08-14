@@ -654,6 +654,18 @@ def _run_browser_session(ws_url: str, targets: list[dict[str, Any]], profile_id:
                 
                 for target in targets:
                     username = target["name"]
+                    # Memory can drop mid-cycle when an upload spins up more
+                    # browsers. Stop cleanly instead of pushing the box into
+                    # a MemoryError — accounts already checked keep their
+                    # fresh snapshots, and the "least recently checked
+                    # first" ordering means whoever was skipped goes to the
+                    # front of the queue next time. A partial cycle is fine;
+                    # a crashed upload is not.
+                    free_now = _free_memory_mb()
+                    if free_now < MEMORY_ABORT_MB:
+                        log(f"Stopping cycle early: only {free_now:.0f}MB free "
+                            f"(checked {checked}/{len(targets)}) — rest continues next cycle", "WARNING")
+                        break
                     try:
                         log(f"Checking @{username}...")
                         
@@ -789,14 +801,77 @@ def run_once() -> int:
         conn.close()
 
 
+def _free_memory_mb() -> float:
+    """Free physical RAM in MB. Returns a large number if it can't be read,
+    so an unreadable value never blocks collection."""
+    if os.name != "nt":
+        return 1e9
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+        return stat.ullAvailPhys / (1024 * 1024)
+    except Exception:
+        return 1e9
+
+
+# Memory thresholds, in MB. An AdsPower browser needs roughly 700MB-1GB;
+# the rest is headroom so an in-flight upload can still open a browser.
+MEMORY_NEEDED_MB = float(os.environ.get("METRICS_MIN_FREE_MB", "3000") or 3000)
+# When metrics are badly overdue, accept a tighter margin rather than let
+# the data go completely stale.
+MEMORY_NEEDED_OVERDUE_MB = float(os.environ.get("METRICS_MIN_FREE_OVERDUE_MB", "1500") or 1500)
+# Abort mid-cycle below this — an upload is clearly squeezing us out.
+MEMORY_ABORT_MB = float(os.environ.get("METRICS_ABORT_FREE_MB", "1000") or 1000)
+OVERDUE_AFTER_HOURS = float(os.environ.get("METRICS_OVERDUE_HOURS", "6") or 6)
+RETRY_WHEN_BUSY_MINUTES = float(os.environ.get("METRICS_RETRY_BUSY_MIN", "10") or 10)
+
+
+def _memory_allows_cycle() -> tuple[bool, str]:
+    """Whether there's room to run a collection cycle right now.
+
+    Diagnosed 2026-08-14: the previous rule was "an upload is running ->
+    skip this cycle", which looked reasonable at 20 accounts and falls
+    apart at 200: an upload run lasting hours meant metrics were never
+    collected at all — the bigger the fleet, the less the parser worked,
+    exactly backwards. What actually matters is free RAM, not whether
+    some other job exists, so measure that instead.
+
+    Being overdue relaxes the threshold: stale data is its own problem,
+    and a long upload shouldn't starve collection indefinitely.
+    """
+    free_mb = _free_memory_mb()
+    overdue_h = _minutes_since_last_check() / 60.0
+    is_overdue = overdue_h >= OVERDUE_AFTER_HOURS
+    needed = MEMORY_NEEDED_OVERDUE_MB if is_overdue else MEMORY_NEEDED_MB
+    if free_mb >= needed:
+        return True, f"free {free_mb:.0f}MB >= {needed:.0f}MB"
+    return False, (
+        f"free {free_mb:.0f}MB < {needed:.0f}MB needed"
+        + (f" (overdue {overdue_h:.1f}h, relaxed threshold)" if is_overdue else "")
+    )
+
+
 def _upload_in_progress() -> bool:
     """True when an upload/workflow job is currently running.
 
-    The checker and the upload workers both spawn browsers, and on this
-    16GB VPS they genuinely compete: 4 parallel Camoufox already produced
-    a MemoryError with ~4.7GB free. Metrics are never urgent — deferring a
-    cycle by one interval costs nothing, whereas starving an upload of
-    memory mid-run costs a real publish. So uploads always win.
+    Kept for logging context only — it no longer gates collection by
+    itself. See _memory_allows_cycle for why.
     """
     try:
         conn = _db_conn()
@@ -846,15 +921,27 @@ def _checker_loop() -> None:
         log(f"Last check was {elapsed:.0f} min ago — waiting {wait_min:.0f} min before first cycle")
         time.sleep(wait_min * 60)
     while True:
+        retry_soon = False
         try:
             if not CHECKER_ENABLED:
                 log("Checker disabled, skipping cycle")
-            elif _upload_in_progress():
-                log("Upload in progress — skipping this metrics cycle (uploads get memory priority)")
             else:
-                run_once()
+                allowed, reason = _memory_allows_cycle()
+                if allowed:
+                    if _upload_in_progress():
+                        log(f"Upload running but memory is fine ({reason}) — collecting anyway")
+                    run_once()
+                else:
+                    log(f"Not enough memory for a cycle: {reason} — retrying in {RETRY_WHEN_BUSY_MINUTES:.0f} min")
+                    retry_soon = True
         except Exception as e:
             log(f"Loop error: {e}", "ERROR")
+
+        if retry_soon:
+            # Short wait, not a full interval: during a long upload run the
+            # hourly wait meant metrics never ran at all.
+            time.sleep(RETRY_WHEN_BUSY_MINUTES * 60)
+            continue
 
         # Random sleep 55-75 minutes
         sleep_min = random.uniform(BASE_INTERVAL_MIN, BASE_INTERVAL_MAX)

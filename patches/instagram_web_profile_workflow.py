@@ -1471,19 +1471,14 @@ def get_state(page) -> tuple[str, str]:
     auth_state = str(auth_goal.get("state") or "")
     if auth_state in strong_auth_states:
         return strong_auth_states[auth_state]
-    # Instagram sometimes uses /accounts/suspended for a reversible human
-    # confirmation flow. Do not misclassify that screen as a permanent ban.
-    if (
-        ("/accounts/suspended" in url or "/suspended" in url)
-        and any(s in txt for s in [
-            "confirm you're human",
-            "confirm you’re human",
-            "takes about 30 seconds",
-            "prove you're human",
-            "prove you’re human",
-        ])
-    ):
-        return "checkpoint", "human confirmation required"
+    # Changed 2026-08-14 at Alexander's explicit instruction: any redirect
+    # to /accounts/suspended counts as blocked, including the "confirm
+    # you're human" variant. Previously that screen was treated as a
+    # reversible checkpoint, so accounts like c32544408 and jacquelinezk1s
+    # sat in limbo instead of being flagged. His reasoning: the redirect
+    # itself is the evidence — an account Instagram has parked on that
+    # page isn't usable either way, and he'd rather see it in the blocked
+    # list and decide himself than have the software keep retrying it.
     if "/accounts/suspended" in url or "/suspended" in url or any(
         s in txt for s in ["we suspended your account", "account has been suspended",
                            "dein konto wurde gesperrt", "konto gesperrt"]):

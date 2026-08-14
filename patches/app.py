@@ -3815,7 +3815,22 @@ async def start_upload(request: Request) -> JSONResponse:
     # Every saved connection is one lane. Accounts sharing the same mobile
     # proxy remain sequential with rotation; distinct mobile connections and
     # static connections with unique exit IPs may run in parallel.
-    lane_parallel = api_parallel if engine == "api" else browser_parallel
+    # Reserve one browser slot for Stories (Alexander's design, 14.08).
+    # Story publishing runs as its own scheduler process with --parallel 1,
+    # so without this reservation an upload at the configured limit N plus
+    # a story trigger would put N+1 browsers on the box — on a 16GB VPS
+    # that is exactly how MemoryError happened. Taking one off the upload
+    # side keeps the total at N no matter when a story fires, and means a
+    # story never has to wait for an upload slot to free up.
+    #
+    # The slot stays reserved even when no story is pending: predictable
+    # capacity is worth more than the occasional idle browser, and a story
+    # that has to queue behind a long upload is a missed posting window.
+    # API mode is untouched — it doesn't open browsers.
+    if engine == "api":
+        lane_parallel = api_parallel
+    else:
+        lane_parallel = max(1, browser_parallel - 1)
     current_upload_settings = upload_settings()
     warmup_is_enabled = str(current_upload_settings.get("warmup_enabled") or "on") == "on"
     # Defaults follow the persisted Settings toggle (Александр's request
