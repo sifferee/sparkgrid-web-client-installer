@@ -637,16 +637,30 @@ $scriptArgs = "_internal\telegram_bot.py"
 $logFile    = "C:\Users\<USER>\SparkGrid-services\bot\run.log"
 $pidFile    = "C:\Users\<USER>\SparkGrid-services\bot\run.pid"
 
-# Load secrets (API keys, tokens) from local file if present
+# Load secrets. Order matters: database FIRST, then secrets.local.ps1 on
+# top.
+#
+# Diagnosed 2026-08-14 right after the server move: the database was only
+# consulted when secrets.local.ps1 was ABSENT. Alexander had entered his
+# keys on the /setup page (so they were in the database) but the old
+# secrets file had also been copied over from the previous server — so
+# the file won, the database was never read, and TELEGRAM_CHAT_ID stayed
+# empty even though he'd just typed it in.
+#
+# Reading both, database first, means values entered through /setup
+# always apply, while an existing secrets.local.ps1 can still override
+# them — which keeps older installs working exactly as before.
 $secretsFile = Join-Path $PSScriptRoot "secrets.local.ps1"
+$botDb = "C:\Users\<USER>\AppData\Local\SparkGrid\data\bot.db"
+# secrets.local.ps1 first, database SECOND — whatever Alexander typed on
+# the /setup page wins. It's the interface he actually uses; a stale file
+# lying next to the script must never silently override it. The file
+# stays supported for values that were never entered through /setup.
 if (Test-Path $secretsFile) {
     . $secretsFile
-} else {
-    Write-Warning "secrets.local.ps1 не найден рядом со скриптом"
-    # Try reading secrets from bot.db ads_power_config table
-    $botDb = "C:\Users\<USER>\AppData\Local\SparkGrid\data\bot.db"
-    if (Test-Path $botDb) {
-        Write-Host "Чтение секретов из bot.db…"
+}
+if (Test-Path $botDb) {
+    Write-Host "Чтение секретов из bot.db (настройки софта имеют приоритет)…"
         try {
             $dbResult = & $exe -c @"
 import sqlite3, json
@@ -668,9 +682,8 @@ conn.close()
                     Set-Item -Path "env:$key" -Value $val
                 }
             }
-        } catch {
-            Write-Warning "Не удалось прочитать секреты из bot.db: $_"
-        }
+    } catch {
+        Write-Warning "Не удалось прочитать секреты из bot.db: $_"
     }
 }
 
