@@ -3945,15 +3945,28 @@ def account_lane(account: dict, args, run_id: str) -> None:
     if run_assets and not forced_retry:
         planned_slot_count = len(run_assets)
         first_planned_asset = int(run_assets[0].get("id") or 0)
+        # Diagnosed 2026-08-14: campaign identity used to be derived only
+        # from the asset and the cycle counter, so launching an upload
+        # again before the cycle advanced produced the SAME identity —
+        # the new run joined the previous campaign, saw 2 of 3 slots
+        # already accepted, published one video and reported "3/3 done".
+        # Alexander's expectation is simple and explicit: one launch = 3
+        # videos, every time. Including run_id makes every launch its own
+        # campaign, so progress always starts at zero.
+        #
+        # Safe with respect to duplicate uploads: which assets get posted
+        # is decided by the content plan (next_plan_set / reserve_asset)
+        # above, not by this identity — the identity only groups slots for
+        # progress tracking.
         if content_mode == "quality":
             campaign_run_identity = f"quality:{run_id}"
         elif configured_set and configured_set.get("strategy") == "custom":
             campaign_run_identity = (
                 f"scale-custom:set-{int(configured_set.get('set_id') or 0)}:"
-                f"cycle-{cycle_count}"
+                f"cycle-{cycle_count}:run-{run_id}"
             )
         else:
-            campaign_run_identity = f"scale-standard:asset-{first_planned_asset}:cycle-{cycle_count}"
+            campaign_run_identity = f"scale-standard:asset-{first_planned_asset}:cycle-{cycle_count}:run-{run_id}"
         for slot_order, item in enumerate(run_assets, start=1):
             plan_item_id = int(item.get("plan_item_id") or 0)
             item["slot_key"] = (
