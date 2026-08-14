@@ -586,9 +586,10 @@ conn.close()
 }
 
 # Environment variables
-# TELEGRAM_CHAT_ID: use from DB if set, otherwise fall back to saved default
+# TELEGRAM_CHAT_ID: must be set via /setup page or secrets.local.ps1
+# If not set, bot will log a warning and notifications won't work.
 if (-not $env:TELEGRAM_CHAT_ID) {
-    $env:TELEGRAM_CHAT_ID = "8149084076"
+    Write-Warning "TELEGRAM_CHAT_ID не задан. Уведомления бота работать не будут. Настройте через http://127.0.0.1:8770/setup"
 }
 $env:SPARKGRID_API_URL  = "http://127.0.0.1:8770"
 $env:SPARKGRID_DATA_DIR = "C:\Users\<USER>\AppData\Local\SparkGrid\data"
