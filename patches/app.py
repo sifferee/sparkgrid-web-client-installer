@@ -2042,6 +2042,24 @@ def upload_settings(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             conn.close()
 
 
+def _headless_from_settings(body: dict[str, Any]) -> bool:
+    """Whether to launch browsers hidden for this request.
+
+    An explicit "headless" in the body wins; otherwise fall back to the
+    Background Web toggle in Settings.
+
+    Added 2026-08-14: only the upload path consulted the setting, so
+    session checks, logins, warmups and account onboarding kept opening
+    visible windows no matter what the toggle said. Visible windows are
+    what freeze when the RDP session is minimised, so those operations
+    stalled exactly like uploads used to.
+    """
+    requested = body.get("headless")
+    if requested is None:
+        return str(upload_settings().get("background_web") or "off") == "on"
+    return bool(requested)
+
+
 def current_browser_parallel() -> int:
     return int(upload_settings().get("browser_parallel") or 3)
 
@@ -3458,7 +3476,7 @@ async def onboard_accounts(request: Request) -> JSONResponse:
             command.append("--show-category")
     if bool(body.get("no_proxy")):
         command.append("--no-proxy")
-    if bool(body.get("headless")):
+    if _headless_from_settings(body):
         command.append("--headless")
     return start_process(command, f"account onboarding: {len(names)} account(s)")
 
@@ -3698,7 +3716,7 @@ async def workflow(request: Request) -> JSONResponse:
             command += ["--professional-type", professional_type, "--professional-category", category]
             if bool(body.get("show_category")):
                 command.append("--show-category")
-        if bool(body.get("headless")):
+        if _headless_from_settings(body):
             command.append("--headless")
         if bool(body.get("no_proxy")):
             command.append("--no-proxy")
@@ -3716,7 +3734,7 @@ async def workflow(request: Request) -> JSONResponse:
     ]
     if task == "open_profile":
         command += ["--arrive", str(body.get("arrive") or "direct"), "--keep-open"]
-    if bool(body.get("headless")):
+    if _headless_from_settings(body):
         command.append("--headless")
     if bool(body.get("no_proxy")):
         command.append("--no-proxy")
@@ -3768,7 +3786,7 @@ async def web_warmup(request: Request) -> JSONResponse:
         "--minutes", str(minutes),
         "--persona", persona,
     ]
-    if bool(body.get("headless")):
+    if _headless_from_settings(body):
         command.append("--headless")
     return start_process(command, f"web warmup: {len(rows)} account(s)")
 
@@ -4058,7 +4076,16 @@ async def post_story(request: Request) -> JSONResponse:
         provider = "camoufox"
     launch = {
         "provider": provider,
-        "headless": str(form.get("headless") or "").lower() in {"1", "true", "yes", "on"},
+        # Stories inherit the Background Web setting too. The story trigger
+        # posts without passing this flag, so before this they always
+        # opened a visible window — and a visible window is what stalls
+        # when the RDP session is minimised, which is precisely when
+        # unattended story posting needs to work.
+        "headless": (
+            str(form.get("headless") or "").lower() in {"1", "true", "yes", "on"}
+            if str(form.get("headless") or "").strip()
+            else str(upload_settings().get("background_web") or "off") == "on"
+        ),
         "no_proxy": str(form.get("no_proxy") or "").lower() in {"1", "true", "yes", "on"},
     }
     manifest = {

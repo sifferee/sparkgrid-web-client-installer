@@ -97,7 +97,21 @@ class InstagramSessionGoalCallbacks:
                 login_evidence += ("login_url",)
 
         loading = bool(signals.get("loading") or dialog.get("progress"))
-        if category in TERMINAL_DIALOGS:
+        # Checked first: being ON the suspension page settles the question
+        # regardless of what dialog sits on top of it.
+        #
+        # Diagnosed 2026-08-14: two earlier attempts put this check in
+        # get_state() in instagram_web_profile_workflow.py, but session
+        # checks never reach that function — operation_state is decided
+        # right here, purely from the dialog category. Instagram shows a
+        # "Confirm you're human" dialog on the suspension page that isn't
+        # in the known set, so the result was "unknown", and c32544408 /
+        # jacquelinezk1s / janetm7vx kept landing in the neutral bucket
+        # while being genuinely blocked. Alexander confirmed all three by
+        # hand and asked for that redirect to count as blocked outright.
+        if "/accounts/suspended" in url.lower() or "/suspended" in url.lower():
+            operation_state = "suspended"
+        elif category in TERMINAL_DIALOGS:
             operation_state = category
         elif category:
             operation_state = category
