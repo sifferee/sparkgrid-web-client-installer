@@ -2035,7 +2035,8 @@ def upload_settings(conn: sqlite3.Connection | None = None) -> dict[str, Any]:
             browser_parallel = 3
         return {"upload_engine": engine, "api_parallel": parallel, "browser_parallel": browser_parallel,
                 "traffic_saver": str(values.get("traffic_saver") or "off"),
-                "warmup_enabled": str(values.get("warmup_enabled") or "on")}
+                "warmup_enabled": str(values.get("warmup_enabled") or "on"),
+                "background_web": str(values.get("background_web") or "off")}
     finally:
         if own and conn is not None:
             conn.close()
@@ -2045,7 +2046,7 @@ def current_browser_parallel() -> int:
     return int(upload_settings().get("browser_parallel") or 3)
 
 
-def save_upload_settings(engine: str, api_parallel: int, browser_parallel: int = 3, traffic_saver: str = "", warmup_enabled: str = "") -> dict[str, Any]:
+def save_upload_settings(engine: str, api_parallel: int, browser_parallel: int = 3, traffic_saver: str = "", warmup_enabled: str = "", background_web: str = "") -> dict[str, Any]:
     engine = str(engine or "clean_web").strip().lower()
     if engine not in {"manual", "clean_web", "api"}:
         engine = "clean_web"
@@ -2055,6 +2056,9 @@ def save_upload_settings(engine: str, api_parallel: int, browser_parallel: int =
     # Default "on" (matches historical always-warmup behavior) if unset —
     # only "off"/"0"/"false"/"no" turns it off, everything else is "on".
     we_value = "off" if str(warmup_enabled or "").lower() in {"off", "0", "false", "no"} else "on"
+    # Background (headless) browser. Default off: visible windows are how
+    # Alexander spots what automation can't report on its own.
+    bw_value = "on" if str(background_web or "").lower() in {"on", "1", "true", "yes"} else "off"
     conn = db_conn()
     try:
         conn.execute(
@@ -2087,11 +2091,16 @@ def save_upload_settings(engine: str, api_parallel: int, browser_parallel: int =
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
             (we_value,),
         )
+        conn.execute(
+            "INSERT INTO ig_web_upload_settings(key,value,updated_at) VALUES ('background_web',?,datetime('now')) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
+            (bw_value,),
+        )
         conn.commit()
     finally:
         conn.close()
     return {"upload_engine": engine, "api_parallel": parallel, "browser_parallel": browser_parallel,
-            "traffic_saver": ts_value, "warmup_enabled": we_value}
+            "traffic_saver": ts_value, "warmup_enabled": we_value, "background_web": bw_value}
 
 
 def assign_legacy_proxy_connection(conn: sqlite3.Connection, account_name: str, proxy: str) -> dict[str, Any]:
@@ -2544,7 +2553,8 @@ async def set_upload_settings(request: Request) -> JSONResponse:
     browser_parallel = body.get("browser_parallel") if body.get("browser_parallel") not in (None, "") else current["browser_parallel"]
     traffic_saver = str(body.get("traffic_saver") or current.get("traffic_saver") or "off")
     warmup_enabled = str(body.get("warmup_enabled") or current.get("warmup_enabled") or "on")
-    saved = save_upload_settings(engine, int(parallel), int(browser_parallel), traffic_saver, warmup_enabled)
+    background_web = str(body.get("background_web") or current.get("background_web") or "off")
+    saved = save_upload_settings(engine, int(parallel), int(browser_parallel), traffic_saver, warmup_enabled, background_web)
     return JSONResponse({"ok": True, **saved})
 
 
@@ -3828,7 +3838,15 @@ async def start_upload(request: Request) -> JSONResponse:
         "--post-warmup-max", str(body.get("post_warmup_max") if body.get("post_warmup_max") not in (None, "") else default_post_max),
         "--cooldown-hours", str(body.get("cooldown_hours") if body.get("cooldown_hours") not in (None, "") else 4),
     ]
-    if bool(body.get("headless")):
+    # Fall back to the saved Settings toggle when the caller didn't say.
+    # The Telegram bot doesn't send this flag at all, so without the
+    # fallback its uploads always opened visible windows regardless of the
+    # Background Web switch — exactly what Alexander hit: he enabled it,
+    # ran an upload from the bot, and a browser window still appeared.
+    headless_requested = body.get("headless")
+    if headless_requested is None:
+        headless_requested = str(current_upload_settings.get("background_web") or "off") == "on"
+    if bool(headless_requested):
         command.append("--headless")
     if bool(body.get("no_proxy")):
         command.append("--no-proxy")
