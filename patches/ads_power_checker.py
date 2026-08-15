@@ -756,6 +756,18 @@ def _run_browser_session(ws_url: str, targets: list[dict[str, Any]], profile_id:
                                 f"(waited {waited}s, checked {checked}/{len(targets)})")
                             time.sleep(MEMORY_WAIT_STEP_SECONDS)
                             waited += MEMORY_WAIT_STEP_SECONDS
+                            # Touch the page so the CDP connection doesn't
+                            # go idle while we wait. The browser is open
+                            # throughout this pause, and several minutes of
+                            # total silence is exactly the condition that
+                            # drops a websocket — we'd resume against a
+                            # dead connection and lose the accounts we
+                            # waited to protect.
+                            try:
+                                page.title()
+                            except Exception as ping_exc:
+                                log(f"Browser connection lost while waiting for memory: {ping_exc}", "WARNING")
+                                break
                             free_now = _free_memory_mb()
                         if free_now < MEMORY_ABORT_MB:
                             log(f"Memory still at {free_now:.0f}MB after {waited}s — "
@@ -858,8 +870,36 @@ def _run_browser_session(ws_url: str, targets: list[dict[str, Any]], profile_id:
     return result["checked"], result["errors"]
 
 
+_CYCLE_LOCK = threading.Lock()
+
+
 def run_once() -> int:
-    """One check cycle. Returns number of accounts successfully checked."""
+    """One check cycle. Returns number of accounts successfully checked.
+
+    Only one cycle runs at a time. Diagnosed 2026-08-14: /api/ig-web-upload/
+    metrics/run starts a fresh thread on every call with no guard, so
+    pressing "Собрать метрики" three times in a row — which Alexander did —
+    launched three collectors against the same AdsPower profile. They
+    close each other's browser on the way out, which produces exactly the
+    "Target page, context or browser has been closed" errors we were
+    chasing. The scheduled loop is sequential and was never the problem;
+    the manual trigger was.
+
+    A second caller returns 0 immediately rather than queueing: metrics
+    are idempotent, and the cycle already under way is collecting the same
+    accounts.
+    """
+    if not _CYCLE_LOCK.acquire(blocking=False):
+        log("A metrics cycle is already running — ignoring this request", "WARNING")
+        return 0
+    try:
+        return _run_once_locked()
+    finally:
+        _CYCLE_LOCK.release()
+
+
+def _run_once_locked() -> int:
+    """The actual cycle body. Never call directly — go through run_once."""
     conn = _db_conn()
     try:
         ensure_metrics_schema(conn)
