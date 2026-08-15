@@ -259,6 +259,38 @@ def _categorize_for_mass_upload(accounts: list) -> dict:
         buckets["ready"].append(a)
     return buckets
 
+
+def _group_accounts_by_reason(
+    accounts: list, reason_key: str, *, max_groups: int = 5, max_names: int = 3
+) -> list[str]:
+    """Turn a flat list of accounts into compact grouped lines like
+    "3 — Instagram отклонил учётные данные (@a, @b, @c)" instead of one
+    bare count. Diagnosed 2026-08-15: the "6 — ошибка" bucket in the mass-
+    upload summary was a naked number with zero detail — Alexander had no
+    way to tell from the bot alone whether that meant 6 accounts with a
+    stale login failure, 6 with no free proxy, or 6 different problems
+    each affecting one account. Grouping by the actual reason text (most
+    common first) answers that without dumping 6 raw error strings.
+
+    Groups beyond max_groups collapse into one "other reasons" line so a
+    long tail of one-off errors can't blow up the message."""
+    groups: dict[str, list[str]] = {}
+    for a in accounts:
+        reason = str(a.get(reason_key) or "").strip() or "причина не указана"
+        groups.setdefault(reason[:80], []).append(str(a.get("name") or "?"))
+    ordered = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
+    lines = []
+    for reason, names in ordered[:max_groups]:
+        names_part = ", ".join(f"@{n}" for n in names[:max_names])
+        if len(names) > max_names:
+            names_part += f" +{len(names) - max_names}"
+        lines.append(f"{len(names)} — {reason} ({names_part})")
+    if len(ordered) > max_groups:
+        rest_count = sum(len(names) for _, names in ordered[max_groups:])
+        rest_kinds = len(ordered) - max_groups
+        lines.append(f"{rest_count} — другие причины ({rest_kinds} видов)")
+    return lines
+
 # ─── API Client ───────────────────────────────────────────────────────────────
 # post-story endpoint reads form data, not JSON.
 # Other endpoints (start, workflow, stop, metrics/run, delete-banned) accept JSON.
@@ -480,6 +512,12 @@ async def _send_metrics(update_or_query):
     msg += f"Просмотры: {fmt(t.get('views',0))}{_arrow(dl.get('views',0))}\n"
     msg += f"Лайки: {fmt(t.get('likes',0))}{_arrow(dl.get('likes',0))}\n"
     msg += f"Комментарии: {fmt(t.get('comments',0))}{_arrow(dl.get('comments',0))}\n"
+    # See background_daily_digest() for the diagnosis: "Просмотры" above
+    # already excludes top-12 rotation drops from the growth number, this
+    # just explains why the raw per-account sum wouldn't match it.
+    rotated_out = int(data.get("views_rotated_out", 0) or 0)
+    if rotated_out > 0:
+        msg += f"   (+{fmt(rotated_out)} просм. выпало из топ-12, не потеря)\n"
     # Change since the previous check, alongside the 24h totals. When
     # checks run about hourly, the 24h numbers barely move between two of
     # them and read as if nothing is happening — this shows what the
@@ -992,7 +1030,21 @@ async def callback_handler(update: Update, ctx):
             if buckets["not_logged_in"]:
                 skip_lines.append(f"{len(buckets['not_logged_in'])} — не залогинены")
             if buckets["error"]:
-                skip_lines.append(f"{len(buckets['error'])} — ошибка")
+                # Was: f"{len(buckets['error'])} — ошибка" — a bare count
+                # that told Alexander nothing about WHY those accounts
+                # were excluded. These are accounts that ARE logged_in
+                # and NOT in cooldown, but got parked here because
+                # web_upload_last_error is still non-empty from whatever
+                # last touched them (a failed login, a failed upload
+                # cycle, a proxy problem, ...) — and nothing auto-clears
+                # that field, so once an account lands here it stays
+                # excluded from every future mass-upload run until it
+                # either succeeds via a manual single-account retry (the
+                # per-account @name button skips this categorization
+                # entirely) or something explicitly clears the error.
+                skip_lines.extend(
+                    _group_accounts_by_reason(buckets["error"], "web_upload_last_error")
+                )
 
             if not ready_names:
                 summary = (
@@ -1023,6 +1075,14 @@ async def callback_handler(update: Update, ctx):
 
             if result.get("ok"):
                 run_id = result.get("run_id", "")
+                # Use what the API actually accepted (result["accounts"]),
+                # not ready_names we asked for — without_suspended_accounts()
+                # in app.py's /start can still drop a few between "we sent
+                # this list" and "this is what actually launched", and the
+                # batch summary's denominator needs to match reality or it
+                # will sit reporting "N missing" forever for accounts that
+                # were never actually started.
+                _register_pending_batch(run_id, result.get("accounts") or ready_names)
                 log_action(user_id, username, "upload_all", detail=f"ready={len(ready_names)}", result=f"run_id={run_id}")
                 await query.edit_message_text(summary, reply_markup=main_menu_keyboard())
             else:
@@ -1164,6 +1224,18 @@ async def background_daily_digest(ctx: ContextTypes.DEFAULT_TYPE):
             f"Подписчики: {fmt_delta(dl.get('followers', 0))} · "
             f"Лайки: {fmt_delta(dl.get('likes', 0))}",
         ]
+        # Diagnosed 2026-08-15: total_views only sums each account's latest
+        # 12 posts. A new reel bumps an old one out of that window and its
+        # views vanish from the number — not a real loss. get_overview()
+        # now excludes those drops from delta_24h.views (growth-only) and
+        # reports their magnitude here so a negative-looking day doesn't
+        # get reported as one when it wasn't.
+        rotated_out = int(data.get("views_rotated_out", 0) or 0)
+        if rotated_out > 0:
+            lines.append(
+                f"ℹ️ +{fmt(rotated_out)} просм. выпало из выборки "
+                f"(старый рилс вне топ-12 после нового поста, не потеря)"
+            )
         if data_1h.get("ok"):
             lines.append(
                 f"За последний час: "
@@ -1244,12 +1316,26 @@ async def background_daily_digest(ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── Background: Upload/Story Completion Notifications ────────────────────────
 
-# Track which run_ids we've already reported
-_REPORTED_RUNS_FILE = DATA_DIR / "telegram_reported_runs.json"
+# Track which job IDs we've already announced individually.
+#
+# Diagnosed 2026-08-15: this used to be keyed by job["run_id"] and called
+# "_reported_runs" — but run_id is NOT unique per job. connection_scheduler.py
+# assigns ONE run_id per batch trigger (SPARKGRID_RUN_ID is set once in
+# app.py's start_process(), then inherited unchanged via os.environ.copy()
+# into every per-account subprocess it launches — traced end to end through
+# app.py -> connection_scheduler.py -> instagram_web_upload.py). So a
+# "Залить рилсы" run on 16 accounts produces 16 job rows that all share the
+# same run_id. The old code did `if run_id in _reported_runs: continue` —
+# meaning the FIRST account to finish claimed that run_id, and every other
+# account sharing the same batch was silently skipped forever after,
+# regardless of its own outcome. That's why only "1-2 accounts" ever showed
+# up out of a much larger run. Each job row's own "id" column IS unique per
+# job — that's the correct dedupe key.
+_REPORTED_JOBS_FILE = DATA_DIR / "telegram_reported_jobs.json"
 
 
-def _load_reported_runs() -> set[str]:
-    """Run IDs already announced, persisted across bot restarts.
+def _load_reported_jobs() -> set[str]:
+    """Job IDs already announced, persisted across bot restarts.
 
     Diagnosed 2026-08-14: this set lived only in memory, so a bot restart
     wiped it and every finished run got announced a second time —
@@ -1259,30 +1345,132 @@ def _load_reported_runs() -> set[str]:
     hold.
     """
     try:
-        if _REPORTED_RUNS_FILE.exists():
-            data = json.loads(_REPORTED_RUNS_FILE.read_text(encoding="utf-8"))
+        if _REPORTED_JOBS_FILE.exists():
+            data = json.loads(_REPORTED_JOBS_FILE.read_text(encoding="utf-8"))
             if isinstance(data, list):
                 return {str(x) for x in data}
     except Exception as e:
-        logger.debug("could not load reported runs: %s", e)
+        logger.debug("could not load reported jobs: %s", e)
     return set()
 
 
-def _save_reported_runs(runs: set[str]) -> None:
+def _save_reported_jobs(jobs: set[str]) -> None:
     try:
         # Keep the most recent 200 — the file is a dedupe guard, not history.
-        trimmed = list(runs)[-200:]
-        tmp = _REPORTED_RUNS_FILE.with_suffix(".json.tmp")
+        trimmed = list(jobs)[-200:]
+        tmp = _REPORTED_JOBS_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(trimmed, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, _REPORTED_RUNS_FILE)
+        os.replace(tmp, _REPORTED_JOBS_FILE)
     except Exception as e:
-        logger.debug("could not save reported runs: %s", e)
+        logger.debug("could not save reported jobs: %s", e)
 
 
-_reported_runs: set[str] = _load_reported_runs()
+_reported_jobs: set[str] = _load_reported_jobs()
 # Buffer for batching notifications — collects events, sends one combined message
 _pending_notifications: list[str] = []
 _last_notification_flush: float = 0
+
+# ─── Background: Batch (mass-upload) Completion Summary ───────────────────────
+#
+# Alexander's ask 2026-08-15: after "Залить рилсы" on e.g. 30 accounts, he
+# wants one final tally — "30/30 posted" or "25/30 posted, 5 accounts —
+# reason X" — instead of only ever seeing the first account's individual
+# line (see the dedupe bug above) or having to guess from a trickle of
+# per-account notifications spread over the run's whole duration.
+#
+# This piggybacks on the same run_id that caused the dedupe bug — since
+# every account in one "Залить рилсы" trigger really does share it, that's
+# exactly the grouping key a batch summary needs. _register_pending_batch()
+# is called right after a mass trigger starts (with the account list the
+# API actually accepted); background_check_completion() then records each
+# job's outcome under its run_id as jobs finish, and fires one summary once
+# every expected account has a result (or after PENDING_BATCH_MAX_AGE_MIN
+# as a safety net, in case some account's worker crashed before ever
+# writing a job row at all).
+_PENDING_BATCHES_FILE = DATA_DIR / "telegram_pending_batches.json"
+PENDING_BATCH_MAX_AGE_MIN = 180  # generous: large batches with limited
+# browser_parallel can legitimately take over an hour to work through.
+
+
+def _load_pending_batches() -> dict:
+    try:
+        if _PENDING_BATCHES_FILE.exists():
+            data = json.loads(_PENDING_BATCHES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        logger.debug("could not load pending batches: %s", e)
+    return {}
+
+
+def _save_pending_batches(batches: dict) -> None:
+    try:
+        tmp = _PENDING_BATCHES_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(batches, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, _PENDING_BATCHES_FILE)
+    except Exception as e:
+        logger.debug("could not save pending batches: %s", e)
+
+
+_pending_batches: dict = _load_pending_batches()
+
+
+def _register_pending_batch(run_id: str, expected_names: list) -> None:
+    """Call right after a mass trigger (e.g. upload_all) starts. expected_names
+    should be exactly the account list the API accepted (result["accounts"]
+    or the same ready_names sent), so the batch summary's denominator
+    matches what was actually launched, not what was merely selected."""
+    run_id = str(run_id or "").strip()
+    names = [str(n) for n in (expected_names or []) if n]
+    if not run_id or not names:
+        return
+    _pending_batches[run_id] = {
+        "expected": names,
+        "seen": {},
+        "triggered_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _save_pending_batches(_pending_batches)
+
+
+def _format_batch_summary(expected: list, seen: dict) -> str:
+    """expected: account names launched. seen: {account_name: {"status","posted","error"}}
+    for every account that reached a terminal state. Accounts missing from
+    seen (never finished, or the safety-net timeout hit) get their own line."""
+    total = len(expected)
+    ok_names = {
+        name for name, v in seen.items()
+        if v.get("status") == "success" and int(v.get("posted") or 0) > 0
+    }
+    posted_total = sum(int(v.get("posted") or 0) for v in seen.values())
+    lines = [f"📦 Итог заливки: {len(ok_names)}/{total} аккаунтов, видео залито: {posted_total}"]
+
+    problem_accounts = []
+    for name, v in seen.items():
+        if name in ok_names:
+            continue
+        status = str(v.get("status") or "")
+        error = str(v.get("error") or "")
+        if status == "partial_success":
+            reason = f"частично ({v.get('posted', 0)} залито) — {error[:60]}" if error else f"частично ({v.get('posted', 0)} залито)"
+        elif status == "cooldown":
+            reason = "кулдаун сработал уже после запуска (гонка между ботом и сервером)"
+        elif error:
+            reason = error
+        else:
+            reason = status or "неизвестно"
+        problem_accounts.append({"name": name, "_reason": reason})
+    if problem_accounts:
+        lines.extend(_group_accounts_by_reason(problem_accounts, "_reason"))
+
+    missing = [n for n in expected if n not in seen]
+    if missing:
+        shown = ", ".join(f"@{n}" for n in missing[:3])
+        if len(missing) > 3:
+            shown += f" +{len(missing) - 3}"
+        lines.append(f"{len(missing)} — ещё не завершились или воркер не отчитался ({shown})")
+    return "\n".join(lines)
+
+
 
 async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
     """Check every 30s for finished jobs. Batch notifications into one message."""
@@ -1298,25 +1486,47 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
         new_events: list[str] = []
         stopped_accounts: list[str] = []
 
+        # Reportable terminal statuses — a job sitting in "running"/"queued"/
+        # "starting" isn't finished yet and shouldn't be touched here.
+        TERMINAL_STATUSES = (
+            "success", "failed", "partial_success", "manual_required",
+            "stopped", "cooldown", "uploaded_unverified",
+            "submitted_unverified", "empty_selection",
+        )
+
         for job in jobs[:20]:
             status = str(job.get("status") or "")
-            run_id = str(job.get("run_id") or "")
-            if not run_id or run_id in _reported_runs:
-                continue
-            if status not in ("success", "failed", "partial_success", "manual_required",
-                              "stopped", "cooldown", "uploaded_unverified",
-                              "submitted_unverified", "empty_selection"):
-                continue
-
-            _reported_runs.add(run_id)
-            if len(_reported_runs) > 200:
-                _reported_runs.clear()
-                _reported_runs.add(run_id)
-            _save_reported_runs(_reported_runs)
-
+            is_terminal = status in TERMINAL_STATUSES
+            job_key = str(job.get("id") or "")
+            job_run_id = str(job.get("run_id") or "")
             account = str(job.get("account_name") or "?")
             posted = int(job.get("posted_count") or 0)
             error = str(job.get("last_error") or "")
+
+            # Feed the batch tracker independently of the individual-
+            # notification dedupe below, so a pending batch summary isn't
+            # blocked just because this account's own line already went
+            # out on an earlier poll. Overwrite-on-each-terminal-sighting
+            # (not skip-if-already-seen) so a later, more final outcome
+            # (e.g. a retried job that eventually succeeds) replaces an
+            # earlier one instead of being stuck behind it.
+            if is_terminal and job_run_id in _pending_batches:
+                batch = _pending_batches[job_run_id]
+                if account in batch.get("expected", []):
+                    batch.setdefault("seen", {})[account] = {
+                        "status": status, "posted": posted, "error": error,
+                    }
+                    _save_pending_batches(_pending_batches)
+
+            if not job_key or job_key in _reported_jobs or not is_terminal:
+                continue
+
+            _reported_jobs.add(job_key)
+            if len(_reported_jobs) > 200:
+                _reported_jobs.clear()
+                _reported_jobs.add(job_key)
+            _save_reported_jobs(_reported_jobs)
+
             current_step = str(job.get("current_step") or "")
             is_story = "story" in current_step.lower() or "story" in str(job.get("label") or "").lower()
 
@@ -1348,9 +1558,18 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
                 # staying quiet: skip it and let the next poll report the
                 # settled state.
                 if not error:
-                    _reported_runs.discard(run_id)
+                    _reported_jobs.discard(job_key)
                     continue
                 line = f"🟡 @{account}: {error[:80]}"
+            elif status == "cooldown":
+                # Diagnosed 2026-08-15: this is the backend's OWN cooldown
+                # check (ig_signals.cooldown_left in instagram_web_upload.py),
+                # separate from the bot's own pre-flight filter
+                # (_cooldown_hours_remaining) used to build ready_names.
+                # The two are computed differently and can disagree — this
+                # fires when the bot thought an account was ready enough to
+                # launch, but the backend's own gate skipped it anyway.
+                line = f"⏳ @{account}: кулдаун сработал уже после запуска" + (f" — {error[:60]}" if error else "")
             elif status == "stopped":
                 # Diagnosed 2026-08-14: these are the "red circles" that
                 # flooded Alexander's chat — 🛑 renders as a red dot in
@@ -1367,6 +1586,31 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
                 line = f"❓ {status}: @{account}"
 
             new_events.append(line)
+
+        # ── Batch (mass-upload) completion summaries ──
+        # A batch is done once every account launched for it has reached a
+        # terminal state, or after PENDING_BATCH_MAX_AGE_MIN as a safety net
+        # (covers an account whose worker crashed before ever writing a job
+        # row at all — vanishingly rare, since create_job() happens right
+        # at the start of account_lane(), but "wait forever" is worse than
+        # "report late" if it ever does happen).
+        batches_changed = False
+        now_dt = datetime.now()
+        for run_id in list(_pending_batches.keys()):
+            batch = _pending_batches[run_id]
+            expected = batch.get("expected", [])
+            seen = batch.get("seen", {})
+            try:
+                age_min = (now_dt - datetime.fromisoformat(str(batch.get("triggered_at") or ""))).total_seconds() / 60.0
+            except Exception:
+                age_min = 0.0
+            if len(seen) >= len(expected) or age_min > PENDING_BATCH_MAX_AGE_MIN:
+                new_events.append(_format_batch_summary(expected, seen))
+                del _pending_batches[run_id]
+                batches_changed = True
+        if batches_changed:
+            _save_pending_batches(_pending_batches)
+
 
         # One line for everything stopped in this batch, instead of one
         # message per account.

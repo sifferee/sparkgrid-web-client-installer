@@ -1239,6 +1239,18 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
     delta_views = 0
     delta_likes = 0
     delta_comments = 0
+    # Diagnosed 2026-08-15: total_views per account is a sum over only the
+    # latest 12 posts (fetch_post_metrics count=12), not a true lifetime
+    # total. When an account posts a new reel, its oldest counted post
+    # drops out of that window and its views vanish from cur_views even
+    # though nothing was actually lost — e.g. lilliancanx posted, an old
+    # reel with 19609 views rotated out of the top-12, and the fleet-wide
+    # delta showed -16581 while 12 of 13 accounts were genuinely growing.
+    # Fix: a negative per-account view delta is presumed to be rotation,
+    # not a real drop (Reels view counts don't spontaneously decrease) —
+    # it's excluded from the growth total and tracked separately here so
+    # the digest can explain it instead of reporting a scary net loss.
+    views_rotated_out = 0
 
     for r in rows:
         d = dict(r)
@@ -1312,7 +1324,16 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
         total_likes += cur_likes
         total_comments += cur_comments
         delta_followers += df
-        delta_views += dv
+        # Only real growth feeds the fleet-wide views delta. A negative dv
+        # (this account's counted views went down) is top-12 rotation, not
+        # a loss — its magnitude goes to views_rotated_out instead. The
+        # per-account "delta.views" above keeps the raw signed dv, so
+        # anyone inspecting a single account still sees exactly what
+        # happened; only the fleet TOTAL is protected from the false dip.
+        if dv < 0:
+            views_rotated_out += -dv
+        else:
+            delta_views += dv
         delta_likes += dl
         delta_comments += dc
 
@@ -1338,6 +1359,10 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
             "views": since_views,
             "likes": since_likes,
         },
+        # Sum of all per-account negative view deltas this cycle, i.e. how
+        # much of "no growth showing" is actually top-12 rotation rather
+        # than a real problem. 0 when nothing rotated out.
+        "views_rotated_out": views_rotated_out,
         "collector_error": get_config(conn, "metrics_last_failure", ""),
         "collector_error_at": get_config(conn, "metrics_last_failure_at", ""),
     }

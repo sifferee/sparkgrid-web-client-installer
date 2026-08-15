@@ -197,6 +197,36 @@ class IndependentHeartbeat:
             except OSError:
                 pass
 
+    def _clear_transport_error(self) -> None:
+        # Diagnosed 2026-08-15: _record_transport_error() had no
+        # counterpart. Once a SINGLE heartbeat write failed (plausible
+        # under I/O contention when several browsers launch in parallel —
+        # 3 of 4 hit this within the first few minutes in one observed
+        # run), connection_scheduler.py's watchdog saw the error file and
+        # `continue`d past ALL stall/hang detection for the rest of that
+        # worker's life, because nothing ever deleted the file again even
+        # after later heartbeat writes succeeded fine. One transient blip
+        # near startup permanently disabled the safety net for the whole
+        # run — including the already-known "Firefox freezes when its
+        # window is backgrounded" failure mode (AGENTS.md, 2026-08-11),
+        # which is exactly the kind of stall this watchdog exists to catch.
+        #
+        # Clearing on the next SUCCESSFUL write restores protection as
+        # soon as the transport is actually healthy again, while leaving
+        # the original defensive behavior untouched for a transport that
+        # stays genuinely broken (no success ever arrives to trigger this,
+        # so `continue`-past-stall-detection still applies for as long as
+        # every write keeps failing — that caution was reasonable and is
+        # not what this fix removes).
+        if not self.transport_error:
+            return
+        self.transport_error = False
+        for target in self.error_paths:
+            try:
+                Path(target).unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def pulse(self) -> bool:
         if not self.path:
             return False
@@ -218,6 +248,8 @@ class IndependentHeartbeat:
             ok = bool(self.writer(self.path, payload))
             if not ok:
                 self._record_transport_error()
+            else:
+                self._clear_transport_error()
             return ok
 
     def update_phase(self, phase: str, *, pulse: bool = True) -> bool:
