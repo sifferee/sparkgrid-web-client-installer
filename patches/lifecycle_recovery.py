@@ -118,6 +118,32 @@ def heartbeat_payload(*, job_ref: str = "", account_ref: str = "", task_ref: str
             "monotonic_elapsed_ms": int((monotonic_now - (started or monotonic_now)) * 1000),
             "recovery_attempt": int(recovery_attempt), "build": str(build or "unknown")[:64]}
 
+def _replace_with_retry(tmp: Path, target: Path, attempts: int = 3, delay_seconds: float = 0.1) -> None:
+    """Diagnosed 2026-08-16: same class of transient WinError 5 (Access
+    Denied) found in browser_launcher.py's profile writes also applies
+    here, and arguably matters MORE here — a heartbeat writes roughly
+    every 5 seconds per worker (vs. once at launch for a profile file),
+    so it's the write most likely to collide with a brief antivirus scan
+    or a not-yet-released reader handle. Every such collision used to
+    count as a hard heartbeat failure and trip the transport_error latch
+    (see IndependentHeartbeat below) — this absorbs the transient case at
+    the source, so the latch fires for genuine problems, not sub-second
+    Windows I/O noise. Kept short (3 tries, 100ms) since this runs on a
+    ~5s cadence and shouldn't itself add meaningful delay."""
+    last_exc: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, target)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt == attempts - 1:
+                break
+            time.sleep(delay_seconds)
+    assert last_exc is not None
+    raise last_exc
+
+
 def write_heartbeat(path: str, payload: dict[str, Any]) -> bool:
     target = Path(path)
     temporary = target.with_name(
@@ -128,7 +154,7 @@ def write_heartbeat(path: str, payload: dict[str, Any]) -> bool:
         temporary.write_text(
             json.dumps(payload, sort_keys=True), encoding="utf-8"
         )
-        os.replace(temporary, target)
+        _replace_with_retry(temporary, target)
         return True
     except OSError:
         try:

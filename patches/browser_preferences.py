@@ -29,6 +29,23 @@ def load_browser_preferences(account: str, mode: str = "desktop") -> Dict[str, A
         return {}
 
 
+def _replace_with_retry(tmp: Path, path: Path, attempts: int = 5, delay_seconds: float = 0.15) -> None:
+    """Same WinError 5 fix as browser_launcher.py, 2026-08-16: same
+    per-account profile-write category as the confirmed-failing file."""
+    last_exc: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt == attempts - 1:
+                break
+            time.sleep(delay_seconds)
+    assert last_exc is not None
+    raise last_exc
+
+
 def save_browser_preferences(account: str, mode: str = "desktop", **updates: Any) -> Dict[str, Any]:
     path = _path(account, mode)
     data = load_browser_preferences(account, mode)
@@ -43,7 +60,7 @@ def save_browser_preferences(account: str, mode: str = "desktop", **updates: Any
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    _replace_with_retry(tmp, path)
     return data
 
 

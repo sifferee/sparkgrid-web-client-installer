@@ -88,11 +88,29 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
+def _replace_with_retry(tmp: Path, path: Path, attempts: int = 5, delay_seconds: float = 0.15) -> None:
+    """Same WinError 5 fix as browser_launcher.py, 2026-08-16: this fires
+    per captured request/response, so it's a hot path when capture is on
+    — same exposure as the confirmed-failing profile write."""
+    last_exc: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt == attempts - 1:
+                break
+            time.sleep(delay_seconds)
+    assert last_exc is not None
+    raise last_exc
+
+
 def _write_json(path: Path, payload: Any, *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    _replace_with_retry(tmp, path)
     try:
         os.chmod(path, mode)
     except Exception:

@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -47,13 +48,28 @@ def _load_records() -> list[dict[str, Any]]:
     return records
 
 
+def _replace_with_retry(tmp, path, attempts: int = 5, delay_seconds: float = 0.15) -> None:
+    """Same WinError 5 fix as browser_launcher.py, 2026-08-16."""
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt == attempts - 1:
+                break
+            time.sleep(delay_seconds)
+    raise last_exc
+
+
 def _save_records(records: list[dict[str, Any]]) -> None:
     tmp = SUCCESSES_FILE.with_suffix(".jsonl.tmp")
     tmp.write_text(
         "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
         encoding="utf-8",
     )
-    os.replace(tmp, SUCCESSES_FILE)  # atomic — same lesson as save_users()
+    _replace_with_retry(tmp, SUCCESSES_FILE)  # atomic — same lesson as save_users()
 
 
 def _admin_chat_ids() -> list[int]:

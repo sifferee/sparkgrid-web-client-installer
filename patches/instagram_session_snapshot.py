@@ -24,6 +24,28 @@ class SessionExportIncomplete(SessionPersistenceError):
     """Browser auth exists, but the required export cookie contract is incomplete."""
 
 
+def _replace_with_retry(tmp: Path, path: Path, attempts: int = 5, delay_seconds: float = 0.15) -> None:
+    """Same fix as browser_launcher.py/lifecycle_recovery.py, applied
+    here 2026-08-16: this is the PRIMARY session-save path (browser_
+    launcher.py's save_browser_state() tries this before falling back to
+    its own raw os.replace), called on every successful login/session
+    refresh — same exposure to a transient WinError 5 from a brief
+    antivirus scan or lingering reader handle, previously with zero
+    retry."""
+    last_exc: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt == attempts - 1:
+                break
+            time.sleep(delay_seconds)
+    assert last_exc is not None
+    raise last_exc
+
+
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -32,7 +54,7 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         os.chmod(tmp, 0o600)
     except Exception:
         pass
-    os.replace(tmp, path)
+    _replace_with_retry(tmp, path)
     try:
         os.chmod(path, 0o600)
     except Exception:
@@ -49,7 +71,7 @@ def save_instagram_session(context: Any, profile_root: Path, storage_state_path:
         os.chmod(tmp_state, 0o600)
     except Exception:
         pass
-    os.replace(tmp_state, storage_state_path)
+    _replace_with_retry(tmp_state, storage_state_path)
 
     state = json.loads(storage_state_path.read_text(encoding="utf-8"))
     cookies = [dict(item) for item in state.get("cookies", []) if isinstance(item, dict)]
@@ -138,7 +160,7 @@ def persist_instagram_session(
         missing = REQUIRED_COOKIES.difference(cookie_names)
         if missing:
             raise SessionExportIncomplete("required session export is incomplete")
-        os.replace(tmp_state, storage_state_path)
+        _replace_with_retry(tmp_state, storage_state_path)
         try:
             os.chmod(storage_state_path, 0o600)
         except Exception:

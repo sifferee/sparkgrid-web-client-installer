@@ -601,12 +601,30 @@ async def _show_upload_menu(update_or_query):
     if not accounts:
         await _reply(update_or_query, "Нет готовых аккаунтов (logged_in)")
         return
+    # Diagnosed 2026-08-16: this used to list EVERY logged_in, non-banned
+    # account as an individual button — including accounts sitting in
+    # cooldown, which is most of the fleet most of the time. With a large
+    # account count that's a wall of buttons to scroll through for nothing:
+    # tapping a cooldown account individually still hits the exact same
+    # backend gate (ig_signals.cooldown_left in instagram_web_upload.py) it
+    # would in a batch run, so listing it here buys nothing. Only the
+    # "error" bucket (stale web_upload_last_error) genuinely benefits from
+    # an individual tap — that's the documented way to give a stuck account
+    # another shot, bypassing the mass-upload categorization that otherwise
+    # excludes it every time (see _categorize_for_mass_upload). "Ready"
+    # accounts are already one tap away via "Все ready" and don't need
+    # their own row either.
+    buckets = _categorize_for_mass_upload(accounts)
     keyboard = []
     keyboard.append([InlineKeyboardButton("🚀 Все ready", callback_data="upload_all")])
-    for a in accounts:
+    for a in buckets["error"]:
         keyboard.append([InlineKeyboardButton(f"@{a['name']}", callback_data=f"upload:{a['name']}")])
     keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="cmd:start")])
-    await _reply(update_or_query, "Выбери аккаунты для залива:", reply_markup=InlineKeyboardMarkup(keyboard))
+    hidden_cooldown = len(buckets["cooldown"])
+    note = f"Выбери аккаунты для залива. Ready: {len(buckets['ready'])} (кнопка выше). С ошибкой ниже: {len(buckets['error'])}."
+    if hidden_cooldown:
+        note += f"\nВ кулдауне сейчас: {hidden_cooldown} — не показаны, тап всё равно отклонит сервер."
+    await _reply(update_or_query, note, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def cmd_stories(update: Update, ctx):
     if not await _check_auth(update):

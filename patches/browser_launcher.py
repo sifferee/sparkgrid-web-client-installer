@@ -560,11 +560,39 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _replace_with_retry(tmp: Path, path: Path, attempts: int = 5, delay_seconds: float = 0.15) -> None:
+    """Diagnosed 2026-08-16: jessicamjs's whole browser launch failed
+    outright with WinError 5 (Access Denied) on the os.replace() below —
+    but a live check right after found no orphaned firefox/camoufox
+    process holding a handle on sparkbrowser_profile.json. That points to
+    a transient lock (real-time antivirus briefly scanning the fresh
+    .tmp/.json, or a reader from a moment earlier not yet having released
+    its handle) rather than a genuine, lasting conflict — Windows can
+    return ERROR_ACCESS_DENIED for a rename target that's momentarily
+    open elsewhere, even for a fraction of a second. os.replace() had no
+    retry at all, so that one sub-second collision was enough to abort
+    the entire account run. A short retry absorbs exactly that window; a
+    truly persistent lock still fails after it, so this doesn't hide a
+    real problem, just a very short-lived one."""
+    last_exc: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            os.replace(str(tmp), str(path))
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt == attempts - 1:
+                break
+            time.sleep(delay_seconds)
+    assert last_exc is not None
+    raise last_exc
+
+
 def _atomic_write_json(path: Path, payload: Dict[str, Any], private: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=list), encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    _replace_with_retry(tmp, path)
     if private:
         try:
             os.chmod(str(path), 0o600)
@@ -1382,7 +1410,7 @@ def save_browser_state(context, account: str, proxy: str = "", mode: str = "desk
         except Exception:
             tmp = path.with_suffix(path.suffix + ".tmp")
             context.storage_state(path=str(tmp))
-            os.replace(str(tmp), str(path))
+            _replace_with_retry(tmp, path)
             try:
                 os.chmod(str(path), 0o600)
             except Exception:
