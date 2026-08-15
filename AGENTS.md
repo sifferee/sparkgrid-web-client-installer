@@ -101,8 +101,11 @@
 ## Последнее изменение
 
 - 2026-08-15 — Claude (диагностика) + Hermes (применение, коммит 06308d8) —
-  три файла: ads_power_checker.py (дельта метрик: same-set comparison вместо
-  разных наборов аккаунтов, исправление отрицательных просмотров в сводке),
+  три файла: ads_power_checker.py (total_views считается только по последним 12
+  постам аккаунта — новый рилс вытесняет старый из выборки, и его
+  просмотры пропадают из суммы, хотя ничего не потеряно; падения теперь
+  не тянут общую дельту в минус, а считаются отдельно как
+  views_rotated_out и объясняются в сводке),
   telegram_bot.py (job-id dedup для completion notifications + батч-сводка,
   self-clearing heartbeat transport_error latch), lifecycle_recovery.py
   (self-clearing heartbeat transport_error latch).
