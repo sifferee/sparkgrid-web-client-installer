@@ -739,11 +739,30 @@ def _run_browser_session(ws_url: str, targets: list[dict[str, Any]], profile_id:
                     # first" ordering means whoever was skipped goes to the
                     # front of the queue next time. A partial cycle is fine;
                     # a crashed upload is not.
+                    # Wait for memory rather than abandoning the run.
+                    # Changed 2026-08-14 on Alexander's instruction: a cycle
+                    # must cover every account. Low memory is nearly always
+                    # an upload holding browsers open for a few minutes, so
+                    # pausing until it passes costs a little time; quitting
+                    # costs the rest of the fleet's metrics for that hour.
+                    # Only if memory stays down for the full wait do we give
+                    # up — at that point something is genuinely wrong and
+                    # pressing on risks a MemoryError.
                     free_now = _free_memory_mb()
                     if free_now < MEMORY_ABORT_MB:
-                        log(f"Stopping cycle early: only {free_now:.0f}MB free "
-                            f"(checked {checked}/{len(targets)}) — rest continues next cycle", "WARNING")
-                        break
+                        waited = 0
+                        while free_now < MEMORY_ABORT_MB and waited < MEMORY_WAIT_MAX_SECONDS:
+                            log(f"Only {free_now:.0f}MB free — pausing before @{username} "
+                                f"(waited {waited}s, checked {checked}/{len(targets)})")
+                            time.sleep(MEMORY_WAIT_STEP_SECONDS)
+                            waited += MEMORY_WAIT_STEP_SECONDS
+                            free_now = _free_memory_mb()
+                        if free_now < MEMORY_ABORT_MB:
+                            log(f"Memory still at {free_now:.0f}MB after {waited}s — "
+                                f"stopping cycle (checked {checked}/{len(targets)}), "
+                                f"rest goes first next cycle", "WARNING")
+                            break
+                        log(f"Memory recovered to {free_now:.0f}MB — continuing")
                     try:
                         log(f"Checking @{username}...")
                         
@@ -808,8 +827,34 @@ def _run_browser_session(ws_url: str, targets: list[dict[str, Any]], profile_id:
     
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
-    t.join(timeout=180)  # 3 min max
-    
+
+    # A cycle runs until every account is done — Alexander's requirement,
+    # and the right behaviour: a metrics run that stops halfway is worse
+    # than one that takes longer.
+    #
+    # Diagnosed 2026-08-14: there used to be a flat 180s join timeout.
+    # Fine at 20 accounts (~6s each, measured), fatal at 72 — the
+    # collector needed about 7 minutes and got 3. When it expired the main
+    # thread carried on and closed the AdsPower profile while the worker
+    # was still reading pages, so every remaining account produced
+    # "Page.evaluate: Target page, context or browser has been closed" and
+    # a zero snapshot. The timeout wasn't protecting the cycle, it was
+    # truncating it.
+    #
+    # Dropping it is safe because a stuck account can't stall the run:
+    # Playwright applies its own per-call timeout, so a hung page raises
+    # and the loop moves to the next account. The very large ceiling below
+    # exists only so a wedged worker thread can't linger forever — at two
+    # minutes per account it is roughly twenty times the measured pace and
+    # will not be reached in normal operation.
+    safety_ceiling_seconds = max(1800, len(targets) * 120)
+    t.join(timeout=safety_ceiling_seconds)
+    if not result["done"]:
+        log(f"Browser session still running after {safety_ceiling_seconds}s "
+            f"({result['checked']}/{len(targets)} accounts done). This should "
+            f"not happen — something is wedged. Remaining accounts go first "
+            f"next cycle.", "WARNING")
+
     return result["checked"], result["errors"]
 
 
@@ -962,6 +1007,10 @@ MEMORY_NEEDED_OVERDUE_MB = float(os.environ.get("METRICS_MIN_FREE_OVERDUE_MB", "
 MEMORY_ABORT_MB = float(os.environ.get("METRICS_ABORT_FREE_MB", "1000") or 1000)
 OVERDUE_AFTER_HOURS = float(os.environ.get("METRICS_OVERDUE_HOURS", "6") or 6)
 RETRY_WHEN_BUSY_MINUTES = float(os.environ.get("METRICS_RETRY_BUSY_MIN", "10") or 10)
+# How long a cycle waits for memory to free up before giving up on the
+# remaining accounts. Ten minutes covers a typical upload run.
+MEMORY_WAIT_MAX_SECONDS = int(os.environ.get("METRICS_MEMORY_WAIT_SEC", "600") or 600)
+MEMORY_WAIT_STEP_SECONDS = int(os.environ.get("METRICS_MEMORY_STEP_SEC", "30") or 30)
 
 
 def _memory_allows_cycle() -> tuple[bool, str]:

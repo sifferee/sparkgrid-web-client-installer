@@ -6438,6 +6438,13 @@ _TYPED_POPUP_FAILURES = {
     "popup_transition_timeout",
     "unrecognized_surface",
     "unknown_blocker",
+    # Added 2026-08-14 together with the /accounts/suspended check in
+    # _resolve_arrival_popup. Without this entry _typed_popup_failure
+    # silently drops the result — the step is returned, matched against
+    # this set, found missing, and treated as "no failure at all", so the
+    # account would have carried on with the same wrong status. The URL
+    # check alone would have looked correct in review and done nothing.
+    "suspended",
 }
 
 
@@ -6639,6 +6646,68 @@ def _resolve_arrival_popup(page: Any, dump: LiveDump | None) -> dict[str, Any]:
     """Route the current topmost blocker through one bounded transaction."""
     observed = inspect_topmost_blocker(page)
     category = str(observed.get("category") or "")
+    # Suspension page short-circuits everything below. Diagnosed
+    # 2026-08-14: bayarjavkhlan and chandraparni sat on
+    # /accounts/suspended/ ("Confirm you're human to use your account")
+    # and came back as browser_internal_error — an error about the
+    # browser, for an account Instagram had simply blocked. The URL check
+    # existed already, but only on the session-check path
+    # (instagram_session_goal); login takes this route instead and never
+    # saw it. Alexander's rule stands: landing on that URL means blocked,
+    # whatever dialog sits on top.
+    try:
+        current_url = str(getattr(page, "url", "") or "").lower()
+    except Exception:
+        current_url = ""
+    if "/accounts/suspended" in current_url or "/suspended" in current_url:
+        return {"handled": False, "ok": False, "step": "suspended"}
+
+    # Account-picker screen. Diagnosed 2026-08-14: oluwafisayomi and
+    # madhivadhanan landed on instagram.com showing "See everyday moments
+    # from your close friends", the account's own name, and buttons
+    # Continue / Use another profile / Create new account. The session was
+    # valid — Instagram just wanted a click to resume it. The code had no
+    # concept of this screen, so it observed three unrecognisable reads in
+    # a row and gave up with unrecognized_surface.
+    #
+    # Clicking the account's own "Continue" resumes the existing session,
+    # which is exactly what a person would do. Deliberately narrow: it
+    # fires only when Continue AND one of the sibling buttons are both
+    # present, so an ordinary page carrying the word "Continue" can't
+    # trigger it.
+    try:
+        picker = page.evaluate("""() => {
+          const vis = el => {
+            if (!el || !el.isConnected) return false;
+            const r = el.getBoundingClientRect();
+            const s = getComputedStyle(el);
+            return r.width > 1 && r.height > 1 && s.display !== 'none'
+              && s.visibility !== 'hidden' && parseFloat(s.opacity || '1') > 0.01;
+          };
+          const nodes = [...document.querySelectorAll('button,[role="button"],a,div[tabindex]')].filter(vis);
+          const textOf = el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+          const hasSibling = nodes.some(n => {
+            const t = textOf(n).toLowerCase();
+            return t.includes('use another profile') || t.includes('create new account');
+          });
+          if (!hasSibling) return null;
+          const cont = nodes.find(n => textOf(n).toLowerCase() === 'continue');
+          if (!cont) return null;
+          cont.click();
+          return true;
+        }""")
+    except Exception as picker_exc:
+        logger.debug("account picker probe failed: %s", picker_exc)
+        picker = None
+    if picker:
+        _record_arrival_route(dump, "account_picker_continue", observed=observed)
+        try:
+            page.wait_for_timeout(2500)
+        except Exception:
+            pass
+        observed = inspect_topmost_blocker(page)
+        category = str(observed.get("category") or "")
+
     if observed.get("document_category") == "browser_internal_error":
         return {"handled": False, "ok": False, "step": "browser_internal_error"}
     if observed.get("authenticated_surface"):
