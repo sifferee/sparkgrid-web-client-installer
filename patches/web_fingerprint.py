@@ -46,13 +46,29 @@ _CAMOUFOX_PARTS: dict = {}
 
 
 def _camoufox_part(module_path: str, attr: str):
-    """Import one camoufox attribute once, safely across threads."""
+    """Import one camoufox attribute once, safely.
+
+    The root package is imported FIRST, before any submodule. Diagnosed
+    2026-08-14: camoufox has a genuine circular dependency between its own
+    modules — fingerprints imports camoufox.webgl, which reaches the
+    package root, whose __init__ imports async_api, which imports back
+    from fingerprints. Ask for a submodule directly and Python enters that
+    loop halfway through and raises "cannot import name
+    generate_context_fingerprint from partially initialized module".
+
+    Importing `camoufox` first lets __init__ complete the whole cycle in
+    the order the package expects; every submodule is then already in
+    sys.modules and asking for one is trivial. This is a single-threaded
+    problem, so the lock alone never fixed it — it only stopped several
+    threads from hitting the same broken path at once.
+    """
     key = module_path + ":" + attr
     cached = _CAMOUFOX_PARTS.get(key)
     if cached is not None:
         return cached
     with _CAMOUFOX_IMPORT_LOCK:
         if key not in _CAMOUFOX_PARTS:
+            import camoufox  # noqa: F401  — must precede any submodule
             module = __import__(module_path, fromlist=[attr])
             _CAMOUFOX_PARTS[key] = getattr(module, attr)
     return _CAMOUFOX_PARTS[key]

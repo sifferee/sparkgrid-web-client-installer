@@ -47,6 +47,10 @@ def _load_camoufox():
         return _CAMOUFOX_SYNC_API
     with _CAMOUFOX_LOCK:
         if _CAMOUFOX_SYNC_API is None:
+            # Root package first — see the note in web_fingerprint's
+            # _camoufox_part. camoufox's own modules import each other in a
+            # cycle, and entering through a submodule breaks it midway.
+            import camoufox  # noqa: F401
             from camoufox.sync_api import Camoufox  # type: ignore
             _CAMOUFOX_SYNC_API = Camoufox
     return _CAMOUFOX_SYNC_API
