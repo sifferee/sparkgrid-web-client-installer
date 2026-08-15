@@ -584,7 +584,18 @@ def save_snapshot(
     views = int(metrics.get("total_views", 0))
     likes = int(metrics.get("total_likes", 0))
     user_id = str(metrics.get("user_id") or "").strip()
-    if fol == 0 and views == 0 and likes == 0 and not error and not user_id:
+    if fol == 0 and views == 0 and likes == 0 and error:
+        # A zero reading that arrives WITH an error is a failed
+        # collection, never a real measurement. Diagnosed 2026-08-14:
+        # AdsPower's browser was closing mid-cycle ("Page.evaluate:
+        # Target page, context or browser has been closed"), and because
+        # the old condition only skipped zeros when there was NO error,
+        # these failures were written straight over good data — accounts
+        # that genuinely had 757 followers an hour earlier now read 0,
+        # and every total in the bot collapsed to nothing.
+        log(f"  @{account_name}: zero metrics with error ({str(error)[:60]}) — collection failed, keeping previous snapshot", "WARNING")
+        return
+    if fol == 0 and views == 0 and likes == 0 and not user_id:
         log(f"  @{account_name}: all metrics zero AND no user_id — collection failed, skipping snapshot", "WARNING")
         return
     if fol == 0 and views == 0 and likes == 0 and user_id:

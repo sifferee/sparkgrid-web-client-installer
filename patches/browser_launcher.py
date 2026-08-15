@@ -20,12 +20,36 @@ import platform
 import re
 import shutil
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 from browser_page_router import attach_page_router
+
+# camoufox is imported once, under a lock, instead of inside the launch
+# function. Diagnosed 2026-08-14: an upload starts several browsers in
+# parallel, each thread hit `from camoufox.sync_api import Camoufox` at
+# the same moment, and Python served a half-initialised module to the
+# losers of that race — "cannot import name generate_context_fingerprint
+# from partially initialized module camoufox.fingerprints (most likely
+# due to a circular import)". The package itself is fine; concurrent
+# first-import is what breaks. Doing it once, guarded, removes the race.
+_CAMOUFOX_LOCK = threading.Lock()
+_CAMOUFOX_SYNC_API = None
+
+
+def _load_camoufox():
+    """Import camoufox.sync_api exactly once, safely across threads."""
+    global _CAMOUFOX_SYNC_API
+    if _CAMOUFOX_SYNC_API is not None:
+        return _CAMOUFOX_SYNC_API
+    with _CAMOUFOX_LOCK:
+        if _CAMOUFOX_SYNC_API is None:
+            from camoufox.sync_api import Camoufox  # type: ignore
+            _CAMOUFOX_SYNC_API = Camoufox
+    return _CAMOUFOX_SYNC_API
 
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = Path(os.environ["SPARKGRID_DATA_DIR"]) if os.environ.get("SPARKGRID_DATA_DIR") else ROOT
@@ -1106,7 +1130,7 @@ def _close_partial_camoufox(manager: Any) -> None:
 
 def _enter_camoufox_once(launch: Dict[str, Any]):
     _configure_camoufox_runtime_assets()
-    from camoufox.sync_api import Camoufox  # type: ignore
+    Camoufox = _load_camoufox()
 
     # Never drop identity-bearing config, persistent path, proxy, locale,
     # timezone, viewport, screen or device scale. Only optional helpers may be

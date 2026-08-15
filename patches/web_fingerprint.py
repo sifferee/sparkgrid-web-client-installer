@@ -22,6 +22,7 @@ import os
 import platform
 import random
 import re
+import threading
 import time
 from dataclasses import asdict, fields
 from pathlib import Path
@@ -30,6 +31,31 @@ from typing import Any, Dict, Optional
 FINGERPRINT_FILENAME = "camoufox_fingerprint.json"
 FINGERPRINT_SCHEMA_VERSION = 6
 BROWSER_LOCALE = "en-US"
+
+
+
+# Same one-time, lock-guarded import as in browser_launcher. Diagnosed
+# 2026-08-14: this module is called from inside the browser-launch path,
+# which an upload runs in several threads at once. Each thread hit these
+# `from camoufox...` lines simultaneously and Python handed the losers a
+# half-built module — "cannot import name generate_context_fingerprint
+# from partially initialized module camoufox.fingerprints". Fixing only
+# browser_launcher left these three imports racing exactly the same way.
+_CAMOUFOX_IMPORT_LOCK = threading.Lock()
+_CAMOUFOX_PARTS: dict = {}
+
+
+def _camoufox_part(module_path: str, attr: str):
+    """Import one camoufox attribute once, safely across threads."""
+    key = module_path + ":" + attr
+    cached = _CAMOUFOX_PARTS.get(key)
+    if cached is not None:
+        return cached
+    with _CAMOUFOX_IMPORT_LOCK:
+        if key not in _CAMOUFOX_PARTS:
+            module = __import__(module_path, fromlist=[attr])
+            _CAMOUFOX_PARTS[key] = getattr(module, attr)
+    return _CAMOUFOX_PARTS[key]
 
 
 def _seed_int(account: str, profile_dir: Path) -> int:
@@ -74,7 +100,7 @@ def _default_geometry() -> Dict[str, Any]:
 
 def _installed_firefox_major() -> Optional[str]:
     try:
-        from camoufox.pkgman import installed_verstr  # type: ignore
+        installed_verstr = _camoufox_part("camoufox.pkgman", "installed_verstr")
 
         raw = str(installed_verstr() or "")
         match = re.search(r"(?<!\d)(1\d{2})(?!\d)", raw)
@@ -119,7 +145,7 @@ def _generate_browserforge_dict(account: str, profile_dir: Path, preferred_os: s
     applied to the generated fingerprint afterwards and then persisted.
     """
     try:
-        from camoufox.fingerprints import generate_fingerprint  # type: ignore
+        generate_fingerprint = _camoufox_part("camoufox.fingerprints", "generate_fingerprint")
     except Exception:
         return None
 
@@ -274,7 +300,7 @@ def _apply_legacy_preferences(bf_data: Dict[str, Any], legacy_config: Dict[str, 
 
 
 def _resolved_config(fp_obj, geometry: Optional[Dict[str, Any]], seed: int) -> Dict[str, Any]:
-    from camoufox.fingerprints import from_browserforge  # type: ignore
+    from_browserforge = _camoufox_part("camoufox.fingerprints", "from_browserforge")
 
     config = from_browserforge(fp_obj, _installed_firefox_major())
     # Deterministic Camoufox-only values which otherwise rotate each launch.
