@@ -16,6 +16,11 @@ from live_observability import install_live_observability
 
 
 def _configure_source_assets() -> None:
+    # Root package first — camoufox's modules import each other in a cycle
+    # and entering through a submodule leaves the package half-loaded for
+    # everything that follows. Same rule as in browser_launcher and
+    # web_fingerprint.
+    import camoufox  # noqa: F401
     import camoufox.locale as locale
     import camoufox.pkgman as pkgman
 

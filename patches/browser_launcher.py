@@ -77,6 +77,16 @@ def _configure_camoufox_runtime_assets() -> Dict[str, str]:
             raise RuntimeError("SparkBrowser runtime executable is missing: %s" % executable)
         if not version_file.is_file():
             raise RuntimeError("SparkBrowser runtime version metadata is missing: %s" % version_file)
+        # Root package before the submodule — the same rule as everywhere
+        # else in this file. This line was the ORIGINAL entry point that
+        # left camoufox half-loaded: it is the first thing to touch the
+        # package during a launch, and reaching pkgman directly starts the
+        # internal cycle (fingerprints -> webgl -> package root ->
+        # async_api -> back into fingerprints). Whatever imported camoufox
+        # afterwards then found it listed in sys.modules but incomplete.
+        # Both entry points have to go through the root or the problem
+        # simply moves.
+        import camoufox  # noqa: F401
         import camoufox.pkgman as pkgman  # type: ignore
 
         pkgman.INSTALL_DIR = browser_dir
@@ -87,6 +97,7 @@ def _configure_camoufox_runtime_assets() -> Dict[str, str]:
         geoip_path = Path(geoip_value).expanduser().resolve()
         if not geoip_path.is_file():
             raise RuntimeError("SparkBrowser GeoIP database is missing: %s" % geoip_path)
+        import camoufox  # noqa: F401  — root before submodule, see above
         import camoufox.locale as camoufox_locale  # type: ignore
 
         camoufox_locale.MMDB_FILE = geoip_path
