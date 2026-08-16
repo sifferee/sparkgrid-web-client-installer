@@ -1350,10 +1350,12 @@ async def background_daily_digest(ctx: ContextTypes.DEFAULT_TYPE):
 # up out of a much larger run. Each job row's own "id" column IS unique per
 # job — that's the correct dedupe key.
 _REPORTED_JOBS_FILE = DATA_DIR / "telegram_reported_jobs.json"
+_REPORTED_JOBS_MAX = 200
 
 
-def _load_reported_jobs() -> set[str]:
-    """Job IDs already announced, persisted across bot restarts.
+def _load_reported_jobs() -> dict[str, bool]:
+    """Job IDs already announced, persisted across bot restarts, in the
+    order they were first seen.
 
     Diagnosed 2026-08-14: this set lived only in memory, so a bot restart
     wiped it and every finished run got announced a second time —
@@ -1361,21 +1363,30 @@ def _load_reported_jobs() -> set[str]:
     same minute. The bot restarts often (crash-loop guard, manual
     restarts, Conflict respawns), so in-memory alone was never going to
     hold.
+
+    Diagnosed 2026-08-16: this used to be a plain set(), which has no
+    defined insertion order in Python. Both the trim logic below AND
+    _save_reported_jobs's list(jobs)[-200:] were silently relying on an
+    ordering a set never guaranteed — the trim could evict a job reported
+    a second ago while keeping one from an hour ago. A dict (insertion
+    order is guaranteed since Python 3.7) makes "oldest" and "newest"
+    actually mean what the code assumes they mean.
     """
     try:
         if _REPORTED_JOBS_FILE.exists():
             data = json.loads(_REPORTED_JOBS_FILE.read_text(encoding="utf-8"))
             if isinstance(data, list):
-                return {str(x) for x in data}
+                return {str(x): True for x in data}
     except Exception as e:
         logger.debug("could not load reported jobs: %s", e)
-    return set()
+    return {}
 
 
-def _save_reported_jobs(jobs: set[str]) -> None:
+def _save_reported_jobs(jobs: dict[str, bool]) -> None:
     try:
-        # Keep the most recent 200 — the file is a dedupe guard, not history.
-        trimmed = list(jobs)[-200:]
+        # Keep the most recent 200, in true insertion order — the file is
+        # a dedupe guard, not history.
+        trimmed = list(jobs.keys())[-_REPORTED_JOBS_MAX:]
         tmp = _REPORTED_JOBS_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(trimmed, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, _REPORTED_JOBS_FILE)
@@ -1383,7 +1394,7 @@ def _save_reported_jobs(jobs: set[str]) -> None:
         logger.debug("could not save reported jobs: %s", e)
 
 
-_reported_jobs: set[str] = _load_reported_jobs()
+_reported_jobs: dict[str, bool] = _load_reported_jobs()
 # Buffer for batching notifications — collects events, sends one combined message
 _pending_notifications: list[str] = []
 _last_notification_flush: float = 0
@@ -1512,7 +1523,19 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
             "submitted_unverified", "empty_selection",
         )
 
-        for job in jobs[:20]:
+        # Diagnosed 2026-08-16: overview()'s SQL already fetches the 100
+        # most recent job rows (LIMIT 100 in app.py), but this used to
+        # only look at the top 20 of those. Fine almost always — new jobs
+        # keep getting created, so anything unreported eventually rises
+        # into that window on a later poll. It broke tonight: a single
+        # mass status change (62 accounts hit "stopped" within the same
+        # second from one batch operation) with no further job creation
+        # afterward meant the bottom 42 of those 62 never had anything to
+        # push them into the top 20 — Alexander's Telegram showed
+        # "Остановлено аккаунтов: 20" while 62 had actually stopped.
+        # Matching the SQL's own LIMIT removes the mismatch instead of
+        # guessing at a bigger arbitrary number.
+        for job in jobs[:100]:
             status = str(job.get("status") or "")
             is_terminal = status in TERMINAL_STATUSES
             job_key = str(job.get("id") or "")
@@ -1539,10 +1562,15 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
             if not job_key or job_key in _reported_jobs or not is_terminal:
                 continue
 
-            _reported_jobs.add(job_key)
-            if len(_reported_jobs) > 200:
-                _reported_jobs.clear()
-                _reported_jobs.add(job_key)
+            _reported_jobs[job_key] = True
+            if len(_reported_jobs) > _REPORTED_JOBS_MAX:
+                # Evict only the actually-oldest entries (dict preserves
+                # insertion order) — never the ones just added in this
+                # very poll, unlike the old set().clear() which wiped
+                # everything, including whatever this same loop had just
+                # added, the moment the count crossed 200.
+                for old_key in list(_reported_jobs.keys())[:-_REPORTED_JOBS_MAX]:
+                    del _reported_jobs[old_key]
             _save_reported_jobs(_reported_jobs)
 
             current_step = str(job.get("current_step") or "")
@@ -1576,7 +1604,7 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
                 # staying quiet: skip it and let the next poll report the
                 # settled state.
                 if not error:
-                    _reported_jobs.discard(job_key)
+                    _reported_jobs.pop(job_key, None)
                     continue
                 line = f"🟡 @{account}: {error[:80]}"
             elif status == "cooldown":
