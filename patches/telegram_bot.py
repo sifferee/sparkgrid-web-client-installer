@@ -1185,7 +1185,37 @@ async def callback_handler(update: Update, ctx):
 
 # ─── Background: Story Trigger Notifications ──────────────────────────────────
 
-last_seen_trigger_id = 0
+# Diagnosed 2026-08-16: last_seen_trigger_id lived only in memory, same
+# flaw _reported_jobs had before 2026-08-14's fix — just in a different
+# function nobody had looked at yet. Every bot restart reset it to 0,
+# so the next poll treated every trigger that ever fired as brand new
+# and re-sent it. Confirmed live: theresa9be6 got the identical "15.5K
+# просмотров" notification twice, 1h51m apart, straddling a restart —
+# not a new story, the same trigger re-announced because the watermark
+# forgot it had already been seen.
+_LAST_SEEN_TRIGGER_FILE = DATA_DIR / "telegram_last_seen_trigger.json"
+
+
+def _load_last_seen_trigger_id() -> int:
+    try:
+        if _LAST_SEEN_TRIGGER_FILE.exists():
+            data = json.loads(_LAST_SEEN_TRIGGER_FILE.read_text(encoding="utf-8"))
+            return int(data.get("id", 0))
+    except Exception as e:
+        logger.debug("could not load last_seen_trigger_id: %s", e)
+    return 0
+
+
+def _save_last_seen_trigger_id(tid: int) -> None:
+    try:
+        tmp = _LAST_SEEN_TRIGGER_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"id": tid}), encoding="utf-8")
+        os.replace(tmp, _LAST_SEEN_TRIGGER_FILE)
+    except Exception as e:
+        logger.debug("could not save last_seen_trigger_id: %s", e)
+
+
+last_seen_trigger_id = _load_last_seen_trigger_id()
 
 async def background_check_triggers(ctx: ContextTypes.DEFAULT_TYPE):
     """Check for new story triggers every 10 min. Notify all authorized users."""
@@ -1196,6 +1226,7 @@ async def background_check_triggers(ctx: ContextTypes.DEFAULT_TYPE):
         if not data.get("ok"):
             return
         triggers = data.get("triggers", [])
+        highest_seen = last_seen_trigger_id
         for t in triggers:
             tid = int(t.get("id", 0))
             if tid <= last_seen_trigger_id:
@@ -1210,7 +1241,10 @@ async def background_check_triggers(ctx: ContextTypes.DEFAULT_TYPE):
                     except Exception as _exc:
                         logger.debug("%s: %s", type(_exc).__name__, _exc)
                         pass
-            last_seen_trigger_id = max(last_seen_trigger_id, tid)
+            highest_seen = max(highest_seen, tid)
+        if highest_seen != last_seen_trigger_id:
+            last_seen_trigger_id = highest_seen
+            _save_last_seen_trigger_id(last_seen_trigger_id)
     except Exception as e:
         logger.warning(f"trigger check error: {e}")
 
@@ -1409,8 +1443,47 @@ def _save_reported_jobs(jobs: dict[str, bool]) -> None:
 
 
 _reported_jobs: dict[str, bool] = _load_reported_jobs()
-# Buffer for batching notifications — collects events, sends one combined message
-_pending_notifications: list[str] = []
+
+# Buffer for batching notifications — collects events, sends one combined
+# message every 2 min or 5+ events.
+#
+# Diagnosed 2026-08-16: same class of bug as last_seen_trigger_id above —
+# this lived only in memory. A job gets marked "reported" in the
+# persisted _reported_jobs the moment its line is added here, well
+# before the buffer actually flushes to Telegram. If the bot restarts in
+# that window (up to 2 minutes, and today alone saw 5+ restarts), the
+# line in the buffer is gone, but _reported_jobs still thinks it went
+# out — that job's notification is lost for good, silently, with no
+# duplicate to notice it by. Persisting the buffer closes the same gap
+# for "missing" that today's other fixes closed for "duplicated".
+_PENDING_NOTIFICATIONS_FILE = DATA_DIR / "telegram_pending_notifications.json"
+
+
+def _load_pending_notifications() -> list[str]:
+    try:
+        if _PENDING_NOTIFICATIONS_FILE.exists():
+            data = json.loads(_PENDING_NOTIFICATIONS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [str(x) for x in data]
+    except Exception as e:
+        logger.debug("could not load pending notifications: %s", e)
+    return []
+
+
+def _save_pending_notifications(items: list[str]) -> None:
+    try:
+        tmp = _PENDING_NOTIFICATIONS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, _PENDING_NOTIFICATIONS_FILE)
+    except Exception as e:
+        logger.debug("could not save pending notifications: %s", e)
+
+
+_pending_notifications: list[str] = _load_pending_notifications()
+# Deliberately NOT persisted: worst case after a restart is now - 0 =
+# huge, so should_flush is immediately True and any reloaded backlog
+# above goes out right away instead of waiting out the normal window —
+# early, never duplicated, never lost. No failure mode to fix here.
 _last_notification_flush: float = 0
 
 # ─── Background: Batch (mass-upload) Completion Summary ───────────────────────
@@ -1682,6 +1755,8 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
 
         # Add to pending buffer
         _pending_notifications.extend(new_events)
+        if new_events:
+            _save_pending_notifications(_pending_notifications)
 
         # Flush: send batched message if 2 min passed OR 5+ events queued
         now = _time.time()
@@ -1697,6 +1772,7 @@ async def background_check_completion(ctx: ContextTypes.DEFAULT_TYPE):
             if len(_pending_notifications) > 20:
                 msg += f"\n... и ещё {len(_pending_notifications) - 20}"
             _pending_notifications.clear()
+            _save_pending_notifications(_pending_notifications)
             _last_notification_flush = now
 
             for chat_id in authorized_chat_ids():
