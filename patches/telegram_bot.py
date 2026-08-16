@@ -276,8 +276,22 @@ def _group_accounts_by_reason(
     long tail of one-off errors can't blow up the message."""
     groups: dict[str, list[str]] = {}
     for a in accounts:
+        name = str(a.get("name") or "?")
         reason = str(a.get(reason_key) or "").strip() or "причина не указана"
-        groups.setdefault(reason[:80], []).append(str(a.get("name") or "?"))
+        # Diagnosed 2026-08-16: some error messages embed the account's
+        # own name as a prefix — e.g. instagram_web_upload.py builds
+        # f"{name}: no ready {content_mode} content". Grouped on the raw
+        # text, every account's version of the exact same underlying
+        # problem ("out of content") counts as its own unique reason —
+        # one line each, seen live as three separate "X: no ready scale
+        # content" lines instead of one "3 — no ready scale content
+        # (@a, @b, @c)". Stripping a leading "{own name}: " before using
+        # the text as a group key restores the intended grouping without
+        # touching what's actually stored in last_error.
+        prefix = f"{name}: "
+        if reason.startswith(prefix):
+            reason = reason[len(prefix):]
+        groups.setdefault(reason[:80], []).append(name)
     ordered = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
     lines = []
     for reason, names in ordered[:max_groups]:
