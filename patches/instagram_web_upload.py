@@ -4117,6 +4117,24 @@ def account_lane(account: dict, args, run_id: str) -> None:
                 fields = {"web_upload_last_error": error}
                 if status in {"LOGIN_REQUIRED", "TWO_FACTOR_REQUIRED", "HUMAN_VERIFICATION", "CHECKPOINT", "CHALLENGE", "SUSPENDED", "DISABLED"}:
                     fields["web_upload_login_status"] = str(status).lower()
+                elif status == "BLOCKED":
+                    # Diagnosed 2026-08-19: BLOCKED is the job-status label
+                    # for PublishObservedState.ACCOUNT_RESTRICTED (see
+                    # upload_video_web's state->status mapping) — Instagram
+                    # showed the account_restricted screen mid-upload. This
+                    # branch was missing entirely, so web_upload_login_status
+                    # stayed "logged_in" forever: the account never showed
+                    # up in "Удалить забаненные" (which only reads
+                    # login_status, exact match against BANNED_ACCOUNT_STATES
+                    # in app.py) while "Open" correctly refused it anyway
+                    # (that check also reads web_upload_last_error, which WAS
+                    # set). Confirmed live for 6 stuck accounts on 2026-08-19.
+                    # `error` already holds "account_restricted" here — that
+                    # string IS in BANNED_ACCOUNT_STATES, so using it
+                    # directly (not str(status).lower(), which would give
+                    # the unmatched "blocked") is what actually closes the
+                    # gap, not just silences it.
+                    fields["web_upload_login_status"] = error or "account_restricted"
                 update_account(name, **fields)
                 if st == "manual_required":
                     hold_manual_required_page(page, dump, error, headless=bool(args.headless))

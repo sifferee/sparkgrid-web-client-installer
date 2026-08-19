@@ -7943,7 +7943,23 @@ def do_post_story(account: dict, args, run_id: str):
                     reason,
                     force_snapshot=True,
                 )
-                update_account(name, web_upload_last_error=reason)
+                fields = {"web_upload_last_error": reason}
+                # Diagnosed 2026-08-19: same gap as _fail()'s BLOCKED case in
+                # instagram_web_upload.py — this only ever wrote last_error,
+                # so an account get_state() confidently classified as
+                # "suspended" (Alexander's 2026-08-14 rule: any
+                # /accounts/suspended redirect is confirmed evidence, not a
+                # maybe) stayed web_upload_login_status="logged_in" forever.
+                # Confirmed live for 2 stuck accounts (adelegvuh4izo,
+                # maviseqci) on 2026-08-19. Whitelisted to the same
+                # confirmed-bad states _sync_login_status_from_settings_error
+                # already trusts elsewhere in this file — deliberately NOT
+                # "unknown"/"unknown_popup"/"blocking_dialog_not_dismissed",
+                # which mean "couldn't get a clear signal" rather than a
+                # confirmed state, so they must not get treated as one here.
+                if state in {"login_required", "consent_required", "two_factor_required", "checkpoint", "restricted", "suspended"}:
+                    fields["web_upload_login_status"] = state
+                update_account(name, **fields)
                 update_job(
                     job,
                     status="manual_required",
