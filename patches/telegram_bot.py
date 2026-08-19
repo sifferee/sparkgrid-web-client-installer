@@ -544,6 +544,15 @@ async def _send_metrics(update_or_query):
     if s_fol or s_views or s_likes:
         msg += (f"\nС прошлой проверки: {fmt_delta(s_views)} просм · "
                 f"{fmt_delta(s_fol)} подп · {fmt_delta(s_likes)} лайк\n")
+        # Diagnosed 2026-08-19: same rotation issue as the 24h total above,
+        # confirmed live on 2026-08-16 20:38 ("С прошлой проверки: -32058
+        # просм" while the fleet was genuinely growing) — get_overview()
+        # now excludes top-12 rotation drops from s_views the same way it
+        # already does for the 24h total; this explains the gap when it
+        # happens instead of leaving a scary negative unexplained.
+        since_rotated = int(data.get("since_views_rotated_out", 0) or 0)
+        if since_rotated > 0:
+            msg += f"   (+{fmt(since_rotated)} просм. выпало из топ-12 с прошлой проверки, не потеря)\n"
 
     if not accounts:
         await _reply(update_or_query, msg)

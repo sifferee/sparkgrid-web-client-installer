@@ -1239,6 +1239,13 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
     delta_views = 0
     delta_likes = 0
     delta_comments = 0
+    # Diagnosed 2026-08-19: same top-12-rotation issue as views_rotated_out
+    # below, but for the "С прошлой проверки" (since-last-check) delta —
+    # deliberately left out of the 2026-08-15 fix at the time since only
+    # the 24h total delta had been reported broken. Confirmed live on
+    # 2026-08-16 20:38: "С прошлой проверки: -32058 просм" while the fleet
+    # was genuinely growing, same false-negative shape as the original bug.
+    since_views_rotated_out = 0
     # Diagnosed 2026-08-15: total_views per account is a sum over only the
     # latest 12 posts (fetch_post_metrics count=12), not a true lifetime
     # total. When an account posts a new reel, its oldest counted post
@@ -1292,7 +1299,11 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
             since_last = {"followers": 0, "views": 0, "likes": 0, "comments": 0, "since": ""}
 
         since_followers += int(since_last.get("followers") or 0)
-        since_views += int(since_last.get("views") or 0)
+        since_views_delta = int(since_last.get("views") or 0)
+        if since_views_delta < 0:
+            since_views_rotated_out += -since_views_delta
+        else:
+            since_views += since_views_delta
         since_likes += int(since_last.get("likes") or 0)
 
         accounts.append({
@@ -1363,6 +1374,7 @@ def get_overview(conn: sqlite3.Connection, hours: int = 24) -> dict[str, Any]:
         # much of "no growth showing" is actually top-12 rotation rather
         # than a real problem. 0 when nothing rotated out.
         "views_rotated_out": views_rotated_out,
+        "since_views_rotated_out": since_views_rotated_out,
         "collector_error": get_config(conn, "metrics_last_failure", ""),
         "collector_error_at": get_config(conn, "metrics_last_failure_at", ""),
     }
