@@ -4114,7 +4114,33 @@ def account_lane(account: dict, args, run_id: str) -> None:
                     finally:
                         c.close()
                 update_job(job_id, status=st, current_step=status or st, posted_count=posted, last_error=error, finished_at=now_iso())
-                fields = {"web_upload_last_error": error}
+                # Diagnosed 2026-08-20: web_upload_last_error was set here
+                # unconditionally, for every failure category, and NOTHING
+                # ever cleared it afterward — not a later successful cycle,
+                # not the partial_success summary path. For a genuine
+                # account-state problem (ban, consent, login) that's
+                # correct: stay excluded from _categorize_for_mass_upload's
+                # ready bucket until someone looks at it. But for a
+                # one-off technical hiccup that says nothing about the
+                # account itself — the goal engine ran out of its fixed
+                # observation budget waiting for Instagram to confirm a
+                # share it had already accepted, or a browser action never
+                # got a heartbeat back in time — the account got the exact
+                # same permanent exclusion. Confirmed live: three accounts
+                # (anuoluwakiitan_oluwamayokun.30, magahetjudaiah_tripuramalini.6,
+                # michelangelo_siphethokuhle.392) sat in the bot's
+                # "ошибка" bucket the entire day, cooldown long since
+                # expired, never attempted again — not because they kept
+                # failing, but because nothing ever gave them a clean
+                # slate. Job history (mark_failed/update_job above) still
+                # keeps the full record either way; this only decides
+                # whether the ACCOUNT is excluded from future automatic
+                # attempts.
+                transient_operational_errors = {
+                    "observation_budget_exhausted", "no_progress_timeout",
+                    "browser_proxy_application_failed",
+                }
+                fields = {} if error in transient_operational_errors else {"web_upload_last_error": error}
                 if status in {"LOGIN_REQUIRED", "TWO_FACTOR_REQUIRED", "HUMAN_VERIFICATION", "CHECKPOINT", "CHALLENGE", "SUSPENDED", "DISABLED"}:
                     fields["web_upload_login_status"] = str(status).lower()
                 elif status == "BLOCKED":
