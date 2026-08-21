@@ -845,6 +845,8 @@ _VERIFIER_THREAD: threading.Thread | None = None
 _BACKGROUND_STOP = threading.Event()
 _BACKGROUND_THREAD: threading.Thread | None = None
 _METRICS_THREAD: threading.Thread | None = None
+_STORY_TRIGGER_THREAD: threading.Thread | None = None
+_STORY_RETRY_THREAD: threading.Thread | None = None
 
 
 def _recover_background_state() -> None:
@@ -1011,7 +1013,7 @@ def _verifier_loop() -> None:
 
 @app.on_event("startup")
 def _start_publication_verifier() -> None:
-    global _VERIFIER_THREAD, _BACKGROUND_THREAD, _METRICS_THREAD
+    global _VERIFIER_THREAD, _BACKGROUND_THREAD, _METRICS_THREAD, _STORY_TRIGGER_THREAD, _STORY_RETRY_THREAD
     ensure_schema()
     cleanup_run_diagnostics(trigger="startup")
     _recover_background_state()
@@ -1024,16 +1026,30 @@ def _start_publication_verifier() -> None:
         _BACKGROUND_THREAD = threading.Thread(target=_background_dispatcher_loop, name="automation-analytics-loop", daemon=True)
         _BACKGROUND_THREAD.start()
     # Start Ads Power metrics checker
+    # Diagnosed 2026-08-21: unlike the two threads above, this had no
+    # is_alive() guard — every startup event fired a brand new checker
+    # thread unconditionally. Confirmed live: two "Metrics checker
+    # started" log lines 15 seconds apart from one restart, meaning two
+    # full metrics cycles were running concurrently against the same 42
+    # accounts — wasted AdsPower browser launches at best, racing writes
+    # to account_metrics_snapshots at worst. Same fix as the two threads
+    # above: skip starting a new one if the existing thread is still alive.
     try:
         import ads_power_checker
-        _METRICS_THREAD = ads_power_checker.start_checker_thread()
+        if _METRICS_THREAD is None or not _METRICS_THREAD.is_alive():
+            _METRICS_THREAD = ads_power_checker.start_checker_thread()
     except Exception as exc:
         print(f"[startup] metrics checker failed to start: {exc}")
     # Start Story auto-trigger
+    # Same diagnosis as metrics checker above — neither thread reference
+    # was even stored before, so there was no way to check, let alone
+    # guard against, a duplicate start.
     try:
         import story_trigger
-        story_trigger.start_trigger_thread()
-        story_trigger.start_retry_thread()
+        if _STORY_TRIGGER_THREAD is None or not _STORY_TRIGGER_THREAD.is_alive():
+            _STORY_TRIGGER_THREAD = story_trigger.start_trigger_thread()
+        if _STORY_RETRY_THREAD is None or not _STORY_RETRY_THREAD.is_alive():
+            _STORY_RETRY_THREAD = story_trigger.start_retry_thread()
     except Exception as exc:
         print(f"[startup] story trigger failed to start: {exc}")
 
