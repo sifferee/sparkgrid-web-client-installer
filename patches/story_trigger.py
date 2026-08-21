@@ -406,6 +406,16 @@ def get_pending_retry_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]
     condition (threshold or daily interval) was already confirmed true,
     but the actual POST to Instagram failed. These are eligible for the
     fast retry loop rather than waiting for the next slow discovery scan.
+
+    Diagnosed 2026-08-21: this joined story_triggers to itself only, with
+    no check that the account still exists. story_triggers is history —
+    it correctly keeps rows for deleted accounts — so once an account got
+    removed (banned, "Удалить забаненные"), its last failed trigger sat
+    here forever and the 10-minute retry loop kept calling
+    trigger_story_post() on it indefinitely: 432 retries/day across 3
+    long-deleted accounts, 95 of the last 100 recorded triggers being
+    exactly this noise. INNER JOIN accounts, not LEFT — same fix, same
+    reasoning as get_overview()'s account join in ads_power_checker.py.
     """
     rows = conn.execute("""
         SELECT t.account_name, t.trigger_reel_pk, t.trigger_views, t.threshold_used
@@ -415,6 +425,7 @@ def get_pending_retry_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]
             FROM story_triggers
             GROUP BY account_name
         ) latest ON t.account_name = latest.account_name AND t.id = latest.max_id
+        INNER JOIN accounts a ON a.name = t.account_name
         WHERE t.story_posted_at IS NULL AND COALESCE(t.error, '') != ''
     """).fetchall()
     return [dict(r) for r in rows]
